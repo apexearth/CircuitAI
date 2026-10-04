@@ -47,6 +47,12 @@ static AIFloat3 CEconomyManager_GetGeoSpotPos(CEconomyManager* mgr, int spotId)
 	return mgr->GetGeoSpotPos(spotId);
 }
 
+// apex: the ETA pool carries geos as a vent-limited rung; this is its n.
+static int CEconomyManager_OpenGeoSpotCount(CEconomyManager* mgr)
+{
+	return mgr->OpenGeoSpotCount();
+}
+
 static IUnitTask* CEconomyManager_EnqueueGeoAt(CEconomyManager* mgr, CCircuitUnit* unit, int spotId)
 {
 	return mgr->EnqueueGeoAt(unit, spotId);
@@ -63,6 +69,10 @@ CEconomyScript::CEconomyScript(CScriptManager* scr, CEconomyManager* mgr)
 	r = engine->RegisterObjectProperty("SResourceInfo", "const float storage", asOFFSET(CEconomyManager::SResourceInfo, storage)); ASSERT(r >= 0);
 	r = engine->RegisterObjectProperty("SResourceInfo", "const float pull", asOFFSET(CEconomyManager::SResourceInfo, pull)); ASSERT(r >= 0);
 	r = engine->RegisterObjectProperty("SResourceInfo", "const float income", asOFFSET(CEconomyManager::SResourceInfo, income)); ASSERT(r >= 0);
+	r = engine->RegisterObjectProperty("SResourceInfo", "const float usage", asOFFSET(CEconomyManager::SResourceInfo, usage)); ASSERT(r >= 0);
+	r = engine->RegisterObjectProperty("SResourceInfo", "const float excess", asOFFSET(CEconomyManager::SResourceInfo, excess)); ASSERT(r >= 0);
+	r = engine->RegisterObjectProperty("SResourceInfo", "const float share", asOFFSET(CEconomyManager::SResourceInfo, share)); ASSERT(r >= 0);
+	r = engine->RegisterObjectProperty("SResourceInfo", "const float sent", asOFFSET(CEconomyManager::SResourceInfo, sent)); ASSERT(r >= 0);
 
 	r = engine->RegisterObjectType("CEconomyManager", 0, asOBJ_REF | asOBJ_NOHANDLE); ASSERT(r >= 0);
 	r = engine->RegisterGlobalProperty("CEconomyManager aiEconomyMgr", manager); ASSERT(r >= 0);
@@ -88,6 +98,7 @@ CEconomyScript::CEconomyScript(CScriptManager* scr, CEconomyManager* mgr)
 	// FindOpenGeoSpot for why HomeEnergy needed this.
 	r = engine->RegisterObjectMethod("CEconomyManager", "int FindOpenGeoSpot(CCircuitUnit@, const AIFloat3& in)", asFUNCTION(CEconomyManager_FindOpenGeoSpot), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CEconomyManager", "AIFloat3 GetGeoSpotPos(int) const", asFUNCTION(CEconomyManager_GetGeoSpotPos), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CEconomyManager", "int OpenGeoSpotCount() const", asFUNCTION(CEconomyManager_OpenGeoSpotCount), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CEconomyManager", "IUnitTask@+ EnqueueGeoAt(CCircuitUnit@, int)", asFUNCTION(CEconomyManager_EnqueueGeoAt), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 }
 

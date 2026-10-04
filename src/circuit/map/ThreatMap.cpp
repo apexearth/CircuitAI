@@ -19,6 +19,7 @@
 
 //#undef NDEBUG
 #include <cassert>
+#include <algorithm>
 
 namespace circuit {
 
@@ -155,7 +156,7 @@ void CThreatMap::EnqueueUpdate()
 	CEnemyManager* enemyMgr = circuit->GetEnemyManager();
 	CScheduler* scheduler = circuit->GetScheduler().get();
 	rangeScale = circuit->GetMilitaryManager()->GetRangeUnitCountCompensatorScale();
-	scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::Update, this, enemyMgr, scheduler));
+	scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::Update, this, enemyMgr, scheduler), "thrMap");
 }
 
 void CThreatMap::SetEnemyUnitRange(CEnemyUnit* e) const
@@ -386,6 +387,9 @@ void CThreatMap::AddEnemyAir(const float threat, float* drawAirThreat,
 	const int endX   = std::min(int(posx + range    ),  width);
 	const int beginZ = std::max(int(posz - range + 1),      0);
 	const int endZ   = std::min(int(posz + range    ), height);
+	perfCells.fetch_add(uint64_t(std::max(0, endX - beginX))
+			* std::max(0, endZ - beginZ), std::memory_order_relaxed);
+	perfPaints.fetch_add(1, std::memory_order_relaxed);
 
 	for (int z = beginZ; z < endZ; ++z) {
 		const int dzSq = SQUARE(posz - z);
@@ -427,6 +431,9 @@ void CThreatMap::AddEnemyAmphConst(const float threatSurf, const float threatWat
 	const int endX   = std::min(int(posx + range    ),  width);
 	const int beginZ = std::max(int(posz - range + 1),      0);
 	const int endZ   = std::min(int(posz + range    ), height);
+	perfCells.fetch_add(uint64_t(std::max(0, endX - beginX))
+			* std::max(0, endZ - beginZ), std::memory_order_relaxed);
+	perfPaints.fetch_add(1, std::memory_order_relaxed);
 
 	for (int z = beginZ; z < endZ; ++z) {
 		const int dzSq = SQUARE(posz - z);
@@ -477,6 +484,9 @@ void CThreatMap::AddEnemyAmphGradient(const float threatSurf, const float threat
 	const int endX   = std::min(int(posx + range    ),  width);
 	const int beginZ = std::max(int(posz - range + 1),      0);
 	const int endZ   = std::min(int(posz + range    ), height);
+	perfCells.fetch_add(uint64_t(std::max(0, endX - beginX))
+			* std::max(0, endZ - beginZ), std::memory_order_relaxed);
+	perfPaints.fetch_add(1, std::memory_order_relaxed);
 
 	for (int z = beginZ; z < endZ; ++z) {
 		const int dzSq = SQUARE(posz - z);
@@ -529,6 +539,9 @@ void CThreatMap::AddDecloaker(float* drawCloakThreat, const SEnemyData& e)
 	const int endX   = std::min(int(posx + rangeCloak    ),  width);
 	const int beginZ = std::max(int(posz - rangeCloak + 1),      0);
 	const int endZ   = std::min(int(posz + rangeCloak    ), height);
+	perfCells.fetch_add(uint64_t(std::max(0, endX - beginX))
+			* std::max(0, endZ - beginZ), std::memory_order_relaxed);
+	perfPaints.fetch_add(1, std::memory_order_relaxed);
 
 	for (int z = beginZ; z < endZ; ++z) {
 		const int dzSq = SQUARE(posz - z);
@@ -559,6 +572,9 @@ void CThreatMap::AddShield(float* drawShieldArray, const SEnemyData& e)
 	const int endX   = std::min(int(posx + rangeShield    ),  width);
 	const int beginZ = std::max(int(posz - rangeShield + 1),      0);
 	const int endZ   = std::min(int(posz + rangeShield    ), height);
+	perfCells.fetch_add(uint64_t(std::max(0, endX - beginX))
+			* std::max(0, endZ - beginZ), std::memory_order_relaxed);
+	perfPaints.fetch_add(1, std::memory_order_relaxed);
 
 	for (int z = beginZ; z < endZ; ++z) {
 		const int rrz = rangeShieldSq - SQUARE(posz - z);
@@ -607,6 +623,7 @@ std::shared_ptr<IMainJob> CThreatMap::AirDrawer(CCircuitDef::RoleT role)
 	SThreatData& threatData = *GetNextThreatData();
 	SRoleThreat& roleThreat = threatData.roleThreats[role];
 	std::fill(roleThreat.airThreat.begin(), roleThreat.airThreat.end(), THREAT_BASE);
+	perfFills.fetch_add(mapSize, std::memory_order_relaxed);
 	float* drawAirThreat = roleThreat.airThreat.data();
 
 	for (const SEnemyData* e : airDraws) {
@@ -630,6 +647,7 @@ std::shared_ptr<IMainJob> CThreatMap::AmphDrawer(CCircuitDef::RoleT role)
 	std::fill(roleThreat.surfThreat.begin(), roleThreat.surfThreat.end(), THREAT_BASE);
 	std::fill(roleThreat.amphThreat.begin(), roleThreat.amphThreat.end(), THREAT_BASE);
 	std::fill(roleThreat.swimThreat.begin(), roleThreat.swimThreat.end(), THREAT_BASE);
+	perfFills.fetch_add(3 * mapSize, std::memory_order_relaxed);
 	float* drawSurfThreat = roleThreat.surfThreat.data();
 	float* drawAmphThreat = roleThreat.amphThreat.data();
 	float* drawSwimThreat = roleThreat.swimThreat.data();
@@ -664,19 +682,29 @@ std::shared_ptr<IMainJob> CThreatMap::Update(CEnemyManager* enemyMgr, CScheduler
 		AddEnemyUnit(const_cast<SEnemyData&>(e));
 	}
 
+	perfAirDraws.fetch_add(airDraws.size(), std::memory_order_relaxed);
+	perfAmphDraws.fetch_add(amphDraws.size(), std::memory_order_relaxed);
+
 	SThreatData& threatData = *GetNextThreatData();
 	numThreadDraws = 1 + 2 * threatData.roleThreats.size();
 	for (auto& kv : threatData.roleThreats) {
-		scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::AirDrawer, this, kv.first));
-		scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::AmphDrawer, this, kv.first));
+		scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::AirDrawer, this, kv.first), "thrAir");
+		scheduler->RunPriorityJob(CScheduler::WorkJob(&CThreatMap::AmphDrawer, this, kv.first), "thrAmph");
 	}
 
 	std::fill(threatData.cloakThreat.begin(), threatData.cloakThreat.end(), THREAT_BASE);
 	std::fill(threatData.shield.begin(), threatData.shield.end(), 0.f);
+	perfFills.fetch_add(2 * mapSize, std::memory_order_relaxed);
 	float* drawCloakThreat = threatData.cloakThreat.data();
 	float* drawShieldArray = threatData.shield.data();
 
-	for (const std::vector<SEnemyData>& datas : {enemyMgr->GetHostileDatas(), enemyMgr->GetPeaceDatas()}) {
+	// apex: {a, b} builds an initializer_list<vector>, i.e. a full COPY of both
+	// enemy vectors every rebuild. Pointers are the same iteration, no copy.
+	const std::vector<SEnemyData>* datasets[2] = {
+			&enemyMgr->GetHostileDatas(), &enemyMgr->GetPeaceDatas()};
+	for (const std::vector<SEnemyData>* datasPtr : datasets) {
+		const std::vector<SEnemyData>& datas = *datasPtr;
+		perfDecloak.fetch_add(datas.size(), std::memory_order_relaxed);
 		for (const SEnemyData& e : datas) {
 			AddDecloaker(drawCloakThreat, e);
 			// FIXME: for shield.getInterceptType() > 1

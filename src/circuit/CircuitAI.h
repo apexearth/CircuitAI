@@ -17,8 +17,12 @@
 #include <unordered_map>
 #include <map>
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <vector>
+#include <chrono>
+#include <mutex>
+#include <cstdio>
 
 struct SSkirmishAICallback;
 
@@ -45,7 +49,12 @@ namespace circuit {
 #define ERROR_LOAD				(ERROR_UNKNOWN + EVENT_LOAD)
 #define ERROR_SAVE				(ERROR_UNKNOWN + EVENT_SAVE)
 #define ERROR_ENEMY_CREATED		(ERROR_UNKNOWN + EVENT_ENEMY_CREATED)
-#define LOG(fmt, ...)	GetLog()->DoLog(utils::string_format(std::string(fmt), ##__VA_ARGS__).c_str())
+// apex: the engine's log call feeds the infolog AND the in-game chat widget,
+// which keeps every line forever (S31); ordinary lines go to our own file next
+// to the infolog and the harness merges them back by frame. LOG_ENGINE is for
+// what must be seen without the merge: compile errors, exceptions, the path.
+#define LOG(fmt, ...)	LogLine(utils::string_format(std::string(fmt), ##__VA_ARGS__).c_str())
+#define LOG_ENGINE(fmt, ...)	GetLog()->DoLog(utils::string_format(std::string(fmt), ##__VA_ARGS__).c_str())
 
 class CGameAttribute;
 class CSetupManager;
@@ -150,6 +159,9 @@ private:
 	void UnregisterTeamUnit(CCircuitUnit* unit);
 	void DeleteTeamUnit(CCircuitUnit* unit);
 public:
+	// apex: enrol/release in the set-target holder census. See tgtHeld.
+	void TgtHoldAdd(CCircuitUnit* unit) { tgtHeld.insert(unit); }
+	void TgtHoldDel(CCircuitUnit* unit) { tgtHeld.erase(unit); }
 	void GiveUnits(std::vector<CCircuitUnit*>&& units, int newTeamId);
 	// apex: send metal/energy to an allied team. The engine command has always
 	// existed (COMMAND_SEND_RESOURCES) and CircuitAI already uses it when
@@ -174,7 +186,8 @@ public:
 	// The default is returned whenever the publishing gadget is absent, which is
 	// every non-harness game, so behaviour off the bench is unchanged. Values
 	// are cached on first read: this sits inside the per-unit attack loop.
-	float GetTunable(const char* name, float defVal) const;
+	float GetTunable(const char* name, float defVal) const { return GetTunable(std::string(name), defVal); }
+	float GetTunable(const std::string& name, float defVal) const;
 
 	// --- in-process team coordination -----------------------------------
 	// Every AI the host adds lives in ONE process (AIExport.cpp keeps them in
@@ -195,7 +208,41 @@ public:
 	float ReadTeamValue(int otherTeamId, const std::string& key, float defVal) const;
 	springai::AIFloat3 GetBestWreckPos(const springai::AIFloat3& pos, float radius, float minMetal);
 	float GetWreckValueAt(const springai::AIFloat3& pos, float radius);
-	bool IsCommanderWreck(springai::Feature* f);
+	float GetFieldWorkAt(const springai::AIFloat3& pos, float radius);
+	springai::AIFloat3 GetBestRezPos(const springai::AIFloat3& pos, float radius, float minCost);  // resurrectable wreck worth the most as a unit  // rez bot work: a resurrectable wreck at its unit's cost, else its reclaim metal
+	// apex: per-featureDef constants, resolved once. See GetFeatDefInfo.
+	struct SFeatDefInfo {
+		float metal;      // FeatureDef contained metal; < 0 means "not resolved yet"
+		float rezCostM;   // the unit this corpse rezzes into, by cost; < 0 if none
+	};
+	const SFeatDefInfo& GetFeatDefInfo(int featureDefId);
+	bool IsCommanderWreckId(int rezDefId);
+	// apex: nearest commander corpse inside the circle, -RgtVector if none.
+	springai::AIFloat3 GetCommanderWreckPos(const springai::AIFloat3& pos, float radius);
+	int GetMetalResId();
+	// THE EXCHANGE MATRIX: metal our type A destroyed of their type B over
+	// metal of A that B destroyed, read per hit off the damage events (no
+	// last-hit guessing, no death needed). Carried across games in the AI's
+	// data dir. Fodder and fighters are the script's business; this only
+	// measures.
+	void RecordDealt(ICoreUnit::Id attacker, ICoreUnit::Id enemy, float damage);
+	void RecordTaken(ICoreUnit::Id unit, ICoreUnit::Id attacker, float damage);
+	void RecordFold(CCircuitUnit* unit, bool died, CCircuitDef* killer);   // the death log line
+	// A's exchange against the B's of this tier (0 = unknown B, always
+	// counted), or against everything for -1.
+	float RecordRatio(CCircuitDef* cdef, int tier) const;
+	int RecordCount(CCircuitDef* cdef, int tier) const;   // A-equivalents of metal lost
+	// One matchup, shrunk toward B's tier when the pair has little history.
+	float RecordRatioVs(CCircuitDef* cdef, CCircuitDef* foe) const;
+	int RecordCountVs(CCircuitDef* cdef, CCircuitDef* foe) const;
+	// The matchups weighted by what the enemy fields now (our own census of
+	// known live enemy attackers, refreshed every 10 s); pooled when blind.
+	float RecordRatioMix(CCircuitDef* cdef);
+	float GetAllyPowerAt(const springai::AIFloat3& pos, float radius);
+	// The same matrix read from their side: their B against our A.
+	float RecordFoeRatio(CCircuitDef* edef, CCircuitDef* ours) const;
+	void RecordSetTier(CCircuitDef* cdef, int tier) { if (cdef != nullptr) { recTier[cdef->GetId()] = tier; recAggDirty = true; } }
+	bool RecordTweaked() const { return recTweaked; }
 	// Recent kills/losses by metal value; see NoteTrade in the .cpp.
 	void NoteTrade(bool isKill, CCircuitDef* cdef);
 	// WHERE we are losing units, cost-weighted and decaying. The AI had no
@@ -230,11 +277,47 @@ public:
 	// same unchecked pattern that made GetBuilderThreatAt kill the engine at
 	// frame 3 on an off-map read. These guard; the raw ones must never be bound.
 	bool IsPosOnMap(const springai::AIFloat3& pos) const;
+	// Ground height, bounds-guarded. SAreaData::GetElevationAt indexes its
+	// heightmap straight from the position with no check, same hazard as above.
+	float GetElevationAt(const springai::AIFloat3& pos) const;
+	// Read a file from the VFS (game archive, map archive). Empty on failure.
+	// The one door onto content the engine does not otherwise hand an AI --
+	// used to read a map's lava schedule rather than learn it a crest at a time.
+	static const int MAX_VFS_READ = 1 << 20;
+	std::string ReadVfsFile(const std::string& name) const;
+	// THE LAVA TIDE. BAR's map_lava gadget publishes its current surface height
+	// as the public game rules param "lavaLevel" -- the very number it damages
+	// against -- and removes itself entirely on a map without lava, so the
+	// param never appears and this stays at NO_LAVA. Cached per frame: the site
+	// predicate asks it per candidate cell.
+	//
+	// Script owns the interesting half (how fast it climbs, when it gets here,
+	// what that does to a build's price -- manager/lava.as). This is only the
+	// hard floor: ground that is under the surface RIGHT NOW takes damage per
+	// second, and nothing may be sited there.
+	static constexpr float NO_LAVA = -99998.f;
+	float GetLavaLevel() const;
+	bool HasLava() const { return GetLavaLevel() > NO_LAVA; }
+	bool IsUnderLava(const springai::AIFloat3& pos, CCircuitDef* def) const;
+	// The tide's proven high-water mark, handed down from script the same way
+	// the front line and the base grid are -- the level a climb reached and
+	// held, which script learns by watching and C++ has no way to derive.
+	// NO_LAVA until a crest has been seen (or the behaviour is switched off).
+	// The farm site search prefers ground above it: a solar drowned every
+	// seven minutes is a solar bought seven times.
+	void SetLavaCrest(float y) { lavaCrest = y; }
+	float GetLavaCrest() const { return lavaCrest; }
+	bool AboveLavaCrest(const springai::AIFloat3& pos) const {
+		return (lavaCrest <= NO_LAVA) || (GetElevationAt(pos) > lavaCrest);
+	}
 	// The front line, handed down from script. Army positions were selected
 	// exclusively from metal-cluster defPoints, so squads had no position that
 	// meant "the line" and orbited bases instead of holding ground.
 	void SetFrontPos(const springai::AIFloat3& pos) { frontPos = pos; }
 	const springai::AIFloat3& GetFrontPos() const { return frontPos; }
+	// apex: where wounded units are healed: the medic station behind the army
+	void SetHealPos(const springai::AIFloat3& pos) { healPos = pos; }
+	const springai::AIFloat3& GetHealPos() const { return healPos; }
 	bool HasFrontPos() const { return frontPos.x >= 0.f; }
 	// The base layout, handed down from script the same way the front line is.
 	//
@@ -246,6 +329,22 @@ public:
 			float cell, float lanePitch, float laneHalf, float range);
 	bool SnapToBaseGrid(const springai::AIFloat3& pos, springai::AIFloat3& outPos,
 			CCircuitDef* def = nullptr, int facing = UNIT_NO_FACING) const;
+	// The lattice cell (i across, j deeper) from a snapped position, in the
+	// def's own strides; false outside the base. The neighbour of a taken
+	// slot is the next slot, never the next build square.
+	bool LatticeNeighbour(const springai::AIFloat3& snapped, CCircuitDef* def, int facing,
+			int i, int j, springai::AIFloat3& outPos) const;
+	// The def's lattice in world axes: pitch and the corner phase from (0,0).
+	void LatticeOf(CCircuitDef* def, int facing, float& px, float& pz, float& ox, float& oz) const;
+	void LatticeCell(const springai::AIFloat3& pos, CCircuitDef* def, int facing,
+			springai::AIFloat3& outPos) const;
+	void LatticePoint(const springai::AIFloat3& cell, CCircuitDef* def, int facing,
+			springai::AIFloat3& outPos) const;
+	// Is this ground one of the published walkways? The snap alone only keeps a
+	// street clear while the slot it snapped to is free; a base whose slots are
+	// all taken falls back to a 3200-elmo site search that lands wherever it
+	// likes, and that base is the one that seals its own units in.
+	bool IsInBaseLane(const springai::AIFloat3& pos) const;
 	// Cardinal facing along the published axis for a position inside the base,
 	// or UNIT_NO_FACING when the grid does not apply. Factories use it so their
 	// exit apron opens onto the road to the front instead of the map centre.
@@ -256,7 +355,13 @@ public:
 	void DrawPoint(const springai::AIFloat3& pos, const std::string& label);
 	void DrawLine(const springai::AIFloat3& from, const springai::AIFloat3& to);
 	void DrawErase(const springai::AIFloat3& pos);
+	// apex: territory (0 nobody, 1 ours, 2 theirs) from the influence map's
+	// derived mask, and the versions the script keys its refreshes on.
+	int GetTerritoryAt(const springai::AIFloat3& pos) const;
+	int GetTerritoryVersion() const;
+	int GetWreckFieldVersion() const;
 	float GetAllyInflAt(const springai::AIFloat3& pos) const;
+	float GetAllyDefendInflAt(const springai::AIFloat3& pos) const;
 	float GetEnemyInflAt(const springai::AIFloat3& pos) const;
 	float GetNetInflAt(const springai::AIFloat3& pos) const;
 	float GetRecentTradeRatio();
@@ -275,12 +380,27 @@ public:
 	// died having never resolved a build site; this lets the script ask the
 	// engine the same question CBFactoryTask asks, before enqueuing.
 	springai::AIFloat3 FindBuildSiteNear(CCircuitDef* def, const springai::AIFloat3& pos, float radius);
+	// The commit's own question: does the def's lattice cell at pos hold it
+	// right now -- the cell exactly, the engine's footprint test at the
+	// facing the task will use, the blocking map with every reservation.
+	bool CanPlaceCell(CCircuitDef* def, const springai::AIFloat3& pos, springai::AIFloat3& outCell);
 	void SetCommitted(bool v) { isCommitted = v; }
 	bool IsCommitted() const { return isCommitted; }
 	// A large building could not be placed. Reported, not acted on: what to
 	// clear out of the way is a policy question and lives in AngelScript.
-	void NoteBuildBlocked(const springai::AIFloat3& pos);
+	void NoteBuildBlocked(const springai::AIFloat3& pos, const CCircuitDef* def = nullptr);
+	// Sites a builder refused as unsafe (CanReachAtSafe), newest last: the
+	// ground raids keep us off, for the script's defence pricing.
+	void NoteUnsafeSite(const springai::AIFloat3& pos);
+	const std::vector<std::pair<springai::AIFloat3, int>>& GetUnsafeSites() const { return unsafeSites; }
 	bool GetBlockedBuildPos(springai::AIFloat3& outPos);
+	// The def that failed to place there, -1 when the mark carries none.
+	int GetBlockedBuildDef() const { return blockedBuildDef; }
+	// apex: every mark in order, oldest first; the slot above keeps only the last
+	bool PopBlockedBuild(springai::AIFloat3& outPos, int& outDef);
+	// apex: a path that failed for this move type into this sector, for a minute
+	void NoteNoPath(const CCircuitDef* cdef, const springai::AIFloat3& pos);
+	bool IsNoPath(const CCircuitDef* cdef, const springai::AIFloat3& pos) const;
 	// Our own units of `def` within radius of pos. The script can see a def's
 	// count but has no way to reach the instances.
 	std::vector<CCircuitUnit*> GetOwnUnitsOfDef(CCircuitDef* def, const springai::AIFloat3& pos, float radius);
@@ -288,6 +408,11 @@ public:
 	// cannot answer "what of ours is standing in the way" -- it only answers it
 	// for the factions someone remembered to list.
 	std::vector<CCircuitUnit*> GetOwnStructsNear(const springai::AIFloat3& pos, float radius);
+	// apex: same sweep, caller-owned buffer -- the by-value form heap-allocates
+	// a vector per call and both military callers run it inside a loop.
+	void GetOwnStructsNear(const springai::AIFloat3& pos, float radius, std::vector<CCircuitUnit*>& out);
+	// apex: the existence question, without building the list to ask it.
+	bool HasOwnStructNear(const springai::AIFloat3& pos, float radius);
 	// Our own damaged MOBILE units near pos, whatever their def. BuilderManager
 	// never registers a damagedHandler for ordinary combat unit defs (only for
 	// builders/rez-bots themselves and for static structures), so nothing ever
@@ -301,6 +426,13 @@ public:
 	// the only oracle here that can see one.
 	float GetPathLength(CCircuitUnit* unit, const springai::AIFloat3& to);
 	float GetEnemyCostAt(const springai::AIFloat3& pos, float radius) const;
+	// How close the nearest enemy is to being able to shoot this spot: the
+	// smallest (distance - its weapon reach - `reactS` seconds of its own
+	// walking) over every enemy we can see. Negative means something already
+	// covers the spot. `foeOut`, when given, receives that enemy's position.
+	float GetEnemyReachSlack(const springai::AIFloat3& pos, float reactS,
+			springai::AIFloat3* foeOut = nullptr);
+	void RebuildReachCache();
 	float GetBuilderThreatAt(const springai::AIFloat3& pos) const;
 	float GetUnitThreatAt(CCircuitUnit* unit, const springai::AIFloat3& pos) const;
 	void Garbage(CCircuitUnit* unit, const char* reason);
@@ -315,7 +447,12 @@ public:
 
 	using EnemyInfos = std::map<ICoreUnit::Id, CEnemyInfo*>;
 private:
-	mutable std::map<std::string, float> tunables;  // see GetTunable
+	mutable std::unordered_map<std::string, float> tunables;  // see GetTunable
+	mutable std::map<std::string, std::string> aiOpts;  // this bot's lobby options
+	mutable bool aiOptsRead = false;
+	mutable float lavaLevel = NO_LAVA;   // see GetLavaLevel
+	mutable int lavaFrame = -1;
+	float lavaCrest = NO_LAVA;           // see SetLavaCrest
 
 	std::pair<CEnemyInfo*, bool> RegisterEnemyInfo(ICoreUnit::Id unitId, bool isInLOS = false);
 	CEnemyInfo* RegisterEnemyInfo(springai::Unit* e);
@@ -344,7 +481,28 @@ private:
 	void UpdateActions();
 
 	Units teamUnits;  // owner
+	// Indices over teamUnits, so the "our units near here" helpers stop walking
+	// the whole team once per call. INVALIDATION CONTRACT: teamUnits is mutated
+	// in exactly three places -- RegisterTeamUnit, UnregisterTeamUnit and the
+	// Release() clear -- and all three maintain these. A unit's CCircuitDef is
+	// fixed at construction (CCircuitUnit has no SetCircuitDef), so nothing ever
+	// migrates buckets. Each vector is kept sorted by unit id, which is the order
+	// a std::map walk produced, so callers see the same sequence they always did.
+	std::map<int, std::vector<CCircuitUnit*>> unitsByDef;  // def id -> units
+	std::vector<CCircuitUnit*> teamStatics;  // !IsMobile(), the only ones GetOwnStructsNear can return
+	std::vector<CCircuitUnit*> teamMobiles;  // IsMobile(), likewise for GetOwnDamagedNear
+	void IndexTeamUnit(CCircuitUnit* unit, bool isAdd);
 	EnemyInfos enemyInfos;  // owner
+	std::vector<CEnemyInfo*> enemyById;  // apex: the same map indexed by unit id, for GetEnemyInfo
+	void SetEnemyById(int id, CEnemyInfo* e) {
+		if (id < 0) {
+			return;
+		}
+		if ((size_t)id >= enemyById.size()) {
+			enemyById.resize(id + 1024, nullptr);
+		}
+		enemyById[id] = e;
+	}
 	CAllyTeam* allyTeam;
 	bool isAllyTeamInit;
 
@@ -386,6 +544,38 @@ private:
 	bool isAllyBaseAvoid;
 // <<< AIOptions.lua ---- END
 
+// >>> Unit track record ---- BEGIN
+public:
+	struct SXch { float dealt = .0f; float taken = .0f; };   // metal, A -> B and B -> A
+private:
+	std::unordered_map<ICoreUnit::Id, float> recDealt;      // per unit this game, for the death line
+	std::unordered_map<long long, SXch> recGame;     // this game, (our def, their def)
+	std::unordered_map<long long, SXch> recStored;   // from the file
+	std::unordered_map<CCircuitDef::Id, int> recTier;   // the script's DefTier
+	// Each type's totals over both tables, both sides: [0] all, [1+t] against
+	// opponent tier t. Read per candidate per enemy def, so never a table walk.
+	struct SAggRow { SXch s[5]; SXch col; };   // col: their copies only, as B
+	mutable std::unordered_map<CCircuitDef::Id, SAggRow> recAgg;
+	mutable bool recAggDirty = true;
+	void RecordAggAdd(CCircuitDef::Id a, CCircuitDef::Id b, float dealt, float taken) const;
+	const SXch& RecordAggOf(CCircuitDef::Id id, int tier) const;
+	static long long RecordKey(CCircuitDef::Id a, CCircuitDef::Id b) { return (long long)a * 65536 + b; }
+	int RecordTierOf(CCircuitDef::Id id) const;
+	void RecordSum(CCircuitDef::Id a, CCircuitDef::Id b, float& dealt, float& taken) const;
+	// A game with tweakunits/tweakdefs set plays altered stats: its record is
+	// built fresh from that game alone, and never loaded or saved.
+	bool recTweaked = false;
+	std::vector<std::pair<CCircuitDef*, float>> recFoe;   // fielded enemy attackers by def
+	float recFoeTotal = .0f;
+	int recFoeFrame = -1;
+	void RecordFoeRefresh();
+	std::string recPath;
+	void RecordLoad();
+	void RecordSave();
+	static bool RecordCounts(CCircuitDef* cdef);
+	static float MetalOf(CCircuitDef* cdef, float damage);
+// <<< Unit track record ---- END
+
 // >>> Recent trade record ---- BEGIN
 private:
 	#define TRADE_DECAY_PERIOD	(FRAMES_PER_SEC * 30)
@@ -399,11 +589,19 @@ private:
 	#define BLOCKED_BUILD_TTL	(FRAMES_PER_SEC * 30)
 	springai::AIFloat3 blockedBuildPos = -RgtVector;
 	int blockedBuildFrame = -1000000;
+	int blockedBuildDef = -1;
+	struct SBlockMark { springai::AIFloat3 pos; int def; int frame; };
+	std::vector<SBlockMark> blockedQueue;
+	std::unordered_map<long long, int> noPathMarks;  // (mobile id, sector) -> frame
+	int allyPowerFrame = -1;
+	std::vector<std::pair<springai::AIFloat3, float>> allyPowerList;
+	std::vector<std::pair<springai::AIFloat3, int>> unsafeSites;
 	// def id -> engine pathType. UnitDef::GetMoveData() allocates a wrapper the
 	// caller must delete, so the lookup is done once per def.
 	std::map<int, int> pathTypes;
 	float engageBoost = 1.f;
 	springai::AIFloat3 frontPos = -RgtVector;
+	springai::AIFloat3 healPos = -RgtVector;
 	// Base grid, published by script. cell <= 0 means "no grid yet".
 	springai::AIFloat3 gridAnchor = -RgtVector;
 	springai::AIFloat3 gridFwd = ZeroVector;
@@ -484,6 +682,18 @@ public:
 	CGameAttribute* GetGameAttribute() const { return gameAttribute.get(); }
 	const std::shared_ptr<CScheduler>& GetScheduler() { return scheduler; }
 	int GetLastFrame()    const { return lastFrame; }
+	// apex: census of engine orders sent to sniper-class units, by kind,
+	// logged every 30s so the move-only rule for that class is measurable.
+	void NoteSniperOrder(CCircuitDef::SniperOrder kind);
+	// apex: census of every engine order this AI sends, by kind, with the ones
+	// that repeat what the same unit was already told. See CCircuitUnit::NoteOrder.
+	void NoteOrder(int kind, int bucket, bool suppressed, int src = 0);
+	// apex: orders the arbiter refused, per call site -- what a centre TRIED to
+	// do while a higher-ranked decision was still running.
+	void NoteOrderRefused(int src, int byPrio);
+	// apex: the arc-side tiebreak that a sticky side would have held. Counted
+	// with apex_arc_sticky OFF too, so one run says what turning it on buys.
+	void NoteArcFlip(bool held, unsigned units);
 	int GetSkirmishAIId() const { return skirmishAIId; }
 	int GetTeamId()       const { return teamId; }
 	int GetAllyTeamId()   const { return allyTeamId; }
@@ -494,6 +704,8 @@ public:
 	CEngine*              GetEngine()     const { return engine.get(); }
 	springai::Cheats*     GetCheats()     const { return cheats.get(); }
 	springai::Log*        GetLog()        const { return log.get(); }
+	void LogLine(const char* msg);
+	void FlushLog();
 	springai::Game*       GetGame()       const { return game.get(); }
 	CMap*                 GetMap()        const { return map.get(); }
 	springai::Lua*        GetLua()        const { return lua.get(); }
@@ -539,8 +751,93 @@ private:
 	uint64_t perfFrameMaxUs = 0;
 	unsigned perfFrameCalls = 0;
 	int perfFrameNextLog = 0;
+	// apex: the frame's cost split into its four top-level calls, so the
+	// non-script remainder stops being one opaque bucket.
+	uint64_t perfAllyUs = 0;
+	uint64_t perfJobsUs = 0;
+	uint64_t perfActUs = 0;
+	uint64_t perfScrUs = 0;   // script->Update(): AngelScript, not unattributed C++
+	// apex: the engine events, which run OUTSIDE AiFrame -- not part of the
+	// split's total, and until now counted as engine time. See HandleGameEvent.
+	uint64_t perfEvtNs = 0;
+	uint64_t perfEvtTopicNs[64] = {};
+	unsigned perfEvtTopicN[64] = {};
+	unsigned perfEvtCalls = 0;
+	// apex: a census, not a clock -- how many elements the O(n) helpers walked
+	// this minute. Increments only, so measuring costs nothing; a helper whose
+	// visited count grows faster than the unit count is the quadratic one.
+	uint64_t perfFeatSweep = 0;   // features visited by the four wreck sweeps
+	unsigned perfFeatCalls = 0;
+	uint64_t perfReachSweep = 0;  // enemies visited by GetEnemyReachSlack
+	unsigned perfReachCalls = 0;
+	// ...and what it ANSWERED, because a wrong envelope costs nothing to walk.
+	float perfReachWorst = std::numeric_limits<float>::max();
+	float perfReachMax = 0.f;
+	uint64_t perfReachRebuildNs = 0;
+	unsigned perfReachRebuilds = 0;
+	CCircuitDef* perfReachMaxDef = nullptr;
+	uint64_t perfOwnSweep = 0;    // own units visited by GetOwn*Near/OfDef
+	unsigned perfOwnCalls = 0;
+	// ...split four ways, because "own" named a helper family, not a helper, and
+	// the next session needs to know which of them is the one that costs.
+	uint64_t perfOwnDefSweep = 0;    unsigned perfOwnDefCalls = 0;
+	uint64_t perfOwnStrSweep = 0;    unsigned perfOwnStrCalls = 0;
+	uint64_t perfOwnDmgSweep = 0;    unsigned perfOwnDmgCalls = 0;
+	mutable uint64_t perfEcostSweep = 0;  // enemies visited by GetEnemyCostAt
+	mutable unsigned perfEcostCalls = 0;
+	// apex: orders sent, orders dropped as provable no-ops, and the repeats
+	// bucketed by how far the commanded point moved: [0] bit-identical,
+	// [1] < SQUARE_SIZE (the goal radius our move orders carry), [2] < 4,
+	// [3] < 16 squares, [4] further. Everything past [0] re-paths.
+	unsigned ordSent[5] = {0, 0, 0, 0, 0};
+	unsigned ordSup[5] = {0, 0, 0, 0, 0};
+	unsigned ordRep[5][5] = {{0}};
+	// apex: the same census split by CALL SITE (CCircuitUnit::OrdSrc), because
+	// the kind/distance one cannot say which loop is generating the churn.
+	// [0] sent, [1] re-sends within 3s, [2] the far ones among those.
+	static constexpr int ORD_SRC_N = 22;
+	unsigned ordRefused[ORD_SRC_N] = {0};
+	unsigned ordSrc[ORD_SRC_N][3] = {{0}};
+	unsigned arcFlip[2] = {0, 0};   // [0] side changed, [1] a sticky side held it
+	unsigned arcFlipU[2] = {0, 0};  // units re-slotted by those
+	// apex: SET-TARGET HOLDER CENSUS. unit_target_on_the_move.lua blocks
+	// CMD_UNIT_SET_TARGET in AllowCommand, so the order looks free -- but it
+	// enrols the unit, and the gadget's GameFrame then re-applies every
+	// holder's target every 5 frames (weapon TryTarget per weapon under
+	// CallAsTeam, SetUnitTarget, four SetUnitRulesParam). That cost scales
+	// with HOLDERS, not with our send rate, and it is billed to the engine.
+	// Two independent counts, because either alone can be doubted. `tgtHeld` is
+	// ours: every unit we sent a set-target to and have not stopped, so it is an
+	// UPPER bound -- the gadget also drops a holder by itself when the target
+	// dies (n%5 checkTarget) or leaves radar+los (n%15 removeUnseenTarget), and
+	// we do not see those. The sampled half reads the gadget's own
+	// unitRulesParam "targetID", one unit per frame with the cursor walked by
+	// id, and is the lower-side check on it.
+	std::set<CCircuitUnit*> tgtHeld;
+	ICoreUnit::Id tgtCursor = -1;
+	unsigned tgtSamp = 0;   // units probed this minute
+	unsigned tgtHold = 0;   // ...of which the gadget still holds a target for
+	unsigned tgtRel = 0;    // ...of which it holds none but once did (param == -1)
+	bool tgtRawLogged = false;  // S7: prove the callback is not silently dead
+	// apex: featureDef -> its constants, filled on first sight. See GetFeatDefInfo.
+	std::vector<SFeatDefInfo> featDefInfo;
+	int metalResId = -1;
+	// apex: GetEnemyReachSlack's input, flattened once per frame. See its .cpp comment.
+	using SReachEnemy = circuit::SReachEnemy;
+	std::vector<SReachEnemy> reachCache;
+	// apex: bounding-volume tree over reachCache, rebuilt with it. See BuildReachTree.
+	using SReachNode = circuit::SReachNode;
+	std::vector<SReachNode> reachNodes;
+	int32_t BuildReachTree(int32_t first, int32_t count);
+	float ReachNodeMinDist(int32_t ni, float px, float pz) const;
+	void ReachQuery(int32_t ni, float px, float pz, float reactS, float minDist,
+			float& worst, uint32_t& bestIdx, const SReachEnemy*& best);
+	static float ReachIn(const SReachEnemy& e, float reactS);
+	int reachCacheFrame = -1;
 	int squadDiagNextLog = 0;
 	int ghostPurgeNext = 0;
+	std::array<int, static_cast<int>(CCircuitDef::SniperOrder::_SIZE_)> sniperOrders{};
+	int sniperOrderNextLog = 0;
 	int skirmishAIId;
 	int teamId;
 	int allyTeamId;
@@ -558,6 +855,11 @@ private:
 	std::unique_ptr<springai::Pathing>    pathing;
 	std::unique_ptr<springai::Drawer>     drawer;
 	std::unique_ptr<springai::SkirmishAI> skirmishAI;
+	FILE* logFile;
+	std::string logTag;
+	int64_t logEpochNs;   // process age when logSteady0 was taken
+	std::chrono::steady_clock::time_point logSteady0;
+	std::mutex logMutex;
 	std::unique_ptr<springai::Team>       team;
 
 	static std::unique_ptr<CGameAttribute> gameAttribute;

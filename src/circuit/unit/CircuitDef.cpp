@@ -181,6 +181,8 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 {
 	thrDmgMod.fill(1.f);
 	maxRange.fill(.0f);
+	autoRange.fill(.0f);
+	autoShellS.fill(1.0e9f);
 	threatRange.fill(0);
 
 	id = def->GetUnitDefId();
@@ -257,6 +259,16 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 	isRezAble = def->IsAbleToResurrect();
 	isKamikazeD = def->IsAbleToKamikaze()
 		|| ((def->GetSelfDCountdown() == 0) && !def->IsBuilder());   // crawling bombs: countdown-0 selfd, no kamikaze flag (corroach)
+	{
+		// BAR's own group for exploding units. The Epic Tumbleweed (armvadert4)
+		// selfds on a 10 s countdown, so the test above missed it: it was priced
+		// as army and retreated home to detonate in our base.
+		auto ug = customParams.find("unitgroup");
+		if ((ug != customParams.end()) && (ug->second == "explo")
+			&& (def->GetSpeed() > 0.f) && !def->IsBuilder()) {
+			isKamikazeD = true;
+		}
+	}
 	areaCells = (def->GetXSize() / 2) * (def->GetZSize() / 2);
 	footX = def->GetXSize() / 2;
 	footZ = def->GetZSize() / 2;
@@ -420,6 +432,8 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 	float bestWpRange = std::numeric_limits<float>::max();
 	float airDps = .0f;
 	float airDmg = .0f;
+	float fireDps = .0f;  // weapons that fire on their own: a D-gun is a command, not a rate
+	float fireDmg = .0f;
 	float surfDps = .0f;
 	float surfDmg = .0f;
 	float waterDps = .0f;
@@ -429,6 +443,7 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 	// bar is "can hit an aircraft", which condemns a Tzar and blesses a Luger.
 	float longestLandRange = .0f;
 	bool longestLandDumb = false;
+	int intercept = 0;  // S7: the raw GetInterceptor, logged once per def below
 	CWeaponDef* bestDGunDef = nullptr;
 	CWeaponDef* bestWpDef = nullptr;
 	WeaponMount* bestDGunMnt = nullptr;
@@ -448,6 +463,17 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 			delete wd;
 			delete mount;
 			continue;
+		}
+
+		{
+			auto cu = customParams.find("carried_unit");
+			if (cu != customParams.end()) {
+				droneName = cu->second;
+				auto mu = customParams.find("maxunits");
+				const int mx = (mu != customParams.end())
+						? utils::string_to_int(mu->second) : 1;
+				droneCount = (mx > 1) ? mx : 1;
+			}
 		}
 
 		float dps = .0f;
@@ -504,7 +530,13 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 			dps += extraDmg * wd->GetSalvoSize() / reloadTime * scale;
 		}
 
-		int weaponCat = mount->GetOnlyTargetCategory();
+		// BAR SAYS "DO NOT SHOOT AT AIR" WITH badtargetcategory, not by leaving
+		// VTOL out of onlytargetcategory: armpw declares onlytargetcategory
+		// "NOTSUB" (which CONTAINS VTOL) and badtargetcategory "VTOL". Reading
+		// only the first made a 180-range cannon bot surface-to-air, and the
+		// squad's air filter tests the LEADER's def -- so one Pawn in front
+		// pointed the whole row at a bomber it cannot reach.
+		int weaponCat = mount->GetOnlyTargetCategory() & ~mount->GetBadTargetCategory();
 		targetCategory |= weaponCat;
 
 		const float wdAoe = wd->GetAreaOfEffect();
@@ -515,11 +547,19 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 //		it = customParams.find("truerange");
 		const float range = /*(it != customParams.end()) ? utils::string_to_float(it->second) : */wd->GetRange();
 
-		isAlwaysHit |= ((wt == "Cannon") || (wt == "DGun") || (wt == "EmgCannon") || (wt == "Flame") ||
-				(wt == "LaserCannon") || (wt == "AircraftBomb")) && (projectileSpeed * FRAMES_PER_SEC >= .8f * range);  // Cannons with fast projectiles
-		isAlwaysHit |= (wt == "BeamLaser") || (wt == "LightningCannon") || (wt == "Rifle") ||  // Instant-hit
-				(((wt == "MissileLauncher") || (wt == "StarburstLauncher") || ((wt == "TorpedoLauncher") && wd->IsSubMissile())) && wd->IsTracks());  // Missiles
-		const bool isAirWeapon = isAlwaysHit && (range > 150.f);
+		// PER WEAPON, resolving the FIXME on the member: isAlwaysHit accumulates
+		// with |= across the whole loop, so once ANY weapon was instant-hit every
+		// LATER weapon over 150 range counted as an air weapon whatever its own
+		// type or projectile speed. The member keeps its old meaning (ThreatMap
+		// reads it as "this def has an always-hit weapon"); only the air test
+		// below becomes per-weapon, which is what it always claimed to be.
+		const bool wAlwaysHit =
+				((((wt == "Cannon") || (wt == "DGun") || (wt == "EmgCannon") || (wt == "Flame") ||
+				(wt == "LaserCannon") || (wt == "AircraftBomb")) && (projectileSpeed * FRAMES_PER_SEC >= .8f * range))  // Cannons with fast projectiles
+				|| (wt == "BeamLaser") || (wt == "LightningCannon") || (wt == "Rifle")  // Instant-hit
+				|| (((wt == "MissileLauncher") || (wt == "StarburstLauncher") || ((wt == "TorpedoLauncher") && wd->IsSubMissile())) && wd->IsTracks()));  // Missiles
+		isAlwaysHit |= wAlwaysHit;
+		const bool isAirWeapon = wAlwaysHit && (range > 150.f);
 		canSurfTargetAir |= isAirWeapon;
 
 		const bool isLandWeapon = ((wt != "TorpedoLauncher") || wd->IsSubMissile());
@@ -555,15 +595,27 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 				// factor in stockpile weapons that take a long time to build, use their build time and assume thats their 'reload' time
 				outDps += localDmg * wd->GetSalvoSize() / (std::max(reloadTime, wd->IsStockpileable() ? wd->GetStockpileTime() : 0)) * scale;
 			};
+			float aD = .0f, aP = .0f, sD = .0f, sP = .0f, wD = .0f, wP = .0f;
 			if ((weaponCat & circuit->GetAirCategory()) && isAirWeapon) {
-				adjustDamage(armor.airTypes, airDmg, airDps);
+				adjustDamage(armor.airTypes, aD, aP);
 			}
 			if ((weaponCat & circuit->GetLandCategory()) && isLandWeapon) {
-				adjustDamage(armor.surfTypes, surfDmg, surfDps);
+				adjustDamage(armor.surfTypes, sD, sP);
 			}
 			if ((weaponCat & circuit->GetWaterCategory()) && isWaterWeapon) {
-				adjustDamage(armor.waterTypes, waterDmg, waterDps);
+				adjustDamage(armor.waterTypes, wD, wP);
 			}
+			airDmg += aD; airDps += aP;
+			surfDmg += sD; surfDps += sP;
+			waterDmg += wD; waterDps += wP;
+			if (!wd->IsManualFire()) {
+				fireDps += std::max(std::max(aP, sP), wP);
+				fireDmg += std::max(std::max(aD, sD), wD);
+			}
+		}
+		if (!wd->IsManualFire()) {
+			fireDps += dps;
+			fireDmg += dmg;
 		}
 		airDmg += dmg;
 		airDps += dps;
@@ -573,11 +625,29 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 		waterDps += dps;
 
 		minRange = std::min(minRange, range);
+		// apex: a weapon that only answers a fire COMMAND (D-gun, nuke, Juno) or
+		// that only hits projectiles (antinuke) never shoots a unit walking past,
+		// so its range is not reach. @see GetAutoRange.
+		intercept |= wd->GetInterceptor();
+		const bool isAutoFire = !wd->IsManualFire() && (wd->GetInterceptor() == 0);
+		const bool wInstant = (wt == "BeamLaser") || (wt == "LightningCannon") || (wt == "Rifle")
+				|| (((wt == "MissileLauncher") || (wt == "StarburstLauncher") || (wt == "TorpedoLauncher")) && wd->IsTracks());
+		const float wShellS = (wInstant || (projectileSpeed <= 0.f)) ? 1.0e9f : projectileSpeed * FRAMES_PER_SEC;
+		auto noteAuto = [this, wShellS](RangeType rt, float r) {
+			float& ar = autoRange[static_cast<RangeT>(rt)];
+			if (r > ar) {
+				ar = r;
+				autoShellS[static_cast<RangeT>(rt)] = wShellS;
+			}
+		};
 		if ((weaponCat & circuit->GetAirCategory()) && isAirWeapon) {
 			float& mr = maxRange[static_cast<RangeT>(RangeType::AIR)];
 			mr = std::max(mr, range);
 			if (mr > maxRange[static_cast<RangeT>(maxRangeType)]) {
 				maxRangeType = RangeType::AIR;
+			}
+			if (isAutoFire) {
+				noteAuto(RangeType::AIR, range);
 			}
 		}
 		if ((weaponCat & circuit->GetLandCategory()) && isLandWeapon && (range > longestLandRange)) {
@@ -590,10 +660,14 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 					|| (wt == "TorpedoLauncher")) && !wd->IsTracks();
 		}
 		if ((weaponCat & circuit->GetLandCategory()) && isLandWeapon) {
+			const float landRange = (isAbleToFly && (wt == "Cannon")) ? range * 1.25f : range;  // 1.25 - gunship height hax
 			float& mr = maxRange[static_cast<RangeT>(RangeType::LAND)];
-			mr = std::max(mr, (isAbleToFly && (wt == "Cannon")) ? range * 1.25f : range);  // 1.25 - gunship height hax
+			mr = std::max(mr, landRange);
 			if (mr > maxRange[static_cast<RangeT>(maxRangeType)]) {
 				maxRangeType = RangeType::LAND;
+			}
+			if (isAutoFire) {
+				noteAuto(RangeType::LAND, landRange);
 			}
 		}
 		if ((weaponCat & circuit->GetWaterCategory()) && isWaterWeapon) {
@@ -601,6 +675,9 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 			mr = std::max(mr, range);
 			if (mr > maxRange[static_cast<RangeT>(maxRangeType)]) {
 				maxRangeType = RangeType::WATER;
+			}
+			if (isAutoFire) {
+				noteAuto(RangeType::WATER, range);
 			}
 		}
 
@@ -672,6 +749,23 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 
 	isDumbFire = longestLandDumb;
 
+	// apex/S7: one line for every def whose longest weapon is not reach. Proves
+	// IsManualFire/GetInterceptor read live values, and names the defs that used
+	// to project a map-wide no-go zone through GetEnemyReachSlack.
+	if (GetMaxRange() > GetAutoRange()) {
+		circuit->LOG("apex: reach %s maxRange=%.0f autoRange=%.0f interceptor=%i",
+				def->GetName(), GetMaxRange(), GetAutoRange(), intercept);
+	}
+	// The other way a range is not reach: a shell that takes longer than a
+	// second to arrive. One line per def whose surface reach shrinks.
+	{
+		const float lr = GetAutoRange(RangeType::LAND);
+		const float ls = GetAutoShellSpeed(RangeType::LAND);
+		if ((lr > 0.f) && (ls < lr)) {
+			circuit->LOG("apex: reach-mover %s range=%.0f shell=%.0f/s", def->GetName(), lr, ls);
+		}
+	}
+
 	isAttacker = (airDps > .1f) || (surfDps > .1f) || (waterDps > .1f);
 	if (IsMobile() && !IsAttacker()) {  // mobile bomb?
 		WeaponDef* wd = def->GetDeathExplosion();
@@ -727,8 +821,10 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 	// Captured here, after the mobile-bomb substitution above, so the identity
 	// power == sqrt(rawDps)*rawDmg^0.25*THREAT_MOD*sqrt(hp+shield) holds by
 	// construction for any def whose power is not later modded.
-	rawDps = dps;
-	rawDmg = dmg;
+	// The script values a unit by these; the commander's 111k D-gun "dps"
+	// made him read as six pawns once the power mod divided it back out.
+	rawDps = (fireDps > .1f) ? std::min(dps, fireDps) : dps;
+	rawDmg = (fireDps > .1f) ? std::min(dmg, fireDmg) : dmg;
 	defThrDmg = pwrDmg = sqrtf(dps) * std::pow(dmg, 0.25f) * THREAT_MOD;
 	defThreat = power = defThrDmg * sqrtf(health + maxShield * SHIELD_MOD);
 	airThrDmg = sqrtf(airDps) * std::pow(airDmg, 0.25f) * THREAT_MOD;
@@ -740,6 +836,13 @@ CCircuitDef::CCircuitDef(CCircuitAI* circuit, UnitDef* def, std::unordered_set<I
 			surfThrDmg * sqrtf(health + maxShield * SHIELD_MOD),
 			waterThrDmg * sqrtf(health + maxShield * SHIELD_MOD));
 #endif
+	// apex/S7: an attacker with power but no surface or air threat is invisible
+	// to every script-side "can it hit what floats" test; name it once.
+	if (IsAttacker() && (surfDps <= .1f) && (airDps <= .1f)) {
+		circuit->LOG("apex: threat-blind %s water=%.1f cat=0x%x land=0x%x air=0x%x water=0x%x",
+				def->GetName(), waterDps, targetCategory,
+				circuit->GetLandCategory(), circuit->GetAirCategory(), circuit->GetWaterCategory());
+	}
 }
 
 CCircuitDef::~CCircuitDef()
@@ -875,6 +978,7 @@ void CCircuitDef::SetRange(float range)
 	maxRangeType = RangeType::AIR;
 	for (RangeT rt = 0; rt < static_cast<RangeT>(RangeType::_SIZE_); ++rt) {
 		maxRange[rt] = range;
+		autoRange[rt] = range;
 	}
 }
 
@@ -883,6 +987,7 @@ void CCircuitDef::SetRange(RangeType type, float range)
 	// TODO: Asserts >= 0?
 	minRange = std::min(minRange, range);
 	maxRange[static_cast<RangeT>(type)] = range;
+	autoRange[static_cast<RangeT>(type)] = range;
 	if (range > maxRange[static_cast<RangeT>(maxRangeType)]) {
 		maxRangeType = type;
 	}

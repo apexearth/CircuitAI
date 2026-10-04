@@ -55,9 +55,18 @@ CAntiAirTask::CAntiAirTask(ITaskModule* mgr, float powerMod)
 		: ISquadTask(mgr, FightType::AA, powerMod)
 {
 	CCircuitAI* circuit = manager->GetCircuit();
-	float x = rand() % circuit->GetTerrainManager()->GetTerrainWidth();
-	float z = rand() % circuit->GetTerrainManager()->GetTerrainHeight();
-	position = AIFloat3(x, circuit->GetMap()->GetElevationAt(x, z), z);
+	// A SEED POSITION MUST NOT BE ABLE TO KILL THE ENGINE. The width and height
+	// here are AIFloat3::maxxpos/maxzpos, statics the wrapper fills in at init
+	// and shares across every AI in the process -- read them as zero and the
+	// modulo itself faults, and the raw CMap::GetElevationAt below indexes the
+	// height map with no check of its own (the GetBuilderThreatAt lesson).
+	// Reproduced live 2026-09-07: 8v8 on Special Hotstepper, access violation
+	// in this constructor at frame 12306, with every AI behaviour switched off.
+	const int w = circuit->GetTerrainManager()->GetTerrainWidth();
+	const int h = circuit->GetTerrainManager()->GetTerrainHeight();
+	const float x = (w > 0) ? float(rand() % w) : 0.f;
+	const float z = (h > 0) ? float(rand() % h) : 0.f;
+	position = AIFloat3(x, circuit->GetElevationAt(AIFloat3(x, 0.f, z)), z);
 }
 
 CAntiAirTask::~CAntiAirTask()
@@ -177,7 +186,7 @@ void CAntiAirTask::Update()
 					unit->GetTravelAct()->StateWait();
 				}
 				TRY_UNIT(circuit, unit,
-					unit->CmdFightTo(groupPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame);
+					unit->CmdFightTo(groupPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame, CCircuitUnit::OrdSrc::REGROUP);
 				)
 			}
 		}
@@ -187,7 +196,7 @@ void CAntiAirTask::Update()
 	bool isExecute = (updCount % 4 == 2);
 	if (!isExecute) {
 		for (CCircuitUnit* unit : units) {
-			isExecute |= unit->IsForceUpdate(frame);
+			isExecute |= unit->IsForceUpdate(frame, CCircuitUnit::Wake::RECONSIDER);
 		}
 		if (!isExecute) {
 			if (wasRegroup && !pPath->posPath.empty()) {
@@ -387,7 +396,7 @@ void CAntiAirTask::FindTarget()
 		{
 			continue;
 		}
-		const float elevation = map->GetElevationAt(ePos.x, ePos.z);
+		const float elevation = circuit->GetElevationAt(ePos);
 		const bool IsInWater = cdef->IsPredictInWater(elevation);
 		if (edef->IsInWater(elevation, ePos.y)) {
 			if (!(IsInWater ? cdef->HasSubToWater() : cdef->HasSurfToWater())) {  // notAW
@@ -457,7 +466,7 @@ void CAntiAirTask::ApplyDisengagePath(const CQueryPathSingle* query)
 			unit->GetTravelAct()->StateWait();
 		}
 		TRY_UNIT(circuit, unit,
-			unit->CmdMoveTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			unit->CmdMoveTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::SCOUT);
 		)
 	}
 	state = State::ROAM;
@@ -539,7 +548,7 @@ void CAntiAirTask::Fallback()
 			unit->GetTravelAct()->StateWait();
 		}
 		TRY_UNIT(circuit, unit,
-			unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::ENGAGE);
 		)
 	}
 }

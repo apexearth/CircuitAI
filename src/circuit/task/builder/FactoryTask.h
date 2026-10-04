@@ -34,6 +34,10 @@ public:
 
 private:
 	virtual void FindBuildSite(CCircuitUnit* builder, const springai::AIFloat3& pos, float searchRadius) override;
+	// One placement attempt at a given self-clearance; false means no facing
+	// could be placed. Run twice, the second time with the clearance dropped.
+	bool TryBuildSite(CCircuitUnit* builder, const springai::AIFloat3& pos,
+			float searchRadius, float selfBar, const springai::AIFloat3& builderPos);
 
 	virtual bool Load(std::istream& is) override;
 	virtual void Save(std::ostream& os) const override;

@@ -112,7 +112,7 @@ void CArtilleryTask::Execute(CCircuitUnit* unit)
 
 		TRY_UNIT(circuit, unit,
 			if (!circuit->IsCheating()) {
-				unit->GetUnit()->Attack(bestTarget->GetUnit(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+				unit->CmdAttack(bestTarget, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
 			} else {
 				unit->CmdAttackGround(bestTarget->GetPos(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
 			}
@@ -356,7 +356,7 @@ void CArtilleryTask::Fallback(CCircuitUnit* unit, bool proceed)
 		unit->GetTravelAct()->StateWait();
 	}
 	TRY_UNIT(circuit, unit,
-		unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+		unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::ENGAGE);
 	)
 }
 

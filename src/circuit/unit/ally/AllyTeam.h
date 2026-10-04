@@ -14,7 +14,9 @@
 
 #include <memory>
 #include <map>
+#include <vector>
 #include <unordered_set>
+#include <cstdint>
 
 namespace springai {
 	class AIFloat3;
@@ -36,6 +38,19 @@ class CEnergyGrid;
 class CDefenceData;
 class CPathFinder;
 class CFactoryData;
+
+// apex: the enemy reach envelope (CCircuitAI::GetEnemyReachSlack). Kept per ally
+// team as well: every allied AI sees the same enemies, and each was rebuilding it.
+struct SReachEnemy {
+	float x, z, reach, speed, shell;
+	uint32_t idx;  // position in the unsorted cache: keeps the tie-break exact
+};
+struct SReachNode {
+	float minx, minz, maxx, maxz;
+	float maxReach, maxSpeed;  // envelope bound for everything below
+	int32_t first, count;      // count > 0: leaf range; count == 0: inner node
+	int32_t right;             // inner: right child; the left child is self + 1
+};
 
 class CAllyTeam {
 public:
@@ -72,6 +87,8 @@ public:
 	void UpdateFriendlyUnits();
 	CAllyUnit* GetFriendlyUnit(ICoreUnit::Id unitId) const;
 	const AllyUnits& GetFriendlyUnits() const { return friendlyUnits; }
+	// apex: bumped on every refresh pass; a merge over the friendlies at the same version is a no-op
+	int GetFriendlyVersion() const { return friendlyVersion; }
 
 	const std::set<CEnemyUnit*>& GetDyingEnemies() const { return enemyManager->GetDyingEnemies(); }
 	void DyingEnemy(CEnemyUnit* enemy, int frame) { enemyManager->DyingEnemy(enemy, frame); }
@@ -92,6 +109,11 @@ public:
 	void UpdateInLOS(CEnemyUnit* data, CCircuitDef::Id unitDefId);
 
 	void Update(CCircuitAI* ai);
+
+	// apex: the ThreatMap/InfluenceMap/EnemyManager rebuild is per ALLY TEAM,
+	// not per AI -- only the leader enqueues it -- so only the leader may log
+	// and clear the counters, or seven AIs print zeros over the eighth.
+	void LogMapPerf(CCircuitAI* ai);
 	void EnqueueUpdate();
 
 	CEnemyUnit* GetEnemyOrFakeIn(const springai::AIFloat3& startPos, const springai::AIFloat3& dir, float length,
@@ -114,11 +136,23 @@ public:
 
 	CCircuitAI* GetAuthority() const { return circuit; }
 	void SetAuthority(CCircuitAI* authority);
+	int reachFrame = -1;
+	std::vector<SReachEnemy> reachCache;
+	std::vector<SReachNode> reachNodes;
 private:
 	void DelegateAuthority();
 	void ApplyAuthority(CCircuitAI* newOwner);
 
 	CCircuitAI* circuit;  // authority
+	// apex: friendly-list rebuild cost -- a delete+new of every ally unit
+	// plus an engine call per unit, demanded from task updates up to once
+	// a frame; counted here because no other timer can see it.
+	uint64_t perfFrUs = 0;
+	unsigned perfFrCalls = 0;
+	int perfFrNextLog = 0;
+	unsigned perfFrAdd = 0;
+	unsigned perfFrDel = 0;
+	std::vector<int> friendlyIds;  // scratch for the diff, capacity kept
 	std::shared_ptr<IMainJob> releaseTask;
 	TeamIds teamIds;
 	utils::CRegion startBox;
@@ -126,6 +160,7 @@ private:
 	int initCount;
 	int resignSize;
 	int lastUpdate;
+	int friendlyVersion = 0;
 	AllyUnits friendlyUnits;  // owner
 	CQuadField quadField;
 

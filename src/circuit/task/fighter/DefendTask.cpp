@@ -7,6 +7,7 @@
 
 #include "task/fighter/DefendTask.h"
 #include "map/InfluenceMap.h"
+#include <algorithm>
 #include "map/ThreatMap.h"
 #include "module/MilitaryManager.h"
 #include "setup/SetupManager.h"
@@ -18,7 +19,6 @@
 #include "unit/action/MoveAction.h"
 #include "unit/action/SupportAction.h"
 #include "unit/enemy/EnemyUnit.h"
-#include "unit/enemy/EnemyManager.h"
 #include "unit/CircuitUnit.h"
 #include "CircuitAI.h"
 #include "util/Utils.h"
@@ -27,26 +27,8 @@
 
 #include "OOAICallback.h"
 #include "AISCommands.h"
-#include "Drawer.h"
 
 namespace circuit {
-
-// How close a DEFEND task must be to the front to count as holding it, and how
-// far past its own maxPower it must get before it may leave anyway. Above that
-// the squad is surplus and is better spent attacking than standing still.
-#define FRONT_HOLD_RANGE	1800.0f
-// A DEFENCE POOL MUST BE ABLE TO REACH THE BAR IT IS HELD TO.
-//
-// CanAssignTo above stops a pool accepting units at maxPower, and this held it
-// until attackPower >= maxPower * FRONT_HOLD_POWER -- so at 2.0 the release was
-// unreachable except by merging two full pools, and every pool passes the
-// `onFront` test by construction because UpdateDefenceTasks writes the anchor
-// into `position` and this compares `position` against that same anchor.
-// apexearth, watching a 400 metal/s player: "we have 257 of them and they all
-// just stay in our base... none of them leave."
-// At 1.0 the release matches the cap: a pool that is full is a pool that may go.
-#define FRONT_HOLD_POWER	1.0f
-
 
 using namespace springai;
 using namespace terrain;
@@ -67,6 +49,14 @@ CDefendTask::~CDefendTask()
 
 bool CDefendTask::CanAssignTo(CCircuitUnit* unit) const
 {
+	if ((leader != nullptr)
+		&& !SameClimb(manager->GetCircuit(), leader->GetCircuitDef(), unit->GetCircuitDef()))
+	{
+		return false;
+	}
+	if (manager->GetCircuit()->GetLastFrame() < detachUntil) {
+		return false;
+	}
 	return (attackPower < maxPower) && (static_cast<CDefendTask*>(unit->GetTask())->GetPromote() == promote);
 }
 
@@ -76,23 +66,13 @@ void CDefendTask::AssignTo(CCircuitUnit* unit)
 	CCircuitDef* cdef = unit->GetCircuitDef();
 	highestRange = std::max(highestRange, cdef->GetLosRadius());
 
-	// See CAttackTask::AssignTo: only an escort that cannot join the squad's
-	// fight follows the leader.
-	if (cdef->IsRoleSupport() && !cdef->HasSurfToLand() && (leader != unit)) {
+	if (cdef->IsRoleSupport() && (leader != unit)) {
 		unit->PushBack(new CSupportAction(unit));
 	}
 
 	int squareSize = manager->GetCircuit()->GetPathfinder()->GetSquareSize();
 	ITravelAction* travelAction;
-	// Formation travel (apexearth 2026-08-21): the whole ground squad marches on
-	// synchronized-speed FIGHT orders, not per-unit moves -- engage together en
-	// route, hold the line together. Wounded still leave: RetreatTask swaps the
-	// travel act out (dropping the fight order), and the engagement standoff
-	// ring still owns distance-keeping once fighting starts. Flyers keep MOVE.
-	if ((cdef->IsAttrSiege() && (manager->GetCircuit()->GetTunable("apex_siege_fight", 1.f) > 0.f))
-		|| (!cdef->IsAbleToFly()
-			&& (manager->GetCircuit()->GetTunable("apex_fight_travel", 1.f) > 0.f)))
-	{
+	if (cdef->IsAttrSiege()) {
 		travelAction = new CFightAction(unit, squareSize);
 	} else {
 		travelAction = new CMoveAction(unit, squareSize);
@@ -114,33 +94,12 @@ void CDefendTask::Start(CCircuitUnit* unit)
 {
 	CCircuitAI* circuit = manager->GetCircuit();
 	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
-	// apex: same solo-walk clamp as Merge -- a chase rewrites this task's
-	// anchor to the target, and a fresh unit starting alone toward a deep
-	// anchor is the single-unit attack stream. Deep anchors are approached
-	// from the lane muster instead.
-	AIFloat3 anchor = position;
-	if (circuit->GetTunable("apex_defend_muster", 1.f) > 0.f) {
-		const AIFloat3& basePos = circuit->GetSetupManager()->GetBasePos();
-		const float deepR = circuit->GetMilitaryManager()->GetBaseDefRange() * 1.25f;
-		const AIFloat3& front = circuit->GetFrontPos();
-		if (utils::is_valid(front)
-			&& (basePos.SqDistance2D(anchor) > SQUARE(deepR))
-			&& (basePos.SqDistance2D(front) < basePos.SqDistance2D(anchor)))
-		{
-			anchor = front;
-		}
-	}
-	AIFloat3 pos = utils::get_radial_pos(anchor, SQUARE_SIZE * 32);
+	AIFloat3 pos = utils::get_radial_pos(position, SQUARE_SIZE * 32);
 	CTerrainManager::CorrectPosition(pos);
 	AIFloat3 freePos = terrainMgr->FindBuildSite(unit->GetCircuitDef(), pos, 300.0f, UNIT_NO_FACING, true);
 //	AIFloat3 freePos = terrainMgr->FindSpringBuildSite(unit->GetCircuitDef(), pos, 300.0f, UNIT_NO_FACING);
 	pos = utils::is_valid(freePos) ? freePos : pos;
 
-	// apex: transit is a MOVE, not a fight-walk. A fight order stops the unit
-	// to trade with whatever it meets on the way, alone -- the measured DEFEND
-	// death bucket. Engaged fighting is Attack()'s ring; the walk there should
-	// not wade (apexearth: "using a fight order was incorrect. We need to be
-	// using move commands along with set target").
 	TRY_UNIT(circuit, unit,
 		unit->CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, circuit->GetLastFrame() + FRAMES_PER_SEC * 60);
 		unit->CmdWantedSpeed(NO_SPEED_LIMIT);
@@ -150,57 +109,18 @@ void CDefendTask::Start(CCircuitUnit* unit)
 void CDefendTask::Update()
 {
 	++updCount;
+	const bool hunting = manager->GetCircuit()->GetLastFrame() < detachUntil;
 
 	/*
 	 * Promote task if possible
 	 */
-	if (updCount % 32 == 1) {
+	if (!hunting && (updCount % 32 == 1)) {
 		CMilitaryManager* militaryMgr = static_cast<CMilitaryManager*>(manager);
-		// Hold a share of the defenders ON the line. A DEFEND task promotes its
-		// whole squad into an ATTACK the moment it is strong enough, which is
-		// exactly what turns a garrison back into a roaming blob -- apexearth:
-		// "the way that AI seems to work is it has these squads, and the squads
-		// move around like blobs on the map, they don't necessarily have any
-		// responsibility to cover any specific area".
-		//
-		// Only defenders sitting on the front are held; a DEFEND task somewhere
-		// in the rear has nothing to cover and should still promote.
-		CCircuitAI* circuitAI = manager->GetCircuit();
-		const bool onFront = circuitAI->HasFrontPos()
-				&& (position.SqDistance2D(circuitAI->GetFrontPos()) < SQUARE(FRONT_HOLD_RANGE));
-		// THE HOLD MUST NOT SKIP THE MERGE BELOW. Returning here jumped over
-		// GetMergeTask(), and merging is the ONLY way a defence pool can grow:
-		// CMilitaryManager::Enqueue builds a fresh one-unit CDefendTask for every
-		// unit, and DefaultMakeTask scans GUARD tasks only. So a pool whose units
-		// were individually weaker than the bar could never combine to reach it
-		// and stood in base for the rest of the game, while anything already over
-		// the bar promoted and left alone.
-		const bool held = (onFront && (attackPower < maxPower * FRONT_HOLD_POWER))
-				|| (circuitAI->GetLastFrame() < noPromoteUntil);
-		// The any-attack-exists shortcut fed solos: each promotion CREATES an
-		// attack task, so after the first real squad -- alive or already dead --
-		// every fresh 1-unit pool saw "an attack exists" and left alone, a
-		// self-sustaining one-by-one stream (measured first-10m squad avg 1.3
-		// vs enemy 2.6). Reinforcements now leave only at a real fraction of
-		// the current quota, which tracks the living army.
-		const float reinforceFrac = circuitAI->GetTunable("apex_reinforce_frac", 0.5f);
-		const bool mayReinforce = !militaryMgr->GetTasks(check).empty()
-				&& (attackPower >= maxPower * reinforceFrac);
-		if (!held && ((attackPower >= maxPower) || mayReinforce)) {
-			if (leader != nullptr) {
-				IntentPing(leader->GetPos(circuitAI->GetLastFrame()),
-						utils::string_format("DEF>ATK n=%d %s", (int)units.size(),
-								(attackPower >= maxPower) ? "full" : "reinforce"));
-			}
+		if ((attackPower >= maxPower) || !militaryMgr->GetTasks(check).empty()) {
 			IFighterTask* task = militaryMgr->Enqueue(TaskF::Common(promote));
 			decltype(units) tmpUnits = units;
 			for (CCircuitUnit* unit : tmpUnits) {
-				// Read BEFORE AssignTask: RemoveAssignee erases coward state.
-				const bool coward = IsCoward(unit);
 				manager->AssignTask(unit, task);
-				if (coward) {
-					task->MarkCoward(unit);
-				}
 			}
 //			manager->DoneTask(this);  // NOTE: RemoveAssignee() will abort task
 			return;
@@ -210,7 +130,7 @@ void CDefendTask::Update()
 	/*
 	 * Merge tasks if possible
 	 */
-	ISquadTask* task = GetMergeTask();
+	ISquadTask* task = hunting ? nullptr : GetMergeTask();
 	if (task != nullptr) {
 		task->Merge(this);
 		units.clear();
@@ -242,13 +162,15 @@ void CDefendTask::Update()
 	 * Update target
 	 */
 	const bool isTargetsFound = FindTarget();
+	if (leader == nullptr) {
+		return;
+	}
 
 	const AIFloat3& startPos = leader->GetPos(frame);
 	state = State::ROAM;
 	if ((GetTarget() != nullptr) || isTargetsFound) {
 		const float slack = (circuit->GetInflMap()->GetAllyDefendInflAt(position) > INFL_EPS) ? 500.f : 300.f;
 		if (position.SqDistance2D(startPos) < SQUARE(highestRange + slack)) {
-			IntentPing(startPos, utils::string_format("DEF fight n=%d", (int)units.size()));
 			state = State::ENGAGE;
 			Attack(frame);
 			return;
@@ -286,37 +208,12 @@ void CDefendTask::Merge(ISquadTask* task)
 	const AIFloat3& leadPos = leader->GetPos(frame);
 	frame += FRAMES_PER_SEC * 60;
 
-	// apex: a rookie must not walk SOLO to a leader already deep in enemy
-	// ground -- that stream of single-unit arrivals was the top death bucket
-	// of a watched game (73% of combat metal on DEFEND at fwd ~0.7, each dead
-	// ~1s after disengaging at 9-15% hp). A deep pool takes reinforcements at
-	// the army's lane anchor instead; the pool collects them when it moves as
-	// a body.
-	AIFloat3 musterPos = leadPos;
-	if (circuit->GetTunable("apex_defend_muster", 1.f) > 0.f) {
-		const AIFloat3& basePos = circuit->GetSetupManager()->GetBasePos();
-		const float deepR = circuit->GetMilitaryManager()->GetBaseDefRange() * 1.25f;
-		const AIFloat3& front = circuit->GetFrontPos();
-		if (utils::is_valid(front)
-			&& (basePos.SqDistance2D(leadPos) > SQUARE(deepR))
-			&& (basePos.SqDistance2D(front) < basePos.SqDistance2D(leadPos)))
-		{
-			musterPos = front;
-		}
-	}
-
 	const std::set<CCircuitUnit*>& rookies = task->GetAssignees();
-	if (!rookies.empty()) {
-		IntentPing(musterPos, utils::string_format("DEF join n=%d+%d",
-				(int)units.size(), (int)rookies.size()));
-	}
 	for (CCircuitUnit* unit : rookies) {
 		unit->SetTask(this);
 
-		// apex: rookies RUN to the group instead of fight-walking -- the
-		// fight order made every merge a stream of solo engagements en route.
 		TRY_UNIT(circuit, unit,
-			unit->CmdFightTo(musterPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame);
+			unit->CmdFightTo(leadPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame);
 		)
 	}
 	units.insert(rookies.begin(), rookies.end());
@@ -341,7 +238,7 @@ bool CDefendTask::FindTarget()
 	const AIFloat3& pos = leader->GetPos(circuit->GetLastFrame());
 	SArea* area = leader->GetArea();
 	CCircuitDef* cdef = leader->GetCircuitDef();
-	const float maxPower = attackPower * powerMod * GetHealthScale();
+	const float maxPower = attackPower * powerMod;
 	const float weaponRange = cdef->GetMaxRange() * 0.9f;
 	const int canTargetCat = cdef->GetTargetCategory();
 	const int noChaseCat = cdef->GetNoChaseCategory();
@@ -353,50 +250,24 @@ bool CDefendTask::FindTarget()
 	CEnemyInfo* bestTarget = nullptr;
 	float minSqDist = std::numeric_limits<float>::max();
 
-	// Intent bookkeeping for the pings: did the target we were walking on just
-	// drop out of sight, and what did this pass refuse. LOS flicker is the
-	// classic "walk at them, then turn around for no reason" -- the elected
-	// enemy goes hidden, the election comes up empty, and the fallback walks
-	// the pool back to the front.
-	const bool prevHidden = (GetTarget() != nullptr) && GetTarget()->IsHidden();
-	int refusedOdds = 0, refusedSmall = 0, refusedSolo = 0;
-
 	SetTarget(nullptr);  // make adequate enemy->GetTasks().size()
 	enemyPositions.clear();
 	threatMap->SetThreatType(leader);
-	// apex: SQUADS COORDINATE (the DEFEND half -- see CAttackTask::FindTarget
-	// for the attack half and the rationale). The odds test below refused
-	// fights the pools TOGETHER would win: two pools massed at the same front
-	// each answered with only their own power, so half the army committed and
-	// the other half refused the same fight and walked back to its post. An
-	// ally counts only when it stands within support range of the ENEMY --
-	// support that can actually reach that fight -- so a lone fresh unit at
-	// home cannot borrow the strength of an army on the far side of the base.
-	struct SAllySquad {
-		springai::AIFloat3 pos;
-		float power;
-	};
-	std::vector<SAllySquad> allySquads;
-	const float supportR = circuit->GetTunable("apex_support_radius", 3000.f);
-	if (circuit->GetTunable("apex_ally_aggregate", 1.f) > 0.f) {
-		CMilitaryManager* mmS = circuit->GetMilitaryManager();
-		for (IFighterTask::FightType ftS : {IFighterTask::FightType::ATTACK,
-		                                    IFighterTask::FightType::DEFEND}) {
-			for (IFighterTask* otherS : mmS->GetTasks(ftS)) {
-				if (otherS == static_cast<IFighterTask*>(this)) {
-					continue;
-				}
-				ISquadTask* stS = static_cast<ISquadTask*>(otherS);
-				CCircuitUnit* olS = stS->GetLeader();
-				if (olS == nullptr) {
-					continue;
-				}
-				allySquads.push_back({olS->GetPos(circuit->GetLastFrame()),
-						otherS->GetAttackPower()});
-			}
-		}
-	}
 	const CCircuitAI::EnemyInfos& enemies = circuit->GetEnemyInfos();
+	// apex: "armies ignore enemies less than half their strength unless
+	// defending the home base" (docs/24). A raider under half the pool is left
+	// to our guns where they outgun it, and otherwise to a squad of its own size
+	// split off for it (apexearth 2026-10-02: "create a squad of an appropriate
+	// size to chase the little amphibious tanks... if you have defense over
+	// there, then you should just assume that it'll be fine").
+	const int frame = circuit->GetLastFrame();
+	const bool detached = frame < detachUntil;
+	const float pettyBar = attackPower * .5f;
+	int pettySkipped = 0;
+	int pettyCovered = 0;
+	CEnemyInfo* detachFor = nullptr;
+	float detachSq = std::numeric_limits<float>::max();
+	float detachThreat = .0f;
 	for (auto& kv : enemies) {
 		CEnemyInfo* enemy = kv.second;
 		if (enemy->IsHidden() || (enemy->GetTasks().size() > 2)) {
@@ -404,138 +275,36 @@ bool CDefendTask::FindTarget()
 		}
 
 		const AIFloat3& ePos = enemy->GetPos();
-		// A DEFENCE SQUAD MUST FIGHT WHAT IS ON TOP OF IT. GetAllyDefendInflAt is
-		// written only by our BUILDINGS -- CInfluenceMap::AddStaticArmed and
-		// AddUnarmed; AddMobileArmed feeds drawAllyInfl and never this one -- so a
-		// squad held away from the base is blind to whatever is shooting it.
-		// `atUs` is the same reach Update() uses to decide ENGAGE.
-		const bool atUs = (pos.SqDistance2D(ePos) < SQUARE(highestRange + 500.f));
-		// apex: DEFENCE IS A POST, NOT A PURSUIT. Election is measured from
-		// the ASSIGNED position only -- the first cut of this kept atUs
-		// (proximity to the squad) as a self-defense clause, and it was the
-		// remaining creep vector: a won fight advances the squad, the next
-		// enemy falls inside its bubble, gets elected as "self-defense", and
-		// the chain marched a victorious pool deeper until it died (watched
-		// 2026-08-21). Units still auto-fire at whatever enters weapon range;
-		// the TASK never re-targets off its own advanced ground.
-		const bool postMode = circuit->GetTunable("apex_defend_post", 1.f) > 0.f;
-		const bool electable = postMode
-			? (position.SqDistance2D(ePos) < SQUARE(highestRange + 500.f))
-			: atUs;
-		if ((!electable && (inflMap->GetAllyDefendInflAt(ePos) < INFL_EPS))
+		if ((inflMap->GetAllyDefendInflAt(ePos) < INFL_EPS)
 			|| !terrainMgr->CanMoveToPos(area, ePos))
 		{
 			continue;
 		}
 
 		const float sqEBDist = basePos.SqDistance2D(ePos);
-		// apex: the home-fight allowance was 4x, PER FRAGMENT -- every fresh
-		// unit off the factory took its own 4:1 fight against the intruder and
-		// died, so under attack the army trickled into the grinder and never
-		// rebuilt (apexearth: "we just continuously let them die... we need
-		// time to build up our army to match what's up there. 1.2x"). At 1.2
-		// a pool engages only near parity; refusals fall back to the front
-		// posts, which is where the pool accumulates until it matches.
 		float checkPower = maxPower;
-		if ((sqEBDist < sqBaseRange) || atUs) {
-			checkPower *= circuit->GetTunable("apex_defend_home_odds", 1.2f);
+		if (sqEBDist < sqBaseRange) {
+			checkPower *= 4.0f - 3.0f / baseRange * sqrtf(sqEBDist);  // 400% near base
 		}
-		// The threat map reads ~0 almost everywhere, so the old
-		// `checkPower <= GetThreatAt` test never refused anything and the
-		// multiplier was decorative. Enemy GROUP influence is the live layer.
-		float eThreat = threatMap->GetThreatAt(ePos);
-		{
-			float localInfl = .0f;
-			const std::vector<CEnemyManager::SEnemyGroup>& groups =
-					circuit->GetEnemyManager()->GetEnemyGroups();
-			for (const CEnemyManager::SEnemyGroup& g : groups) {
-				if (g.pos.SqDistance2D(ePos) < SQUARE(800.f)) {
-					localInfl += g.influence;
-				}
-			}
-			eThreat = std::max(eThreat, localInfl);
-		}
-		float allyPower = .0f;
-		for (const SAllySquad& ally : allySquads) {
-			if (ally.pos.SqDistance2D(ePos) < SQUARE(supportR)) {
-				allyPower += ally.power;
-			}
-		}
-		if (checkPower + allyPower <= eThreat) {
-			++refusedOdds;
+		const float eThreat = threatMap->GetThreatAt(ePos);
+		if (checkPower <= eThreat) {
 			continue;
 		}
-		// PROPORTIONAL RESPONSE. Line 355 below rewrites this task's anchor to
-		// the chosen target, so chasing is the WHOLE pool walking there -- and
-		// the nearest-first choice is value-blind, so a two-raider ping in the
-		// rear pulled every massed pool off the line (apexearth: "I see us move
-		// our entire army way in the back to chase down some petty raiders...
-		// then the enemy just walks into our base and crushes us"). apexearth
-		// 2026-08-22 set the bar: "our armies generally ignore enemies that
-		// are less than half their strength unless we need to defend the home
-		// base" -- so the ratio is 0.5, the home ring is exempt, and anything
-		// already in contact (atUs) is always fought.
-		const bool atHome = sqEBDist < sqBaseRange;
-		if (!atUs && !atHome && (eThreat < attackPower
-				* circuit->GetTunable("apex_chase_min_ratio", 0.5f)))
-		{
-			++refusedSmall;
-			continue;
-		}
-		// A SOLO POOL DOES NOT CHASE DEEP. The manager spawns fresh 1-unit
-		// defend tasks, and after the muster clamp brings one to the lane it
-		// is its own leader -- a lone unit electing a target past the deep
-		// ring IS the single-unit attack stream (watched 2026-08-21: 73% of
-		// combat metal, defend at fwd ~0.7, dead 1s after disengage). It
-		// still fights whatever is on top of it (atUs) or inside the ring;
-		// travelling deep needs company. apex_defend_solo_deep=1 restores
-		// the old behavior.
-		if (!atUs && (units.size() <= 1)
-			&& (circuit->GetTunable("apex_defend_solo_deep", 0.f) <= 0.f))
-		{
-			const AIFloat3& basePos2 = circuit->GetSetupManager()->GetBasePos();
-			const float deepR = circuit->GetMilitaryManager()->GetBaseDefRange() * 1.25f;
-			if (basePos2.SqDistance2D(ePos) > SQUARE(deepR)) {
-				++refusedSolo;
-				continue;
-			}
-		}
-		// The eThreat gate above reads the surf threat map, which measures ~0
-		// almost everywhere -- a Punisher line rates as empty ground and the
-		// pool walks into it. Enemy GROUP influence is the live layer (the same
-		// data AttackTask's strength test reads), so this can refuse walking
-		// the pool at ground whose standing groups outweigh it. Scoped away
-		// from home: what is on top of us (atUs) or inside the base ring is
-		// fought regardless. DEFAULT OFF: at margins 1.0 and 0.6 it traded
-		// losses for timeout draws without winning more (see CHANGES.md
-		// 2026-08-21); the lever stays for experiments.
-		const float engageMargin = circuit->GetTunable("apex_defend_engage_margin", 0.f);
-		if ((engageMargin > 0.f) && !atUs && (sqEBDist >= sqBaseRange)) {
-			float localInfl = .0f;
-			const std::vector<CEnemyManager::SEnemyGroup>& groups =
-					circuit->GetEnemyManager()->GetEnemyGroups();
-			for (const CEnemyManager::SEnemyGroup& g : groups) {
-				if (g.pos.SqDistance2D(ePos) < SQUARE(800.f)) {
-					localInfl += g.influence;
-				}
-			}
-			if ((localInfl > .0f) && (maxPower < localInfl * engageMargin)) {
-				continue;
-			}
-		}
+		const bool petty = !detached && (units.size() > 1)
+				&& (sqEBDist >= sqBaseRange) && (eThreat < pettyBar);
 
-		const float elevation = map->GetElevationAt(ePos.x, ePos.z);
+		const float elevation = circuit->GetElevationAt(ePos);
 		const bool IsInWater = cdef->IsPredictInWater(elevation);
 		CCircuitDef* edef = enemy->GetCircuitDef();
 		if (edef != nullptr) {
 			if (((edef->GetCategory() & canTargetCat) == 0)
 				|| ((edef->GetCategory() & noChaseCat) != 0)
 				|| circuit->GetCircuitDef(edef->GetId())->IsIgnore()
-				|| (edef->IsAbleToFly() && !(IsInWater ? cdef->HasSubToAir() : cdef->HasSurfToAir())))  // notAA
+				|| (edef->IsAbleToFly() && !cdef->IsAirHunter(IsInWater)))  // notAA
 			{
 				continue;
 			}
-			float elevation = map->GetElevationAt(ePos.x, ePos.z);
+			float elevation = circuit->GetElevationAt(ePos);
 			if (edef->IsInWater(elevation, ePos.y)) {
 				if (!(IsInWater ? cdef->HasSubToWater() : cdef->HasSurfToWater())) {  // notAW
 					continue;
@@ -557,37 +326,46 @@ bool CDefendTask::FindTarget()
 		}
 
 		float sqDist = pos.SqDistance2D(ePos);
+		if (petty) {
+			++pettySkipped;
+			if (inflMap->GetAllyStaticInflAt(ePos) >= eThreat) {
+				++pettyCovered;
+			} else if (enemy->GetTasks().empty() && (sqDist < detachSq)) {
+				detachSq = sqDist;
+				detachFor = enemy;
+				detachThreat = eThreat;
+			}
+			continue;
+		}
 		if (minSqDist > sqDist) {
 			minSqDist = sqDist;
 			bestTarget = enemy;
-			// eThreat bucketed to hundreds: a raw float in the message would
-			// defeat IntentPing's dedupe on every jitter of the influence map.
-			tgtWhy = utils::string_format("%s e=%d", atUs ? "atUs" : "post",
-					((int)eThreat / 100) * 100);
 		}
 		enemyPositions.push_back(ePos);
 	}
 
+	if (detached && (bestTarget != nullptr)) {
+		detachUntil = std::max(detachUntil, frame + FRAMES_PER_SEC * 10);
+	}
+	int sent = 0;
+	if (detachFor != nullptr) {
+		sent = Detach(detachFor, detachThreat);
+	}
+	if (((pettySkipped > 0) || (sent > 0)) && (frame >= pettyLogAt)) {
+		pettyLogAt = frame + FRAMES_PER_SEC * 30;
+		circuit->LOG("apex: defend-petty t=%i lead=%s at=%.0f,%.0f n=%u skipped=%i covered=%i power=%.0f sent=%i for=%s target=%s",
+				circuit->GetTeamId(), cdef->GetDef()->GetName(), pos.x, pos.z, (unsigned)units.size(),
+				pettySkipped, pettyCovered, attackPower, sent,
+				(detachFor != nullptr) && (detachFor->GetCircuitDef() != nullptr)
+					? detachFor->GetCircuitDef()->GetDef()->GetName() : "-",
+				(bestTarget != nullptr) && (bestTarget->GetCircuitDef() != nullptr)
+					? bestTarget->GetCircuitDef()->GetDef()->GetName() : "-");
+	}
 	if (bestTarget != nullptr) {
 		SetTarget(bestTarget);
-		// apex: the anchor does NOT follow the target. This rewrite advanced
-		// the post to every elected enemy, so each chase re-based the pool on
-		// its new ground and the next election reached further -- the creep
-		// that turned defense into pursuit. The post stays where it was
-		// assigned; when the enemy flees past reach, the no-target fallback
-		// walks the pool back to a front post instead of following.
-		if (circuit->GetTunable("apex_defend_post", 1.f) <= 0.f) {
-			position = GetTarget()->GetPos();
-		}
+		position = GetTarget()->GetPos();
 	}
 	if (enemyPositions.empty()) {
-		// Ranked by how misleading the silent version was when watched: a
-		// vanished target beats "we refused a fight" beats "nothing there".
-		noTgtWhy = prevHidden ? "tgt hid"
-				: (refusedOdds > 0) ? "outgunned"
-				: (refusedSmall > 0) ? "small fry"
-				: (refusedSolo > 0) ? "solo"
-				: "no enemy";
 		return false;
 	}
 
@@ -595,48 +373,59 @@ bool CDefendTask::FindTarget()
 	// Return: target, startPos=leader->pos, enemyPositions
 }
 
+// apex: split off the members nearest the raider until they carry its threat
+// at home-defence parity (his 1.2x, docs/24), keeping at least half the pool.
+int CDefendTask::Detach(CEnemyInfo* enemy, float threat)
+{
+	CCircuitAI* circuit = manager->GetCircuit();
+	const int frame = circuit->GetLastFrame();
+	const AIFloat3 ePos = enemy->GetPos();
+	const float need = std::max(threat * 1.2f, 1.f);
+	// Only fighters go, and one always stays: a squad's leader is never a
+	// support unit, so a pool left with only those has no leader at all.
+	std::vector<std::pair<float, CCircuitUnit*>> byDist;
+	for (CCircuitUnit* unit : units) {
+		if (!unit->GetCircuitDef()->IsRoleSupport()) {
+			byDist.push_back(std::make_pair(unit->GetPos(frame).SqDistance2D(ePos), unit));
+		}
+	}
+	std::sort(byDist.begin(), byDist.end(),
+			[](const std::pair<float, CCircuitUnit*>& a, const std::pair<float, CCircuitUnit*>& b) {
+				return a.first < b.first;
+			});
+	std::vector<CCircuitUnit*> pick;
+	float got = .0f;
+	float left = attackPower;
+	for (const auto& du : byDist) {
+		if (got >= need) {
+			break;
+		}
+		const float p = du.second->GetCircuitDef()->GetPower();
+		if ((left - p < attackPower * .5f) || (pick.size() + 1 >= byDist.size())) {
+			break;
+		}
+		pick.push_back(du.second);
+		got += p;
+		left -= p;
+	}
+	if (pick.empty() || (got < need)) {
+		return 0;
+	}
+	CMilitaryManager* militaryMgr = static_cast<CMilitaryManager*>(manager);
+	CDefendTask* det = static_cast<CDefendTask*>(militaryMgr->Enqueue(TaskF::Defend(check, promote, got)));
+	det->position = ePos;
+	det->detachUntil = frame + FRAMES_PER_SEC * 30;
+	for (CCircuitUnit* unit : pick) {
+		manager->AssignTask(unit, det);
+	}
+	return int(pick.size());
+}
+
 void CDefendTask::ApplyTargetPath(const CQueryPathMulti* query)
 {
 	pPath = query->GetPathInfo();
 
 	if (!pPath->posPath.empty()) {
-		CCircuitAI* circuit = manager->GetCircuit();
-		// apex: THE ROUTE IS VALIDATED WITH A LIVE SENSOR, NOT THE DEAD ONE.
-		// Target selection already refuses bad fights on group influence, but
-		// the A* that walks there prices ground off CThreatMap -- measured ~0
-		// almost everywhere -- so a correctly-chosen target still got
-		// approached through a Punisher's kill zone. Any waypoint beyond
-		// engaged range carrying enemy influence past our own power refuses
-		// the walk and re-musters at the front instead of idling. OFF by
-		// default: the over-refusal risk is the exact engage-margin failure
-		// signature, so it ships as an experiment lever.
-		const float pathMargin = circuit->GetTunable("apex_path_infl_margin", 0.f);
-		if (pathMargin > 0.f) {
-			CInfluenceMap* inflMap = circuit->GetInflMap();
-			const AIFloat3& lp = leader->GetPos(circuit->GetLastFrame());
-			const float atUsSq = SQUARE(highestRange + 500.f);
-			for (const AIFloat3& wp : pPath->posPath) {
-				if (lp.SqDistance2D(wp) < atUsSq) {
-					continue;   // already at engaged range: fight what's on us
-				}
-				if (inflMap->GetEnemyInflAt(wp) > maxPower * pathMargin) {
-					noTgtWhy = "hot path";
-					FallbackFrontPos();
-					return;
-				}
-			}
-		}
-		// apex: intent ping (apexearth: "Can we have our squads ping on the map
-		// so that I can understand what they're thinking?"). Named target, and
-		// IntentPing dedupes -- one mark per change of mind, not per re-path.
-		{
-			CEnemyInfo* tgt = GetTarget();
-			const char* tname = ((tgt != nullptr) && (tgt->GetCircuitDef() != nullptr))
-					? tgt->GetCircuitDef()->GetDef()->GetName() : "enemy";
-			IntentPing(leader->GetLastPos(),
-					utils::string_format("DEF n=%d > %s %s", (int)units.size(), tname,
-							tgtWhy.c_str()));
-		}
 		ActivePath(lowestSpeed);
 	} else {
 		Fallback();
@@ -646,10 +435,6 @@ void CDefendTask::ApplyTargetPath(const CQueryPathMulti* query)
 void CDefendTask::FallbackFrontPos()
 {
 	CCircuitAI* circuit = manager->GetCircuit();
-	// The U-turn, explained: this is the decision that walks a pool back to a
-	// front post, and noTgtWhy is what emptied the election this pass.
-	IntentPing(leader->GetPos(circuit->GetLastFrame()),
-			utils::string_format("DEF n=%d back: %s", (int)units.size(), noTgtWhy.c_str()));
 	circuit->GetMilitaryManager()->FillFrontPos(leader, urgentPositions);
 	if (urgentPositions.empty()) {
 		FallbackBasePos();
@@ -676,13 +461,7 @@ void CDefendTask::ApplyFrontPos(const CQueryPathMulti* query)
 
 	if (!pPath->path.empty()) {
 		if (pPath->path.size() > 2) {
-			// apex: the pool marches TOGETHER. Uncapped, the fast units reach
-			// the front first and fight alone -- apexearth: "we often have our
-			// faster units running in and engaging the enemy army first, they
-			// die, then the slower units in the back either fight and die, or
-			// are already running away... move at the speed of the slowest
-			// unit in the group. This helps them to all stay together."
-			ActivePath(lowestSpeed);
+			ActivePath();
 		}
 	} else {
 		FallbackBasePos();
@@ -694,8 +473,6 @@ void CDefendTask::FallbackBasePos()
 	CCircuitAI* circuit = manager->GetCircuit();
 	CSetupManager* setupMgr = circuit->GetSetupManager();
 
-	IntentPing(leader->GetPos(circuit->GetLastFrame()),
-			utils::string_format("DEF n=%d home", (int)units.size()));
 	const AIFloat3& startPos = leader->GetPos(circuit->GetLastFrame());
 	const AIFloat3& endPos = setupMgr->GetBasePos();
 	const float pathRange = DEFAULT_SLACK * 4;
@@ -730,9 +507,7 @@ void CDefendTask::Fallback()
 	CCircuitAI* circuit = manager->GetCircuit();
 	const int frame = circuit->GetLastFrame();
 	for (CCircuitUnit* unit : units) {
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->StateWait();
-		}
+		unit->GetTravelAct()->StateWait();
 		TRY_UNIT(circuit, unit,
 			unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
 			unit->CmdWantedSpeed(lowestSpeed);

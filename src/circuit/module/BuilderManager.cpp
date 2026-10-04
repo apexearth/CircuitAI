@@ -51,6 +51,10 @@
 #include "json/json.h"
 
 #include "spring/SpringCallback.h"
+#include "AISCommands.h"
+
+#include <limits>
+#include <cmath>
 
 #include "Log.h"
 
@@ -183,6 +187,7 @@ void CBuilderManager::InitHandlers()
 		militaryMgr->AddResponse(unit);
 
 		workers.insert(unit);
+		rezzers.insert(unit);
 
 		UnitAdded(unit, UseAs::REZZER);
 	};
@@ -198,6 +203,8 @@ void CBuilderManager::InitHandlers()
 		militaryMgr->DelResponse(unit);
 
 		workers.erase(unit);
+		rezzers.erase(unit);
+		rezEvadeAt.erase(unit->GetId());
 		costQueries.erase(unit);
 
 		UnitRemoved(unit, UseAs::REZZER);
@@ -461,12 +468,18 @@ void CBuilderManager::Init()
 		CScheduler* scheduler = circuit->GetScheduler().get();
 		const int interval = 8;
 		const int offset = circuit->GetSkirmishAIId() % interval;
-		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::UpdateIdle, this), interval, offset + 0);
-		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::Update, this), 1/*interval*/, offset + 1);
+		// apex: every frame, a slice sized for the same pass length. Once per
+		// 8 frames the pass put ~10 elections in one frame and the script's
+		// slice held the later finishes over to the next pass.
+		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::UpdateIdle, this), 1, offset + 0, "bldIdle");
+		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::Update, this), 1/*interval*/, offset + 1, "bldUpd");
+		// Six times a second: his bar is one second, and a reflex that samples
+		// at the bar is already late by the time it fires.
+		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::UpdateRezGuard, this), 5, offset + 2, "rezGuard");
 
 		scheduler->RunJobEvery(CScheduler::GameJob(&CBuilderManager::Watchdog, this),
 								FRAMES_PER_SEC * 60,
-								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 10);
+								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 10, "wdog");
 	};
 
 	circuit->GetSetupManager()->ExecOnFindStart(subinit);
@@ -548,6 +561,7 @@ int CBuilderManager::UnitFinished(CCircuitUnit* unit)
 	}
 	auto itcl = reclaimUnits.find(unit);
 	if ((itcl != reclaimUnits.end()) && (itcl->second != nullptr)) {
+		itcl->second->SetDeathNote("reclaim-done");
 		AbortTask(itcl->second);
 	}
 
@@ -583,10 +597,12 @@ int CBuilderManager::UnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker)
 {
 	auto iter = unfinishedUnits.find(unit);
 	if (iter != unfinishedUnits.end()) {
+		iter->second->SetDeathNote("target-killed");
 		AbortTask(iter->second);
 	}
 	auto itre = repairUnits.find(unit->GetId());
 	if (itre != repairUnits.end()) {
+		itre->second->SetDeathNote("target-killed");
 		AbortTask(itre->second);
 	}
 	auto itcl = reclaimUnits.find(unit);
@@ -1022,60 +1038,6 @@ IUnitTask* CBuilderManager::DefaultMakeTask(CCircuitUnit* unit)
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	// A builder the Brain has no task for idles visibly.
 	return nullptr;
-	const int frame = circuit->GetLastFrame();
-	const AIFloat3& pos = unit->GetPos(frame);
-
-	const CCircuitDef* cdef = unit->GetCircuitDef();
-	constexpr float POWER_MOD = 1.5f;
-	if ((cdef->GetPower() > THREAT_MIN)
-		&& (circuit->GetMilitaryManager()->FindBCombatTarget(unit, pos, POWER_MOD, true) != nullptr))
-	{
-		return Enqueue(TaskB::Combat(POWER_MOD));
-	}
-
-	const auto it = costQueries.find(unit);
-	std::shared_ptr<IPathQuery> query = (it == costQueries.end()) ? nullptr : it->second;
-	if ((query != nullptr) && (query->GetState() != IPathQuery::State::READY)) {  // not ready
-		return nullptr;
-	}
-
-	CPathFinder* pathfinder = circuit->GetPathfinder();
-	std::shared_ptr<IPathQuery> q = pathfinder->CreateCostMapQuery(unit, circuit->GetThreatMap(),
-			/*unit->IsAttrBase() ? circuit->GetSetupManager()->GetBasePos() : */pos, cdef->GetPower());
-	costQueries[unit] = q;
-	pathfinder->RunQuery(circuit->GetScheduler().get(), q);
-
-	if (query == nullptr) {
-		return Enqueue(TaskB::Wait(FRAMES_PER_SEC));  // 1st run
-	}
-
-	std::shared_ptr<CQueryCostMap> pQuery = std::static_pointer_cast<CQueryCostMap>(query);
-	circuit->GetEconomyManager()->IsEnergyStalling();  // Only for UpdateEconomy
-
-	if (cdef->IsRoleComm() && (circuit->GetFactoryManager()->GetFactoryCount() > 0)) {  // hide commander?
-		CEnemyManager* enemyMgr = circuit->GetEnemyManager();
-		const CSetupManager::SCommInfo::SHide* hide = circuit->GetSetupManager()->GetHide(cdef);
-		if (hide != nullptr) {
-			if ((frame < hide->frame) || (GetWorkerCount() <= 2)) {
-				return (hide->sqPeaceTaskRad < 0.f)
-						? MakeBuilderTask(unit, pQuery.get())
-						: MakeCommPeaceTask(unit, pQuery.get(), hide->sqPeaceTaskRad);
-			}
-//			if ((enemyMgr->GetMobileThreat() / circuit->GetAllyTeam()->GetAliveSize() >= hide->threat)
-			if ((circuit->GetInflMap()->GetEnemyInflAt(pos) >= hide->threat)
-				|| ((hide->isAir) && (enemyMgr->GetEnemyCost(ROLE_TYPE(AIR)) > 1.f)))
-			{
-				return MakeCommDangerTask(unit, pQuery.get(), hide->sqDangerTaskRad);
-			}
-			return (hide->sqPeaceTaskRad < 0.f)
-					? MakeBuilderTask(unit, pQuery.get())
-					: MakeCommPeaceTask(unit, pQuery.get(), hide->sqPeaceTaskRad);
-		}
-	}
-
-	return unit->IsAttrBase()
-			? MakeEnergizerTask(unit, pQuery.get())
-			: MakeBuilderTask(unit, pQuery.get());
 }
 
 IBuilderTask* CBuilderManager::MakeEnergizerTask(CCircuitUnit* unit, const CQueryCostMap* query)
@@ -1659,6 +1621,118 @@ void CBuilderManager::RemoveBuildList(CCircuitUnit* unit, int hiddenDefs)
 	if (!buildDefs.empty()) {  // throws exception on set::erase otherwise
 		circuit->GetEconomyManager()->RemoveEconomyDefs(buildDefs);
 		circuit->GetMilitaryManager()->RemoveSensorDefs(buildDefs);
+	}
+}
+
+// THE REZ BOTS' REFLEX. Off the election path on purpose: AiMakeTask is only
+// called for a bot the idle task owns, so a bot carrying a reclaim was never
+// asked anything again and its flee rule could not see an enemy walking up to
+// it. The bar is the enemy's reach plus a second of its walking
+// (GetEnemyReachSlack). Dropping the task matters as much as the move order --
+// a builder task re-issues its own path move every second (CMoveAction) and
+// would walk the bot straight back in.
+void CBuilderManager::UpdateRezGuard()
+{
+	if (rezzers.empty()) {
+		return;
+	}
+	const int frame = circuit->GetLastFrame();
+	const float react = circuit->GetTunable("apex_rez_react_s", 1.0f);
+	CInfluenceMap* inflMap = circuit->GetInflMap();
+	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
+
+	for (CCircuitUnit* unit : rezzers) {
+		if ((unit == nullptr) || unit->IsDead()) {
+			continue;
+		}
+		// One already retreating is already leaving, and CRetreatTask re-issues
+		// its own movement -- two hands on the wheel walks it on the spot.
+		IUnitTask* held = unit->GetTask();
+		if ((held != nullptr) && (held->GetType() == IUnitTask::Type::RETREAT)) {
+			continue;
+		}
+		const AIFloat3 pos = unit->GetPos(frame);
+		AIFloat3 foe(-1.f, 0.f, -1.f);
+		const float slack = circuit->GetEnemyReachSlack(pos, react, &foe);
+		if (slack >= 0.f) {
+			continue;  // nothing can reach this spot before we would see it coming
+		}
+		++rezGuardPressed;
+		rezGuardWorst = std::min(rezGuardWorst, slack);
+
+		// One order every half second per bot: re-pathing on every tick walks
+		// on the spot, and the bot needs to actually cover ground.
+		auto it = rezEvadeAt.find(unit->GetId());
+		if ((it != rezEvadeAt.end()) && (frame < it->second + FRAMES_PER_SEC / 2)) {
+			continue;
+		}
+		rezEvadeAt[unit->GetId()] = frame;
+
+		// Far enough to be out of the envelope, not so far it is a trip home:
+		// the distance it is short by, plus a body length, and it is re-read
+		// six times a second on the way.
+		float need = std::min(-slack + 96.f, 900.f);
+		AIFloat3 back = pos - foe;
+		back.y = 0.f;
+		if (back.SqLength2D() < 1.f) {
+			back = circuit->GetSetupManager()->GetBasePos() - pos;
+			back.y = 0.f;
+			if (back.SqLength2D() < 1.f) {
+				continue;
+			}
+		}
+		back.Normalize2D();
+
+		// "In combat they should stand behind allied units away from enemies."
+		// Straight back is the direction; among a fan of them, the one standing
+		// in the least enemy influence is the one with our own units between it
+		// and the shooting -- influence is where the sides' power actually
+		// reaches, so this steers to cover rather than merely to distance.
+		AIFloat3 dest = pos;
+		float bestInfl = std::numeric_limits<float>::max();
+		static constexpr float FAN[5] = {0.f, 0.61f, -0.61f, 1.22f, -1.22f};
+		for (int k = 0; k < 5; ++k) {
+			const float c = cosf(FAN[k]);
+			const float sn = sinf(FAN[k]);
+			AIFloat3 p(pos.x + (back.x * c - back.z * sn) * need, pos.y,
+					pos.z + (back.x * sn + back.z * c) * need);
+			CTerrainManager::CorrectPosition(p);
+			if (!terrainMgr->CanMoveToPos(unit->GetArea(), p)) {
+				continue;
+			}
+			const float infl = (inflMap != nullptr) ? inflMap->GetEnemyInflAt(p) : 0.f;
+			if (infl < bestInfl) {
+				bestInfl = infl;
+				dest = p;
+			}
+		}
+		if (bestInfl == std::numeric_limits<float>::max()) {
+			continue;  // nowhere behind it we can walk
+		}
+
+		// Let the job go, or its own travel action pulls the bot back into the
+		// envelope within the second. The bot lands in the idle task and is
+		// re-elected in a few frames; the election reads the same envelope
+		// (EnemyReachSlack, sitesafety.as) and hands it work out of reach.
+		if ((held != nullptr) && (held->GetType() == IUnitTask::Type::BUILDER)) {
+			held->AddRef();
+			held->RemoveAssignee(unit);
+			held->Release();
+		}
+		TRY_UNIT(circuit, unit,
+			unit->CmdMoveTo(dest, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 3, CCircuitUnit::OrdSrc::BUILD);
+		)
+		++rezGuardMoves;
+	}
+
+	if (frame >= rezGuardLogAt) {
+		rezGuardLogAt = frame + FRAMES_PER_SEC * 60;
+		circuit->LOG("apex: rez-guard t=%i bots=%u pressed=%u moves=%u worst=%.0f",
+				circuit->GetTeamId(), (unsigned)rezzers.size(),
+				rezGuardPressed, rezGuardMoves, rezGuardWorst);
+		rezGuardPressed = 0;
+		rezGuardMoves = 0;
+		rezGuardWorst = 0.f;
 	}
 }
 

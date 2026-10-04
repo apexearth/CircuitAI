@@ -85,7 +85,7 @@ void CCombatTask::Execute(CCircuitUnit* unit)
 		AIFloat3 leadPos = position + lead;
 		CTerrainManager::CorrectPosition(leadPos);
 		TRY_UNIT(circuit, unit,
-			unit->CmdMoveTo(leadPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			unit->CmdMoveTo(leadPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::COMBAT);
 		)
 	}
 }

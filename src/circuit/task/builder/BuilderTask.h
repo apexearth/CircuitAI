@@ -12,6 +12,7 @@
 #include "util/Defines.h"
 #include "util/math/Geometry.h"
 
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -21,6 +22,10 @@ class CCircuitDef;
 class CAllyUnit;
 
 struct SBuildChain;
+
+// How far a build site must stay from the builder that ordered it for the
+// building's footprint to clear it. Defined in BuilderTask.cpp.
+float SelfClearance(CCircuitUnit* builder, CCircuitDef* buildDef);
 
 struct SResource {
 	float metal;
@@ -133,10 +138,13 @@ protected:
 	virtual bool Reevaluate(CCircuitUnit* unit);
 	void UpdatePath(CCircuitUnit* unit);
 	void ApplyPath(const CQueryPathSingle* query);
+	void ApplyPathUnbounded(const CQueryPathSingle* query);
+	void OnNoPath(CCircuitUnit* unit);
 	void HideAssignee(CCircuitUnit* unit);
 	void ShowAssignee(CCircuitUnit* unit);
 	virtual CAllyUnit* FindSameAlly(CCircuitUnit* builder, const std::vector<springai::Unit*>& friendlies);
 	virtual void FindBuildSite(CCircuitUnit* builder, const springai::AIFloat3& pos, float searchRadius);
+	std::function<bool (const springai::AIFloat3&)> SitePredicate(CCircuitUnit* builder, float selfBar, bool aboveCrest);
 	void FindFacing(const springai::AIFloat3& pos);
 
 	void ExecuteChain(SBuildChain* chain);
@@ -179,6 +187,8 @@ protected:
 
 	std::set<CCircuitUnit*> traveled;
 	std::set<CCircuitUnit*> executors;
+	static bool sInReelect;  // apex: inside Reevaluate's re-election
+	std::map<CCircuitUnit*, int> ordSilent;  // apex: frame a sent order was last seen unapplied
 
 #ifdef DEBUG_VIS
 	virtual void Log() override;

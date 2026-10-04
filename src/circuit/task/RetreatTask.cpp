@@ -19,6 +19,7 @@
 #include "terrain/path/QueryPathSingle.h"
 #include "terrain/path/QueryCostMap.h"
 #include "terrain/TerrainManager.h"
+#include "unit/CircuitUnit.h"
 #include "unit/action/DGunAction.h"
 #include "unit/action/MoveAction.h"
 #include "unit/action/FightAction.h"
@@ -210,7 +211,7 @@ void CRetreatTask::Start(CCircuitUnit* unit)
 		// always carries some enemy influence, and demanding essentially zero
 		// rejected every candidate.
 		bool healPost = false;
-		const float behind = circuit->GetTunable("apex_retreat_behind", 0.f);
+		const float behind = circuit->GetTunable("apex_retreat_behind", 600.f);
 		if (behind > 0.f) {
 			const AIFloat3& front = circuit->GetFrontPos();
 			const AIFloat3& home = circuit->GetSetupManager()->GetBasePos();
@@ -220,20 +221,37 @@ void CRetreatTask::Start(CCircuitUnit* unit)
 				const float len = dir.Length2D();
 				if (len > 1.f) {
 					dir /= len;
-					AIFloat3 spot = front + dir * behind;
-					CTerrainManager::CorrectPosition(spot);
+					// apex: the script's medic station when it has one: behind
+					// the army, out of the enemy's reach, where the medics stand.
+					// CONCENTRATE OPPOSITE THEIR ARMY, NEVER SPLIT OURS TO WALK
+					// HOME (apexearth 2026-10-03, docs/24): a contested post sent
+					// a back seat's wounded to its corner base, across the map
+					// from the fight. Step back from the front toward home until
+					// the ground is ours; home only if none is within reach.
 					const AIFloat3& here = unit->GetPos(frame);
-					const float ours = circuit->GetInflMap()->GetInfluenceAt(spot);
-					const float foe = circuit->GetInflMap()->GetEnemyInflAt(spot);
-					const bool ourGround = (ours > foe);
-					const bool nearer =
-							here.SqDistance2D(spot) < here.SqDistance2D(endPos);
-					if (ourGround && nearer
-						&& circuit->GetTerrainManager()->CanMoveToPos(unit->GetArea(), spot))
-					{
-						endPos = spot;
-						healPost = true;
-					} else if (circuit->GetTunable("apex_retreat_log", 0.f) > 0.f) {
+					float ours = 0.f, foe = 0.f;
+					bool nearer = false;
+					for (float b = behind; b <= behind + 3000.f; b += 300.f) {
+						AIFloat3 spot = front + dir * b;
+						if ((b == behind) && utils::is_valid(circuit->GetHealPos())) {
+							spot = circuit->GetHealPos();
+						}
+						CTerrainManager::CorrectPosition(spot);
+						ours = circuit->GetInflMap()->GetInfluenceAt(spot);
+						foe = circuit->GetInflMap()->GetEnemyInflAt(spot);
+						nearer = here.SqDistance2D(spot) < here.SqDistance2D(endPos);
+						if (!nearer) {
+							break;
+						}
+						if ((ours > foe)
+							&& circuit->GetTerrainManager()->CanMoveToPos(unit->GetArea(), spot))
+						{
+							endPos = spot;
+							healPost = true;
+							break;
+						}
+					}
+					if (!healPost && (circuit->GetTunable("apex_retreat_log", 0.f) > 0.f)) {
 						circuit->LOG("apex: heal-post refused ourInfl=%.2f foeInfl=%.2f nearer=%d",
 								ours, foe, (int)nearer);
 					}
@@ -243,6 +261,17 @@ void CRetreatTask::Start(CCircuitUnit* unit)
 		// Retreats were the biggest source of unexplained movement on the map:
 		// every other mover pings its intent, so the wounded walk must too.
 		IntentPing(unit->GetPos(frame), healPost ? "RET heal" : "RET home");
+		{
+			// apex: per AI, how many wounded went to the heal post vs home
+			struct Tally { int heal = 0, home = 0, logAt = 0; };
+			static std::map<const CCircuitAI*, Tally> tally;
+			Tally& t = tally[circuit];
+			++(healPost ? t.heal : t.home);
+			if (frame >= t.logAt) {
+				t.logAt = frame + FRAMES_PER_SEC * 60;
+				circuit->LOG("apex: retreat-dest heal=%i home=%i", t.heal, t.home);
+			}
+		}
 
 		// apexearth: "when we're retreating to safe havens, it seems we
 		// clump up into a tight ball, which makes us even more likely to
@@ -440,13 +469,63 @@ void CRetreatTask::Update()
 		// secondary contributor). Falls through to the branch below instead,
 		// which already gates the commander on real influence
 		// (GetEnemyInflAt < INFL_EPS), not just HP.
+		// The commander's bar is what it can fight off alone, not zero: a
+		// raided base never reads zero, and a healed commander sat in
+		// retreat for ten minutes while it burned (watched 2026-09-05,
+		// apexearth: "commander ai seems to break at some point after
+		// losing some stuff"). Enemy influence and unit power are the same
+		// currency (CInfluenceMap::AddStaticArmed writes GetPower()).
+		// The influence field is presence, painted map-wide by a big army,
+		// so it never drops below him once his base has fallen. Reach is the
+		// threat map -- what can actually hit this cell -- so that is what
+		// holds him and what he steps out of.
+		const float comPower = cdef->IsRoleComm() ? circuit->GetThreatMap()->GetUnitPower(unit) : 0.f;
+		const float safeInfl = std::max(INFL_EPS, comPower);
+		const AIFloat3 herePos = unit->GetPos(frame);
+		const float inflHere = circuit->GetInflMap()->GetEnemyInflAt(herePos);
+		const float threatHere = cdef->IsRoleComm()
+				? circuit->GetThreatMap()->GetThreatAt(unit, herePos) : 0.f;
+		const bool comHeld = cdef->IsRoleComm() && (threatHere > 0.f) && (inflHere >= safeInfl);
+		if (cdef->IsRoleComm() && (frame >= comHoldLogAt + FRAMES_PER_SEC * 30)) {
+			comHoldLogAt = frame;
+			circuit->LOG("apex: com-retreat-hold t=%i hp=%.2f infl=%.1f pw=%.1f thr=%.1f",
+					circuit->GetTeamId(), healthPerc, inflHere, comPower, threatHere);
+		}
+		// A retreat whose haven sits inside the enemy's reach is a stand-
+		// still (seed 18: 40 s at the base edge, hp 0.91 -> dead to a
+		// Banisher). Held there, he keeps walking to the lowest threat
+		// around him instead.
+		if (comHeld && (frame >= comEvadeAt + FRAMES_PER_SEC * 5)) {
+			comEvadeAt = frame;
+			static constexpr float STEP = 400.f;
+			const AIFloat3 here = herePos;
+			AIFloat3 best = here;
+			float bestThr = threatHere;
+			for (int k = 0; k < 8; ++k) {
+				const float a = k * 0.7853981634f;
+				AIFloat3 p(here.x + cosf(a) * STEP, here.y, here.z + sinf(a) * STEP);
+				CTerrainManager::CorrectPosition(p);
+				const float v = circuit->GetThreatMap()->GetThreatAt(unit, p);
+				if (v < bestThr) {
+					bestThr = v;
+					best = p;
+				}
+			}
+			if (bestThr < threatHere * 0.8f) {
+				TRY_UNIT(circuit, unit,
+					unit->CmdMoveTo(best, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 10, CCircuitUnit::OrdSrc::RETREAT);
+				)
+				circuit->LOG("apex: com-evade t=%i thr=%.1f -> %.1f at=%.0f,%.0f",
+						circuit->GetTeamId(), threatHere, bestThr, best.x, best.z);
+			}
+		}
 		if (isRepaired && !unit->IsDisarmed(frame) && !cdef->IsRoleComm()) {
 			Recovered(unit);
 		} else if (unit->IsForceUpdate(frame) || isExecute) {
 			Start(unit);
 		} else if ((circuit->GetBindedRole(cdef->GetMainRole()) == ROLE_TYPE(BUILDER))
 			&& (!cdef->IsRoleComm() || (healthPerc >= cdef->GetRetreat()))
-			&& (circuit->GetInflMap()->GetEnemyInflAt(unit->GetPos(frame)) < INFL_EPS))
+			&& (cdef->IsRoleComm() ? !comHeld : (inflHere < safeInfl)))
 		{
 			Recovered(unit);
 		}
@@ -534,7 +613,7 @@ void CRetreatTask::OnUnitIdle(CCircuitUnit* unit)
 	if (unitPos.SqDistance2D(haven) > SQUARE(maxDist)) {
 		// TODO: push MoveAction into unit? to avoid enemy fire
 		TRY_UNIT(circuit, unit,
-			unit->CmdMoveTo(haven, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 1);
+			unit->CmdMoveTo(haven, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 1, CCircuitUnit::OrdSrc::RETREAT);
 		)
 		// TODO: Add fail counter?
 	} else {

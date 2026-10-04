@@ -13,6 +13,7 @@
 #include "CircuitAI.h"
 #include "util/Utils.h"
 
+#include "spring/SpringCallback.h"
 #include "spring/SpringMap.h"
 
 #include "AISCommands.h"
@@ -84,9 +85,120 @@ void CBFactoryTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, fl
 {
 	CCircuitAI* circuit = manager->GetCircuit();
 	CMap* map = circuit->GetMap();
-	if ((facing != UNIT_NO_FACING) && map->IsPossibleToBuildAt(buildDef->GetDef(), pos, facing)) {
+	// A FACTORY IS THE WORST THING TO PARK ON TOP OF ITS OWN BUILDER: the
+	// biggest footprint we place, and nothing can start until whoever ordered
+	// it has been pushed off the whole apron. Same rule as
+	// IBuilderTask::FindBuildSite, and the same last-resort relaxation below --
+	// a factory that can only stand here still stands here.
+	const float selfClear = SelfClearance(builder, buildDef);
+	const AIFloat3 builderPos = builder->GetPos(circuit->GetLastFrame());
+	if (!TryBuildSite(builder, pos, searchRadius, selfClear, builderPos)
+		&& (selfClear > 0.f))
+	{
+		TryBuildSite(builder, pos, searchRadius, 0.f, builderPos);
+	}
+}
+
+bool CBFactoryTask::TryBuildSite(CCircuitUnit* builder, const AIFloat3& pos,
+		float searchRadius, float selfBar, const AIFloat3& builderPos)
+{
+	CCircuitAI* circuit = manager->GetCircuit();
+	CMap* map = circuit->GetMap();
+	auto clearsBuilder = [selfBar, &builderPos](const AIFloat3& p) {
+		return (selfBar <= 0.f) || (p.SqDistance2D(builderPos) >= SQUARE(selfBar));
+	};
+	// apex: THE DOOR MUST OPEN ONTO GROUND ITS UNITS CAN DRIVE (his watched game
+	// 2026-09-28: a hover lab faced into a mountain and nothing got out). The
+	// footprint test below only asks whether the BUILDING could stand ahead.
+	// One and two footprints out, the product's own move type must stand in
+	// one connected area.
+	CTerrainManager* exitTerrain = circuit->GetTerrainManager();
+	terrain::SMobileType* exitMt = nullptr;
+	for (CCircuitDef::Id pid : buildDef->GetBuildOptions()) {
+		CCircuitDef* pd = circuit->GetCircuitDef(pid);
+		if ((pd != nullptr) && pd->IsMobile() && !pd->IsAbleToFly()) {
+			exitMt = exitTerrain->GetMobileTypeById(pd->GetMobileId());
+			if (exitMt != nullptr) {
+				break;
+			}
+		}
+	}
+	const float exitStep = std::max(buildDef->GetDef()->GetXSize(), buildDef->GetDef()->GetZSize()) * SQUARE_SIZE;
+	// apex: ...AND NO BUILDING OF OURS OR AN ALLY'S STANDS IN IT (his watch
+	// 2026-09-28: a gantry placed facing its own two advanced solars, 128
+	// elmos out). Two footprints ahead, the factory's width, at the facing
+	// the engine will actually build with.
+	auto laneClear = [this, circuit, exitStep](const AIFloat3& bp) {
+		AIFloat3 fwd(0.f, 0.f, 0.f);
+		switch (facing) {
+			default:
+			case UNIT_FACING_SOUTH: fwd.z = 1.f; break;
+			case UNIT_FACING_EAST:  fwd.x = 1.f; break;
+			case UNIT_FACING_NORTH: fwd.z = -1.f; break;
+			case UNIT_FACING_WEST:  fwd.x = -1.f; break;
+		}
+		const float half = exitStep * 0.5f;
+		const AIFloat3 mid = bp + fwd * (half + exitStep * 0.75f);
+		circuit->UpdateFriendlyUnits();
+		auto& units = circuit->GetCallback()->GetFriendlyUnitsIn(mid, exitStep * 1.5f + 64.f);
+		bool clear = true;
+		for (springai::Unit* u : units) {
+			if (!clear) {
+				break;
+			}
+			auto [cand, isTeam] = circuit->GetTeamOrAllyUnit(u);
+			if (cand == nullptr) {
+				continue;
+			}
+			CCircuitDef* cd = cand->GetCircuitDef();
+			if ((cd == nullptr) || cd->IsMobile()) {
+				continue;
+			}
+			const AIFloat3& up = cand->GetPos(circuit->GetLastFrame());
+			const float uh = std::max(cd->GetDef()->GetXSize(), cd->GetDef()->GetZSize()) * SQUARE_SIZE * 0.5f;
+			const float rx = up.x - bp.x;
+			const float rz = up.z - bp.z;
+			const float ahead = rx * fwd.x + rz * fwd.z;
+			const float side = std::fabs(rx * fwd.z - rz * fwd.x);
+			if ((ahead + uh > half) && (ahead - uh < 2.f * exitStep) && (side - uh < half)) {
+				clear = false;
+			}
+		}
+		utils::free(units);
+		return clear;
+	};
+	auto exitOpen = [this, exitTerrain, exitMt, exitStep, &laneClear](const AIFloat3& bp) {
+		if (!laneClear(bp)) {
+			return false;
+		}
+		if (exitMt == nullptr) {
+			return true;
+		}
+		terrain::SArea* seen[2] = {nullptr, nullptr};
+		for (int k = 1; k <= 2; ++k) {
+			AIFloat3 p = bp;
+			switch (facing) {
+				default:
+				case UNIT_FACING_SOUTH: p.z += exitStep * k; break;
+				case UNIT_FACING_EAST:  p.x += exitStep * k; break;
+				case UNIT_FACING_NORTH: p.z -= exitStep * k; break;
+				case UNIT_FACING_WEST:  p.x -= exitStep * k; break;
+			}
+			const int iS = exitTerrain->GetSectorIndex(p);
+			if ((iS < 0) || (iS >= (int)exitMt->sector.size())) {
+				return false;
+			}
+			seen[k - 1] = exitMt->sector[iS].area;
+			if (seen[k - 1] == nullptr) {
+				return false;
+			}
+		}
+		return seen[0] == seen[1];
+	};
+	if ((facing != UNIT_NO_FACING) && clearsBuilder(pos)
+		&& map->IsPossibleToBuildAt(buildDef->GetDef(), pos, facing) && exitOpen(pos)) {
 		SetBuildPos(pos);
-		return;
+		return true;
 	}
 
 	FindFacing(pos);
@@ -94,18 +206,22 @@ void CBFactoryTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, fl
 	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
 	CTerrainManager::TerrainPredicate predicate;
 	if (reprDef == nullptr) {
-		predicate = [terrainMgr, builder](const AIFloat3& p) {
-			return terrainMgr->CanReachAtSafe(builder, p, builder->GetCircuitDef()->GetBuildDistance());
+		predicate = [terrainMgr, builder, clearsBuilder, &exitOpen](const AIFloat3& p) {
+			return clearsBuilder(p)
+					&& terrainMgr->CanReachAtSafe(builder, p, builder->GetCircuitDef()->GetBuildDistance())
+					&& exitOpen(p);
 		};
 	} else {
 		CCircuitDef* reprDef = this->reprDef;
-		predicate = [terrainMgr, builder, reprDef](const AIFloat3& p) {
-			return terrainMgr->CanReachAtSafe(builder, p, builder->GetCircuitDef()->GetBuildDistance())
-					&& terrainMgr->CanBeBuiltAt(reprDef, p);
+		predicate = [terrainMgr, builder, reprDef, clearsBuilder, &exitOpen](const AIFloat3& p) {
+			return clearsBuilder(p)
+					&& terrainMgr->CanReachAtSafe(builder, p, builder->GetCircuitDef()->GetBuildDistance())
+					&& terrainMgr->CanBeBuiltAt(reprDef, p)
+					&& exitOpen(p);
 		};
 	}
 	const float testSize = std::max(buildDef->GetDef()->GetXSize(), buildDef->GetDef()->GetZSize()) * SQUARE_SIZE;
-	auto checkFacing = [this, map, terrainMgr, testSize, &predicate, &pos, searchRadius]() {
+	auto checkFacing = [this, map, terrainMgr, testSize, &predicate, &pos, searchRadius, &exitOpen]() {
 		AIFloat3 bp = terrainMgr->FindBuildSite(buildDef, pos, searchRadius, facing, predicate);
 		if (!utils::is_valid(bp)) {
 			return false;
@@ -128,7 +244,7 @@ void CBFactoryTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, fl
 				posOffset.x -= testSize;
 			} break;
 		}
-		if (map->IsPossibleToBuildAt(buildDef->GetDef(), posOffset, facing)) {
+		if (map->IsPossibleToBuildAt(buildDef->GetDef(), posOffset, facing) && exitOpen(bp)) {
 			SetBuildPos(bp);
 			return true;
 		}
@@ -136,19 +252,19 @@ void CBFactoryTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, fl
 	};
 
 	if (checkFacing()) {
-		return;
+		return true;
 	}
 	facing = opposite[facing];
 	if (checkFacing()) {
-		return;
+		return true;
 	}
 	++facing %= 4;
 	if (checkFacing()) {
-		return;
+		return true;
 	}
 	facing = opposite[facing];
 	if (checkFacing()) {
-		return;
+		return true;
 	}
 
 	// All four facings failed: there is genuinely nowhere here to put this.
@@ -156,9 +272,12 @@ void CBFactoryTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, fl
 	// usually a bad search origin, whereas a gantry-sized building failing is
 	// what a base packed with old T1 clutter looks like. The script decides
 	// whether anything nearby is worth clearing; see CCircuitAI::NoteBuildBlocked.
-	if (testSize >= SQUARE_SIZE * 8) {
-		circuit->NoteBuildBlocked(pos);
+	// Not while we are only holding ground clear for our own builder: that pass
+	// falls through to the relaxed one, which reports for it.
+	if ((selfBar <= 0.f) && (testSize >= SQUARE_SIZE * 8)) {
+		circuit->NoteBuildBlocked(pos, buildDef);
 	}
+	return false;
 }
 
 #define SERIALIZE(stream, func)	\

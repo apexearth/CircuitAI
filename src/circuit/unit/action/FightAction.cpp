@@ -47,7 +47,7 @@ void CFightAction::Update(CCircuitAI* circuit)
 	switch (pathMaxIndex) {
 		case -2:  // arrived
 			TRY_UNIT(circuit, unit,
-				unit->CmdFightTo(pPath->posPath.back(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
+				unit->CmdFightTo(pPath->posPath.back(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::FWALK);
 			)
 			return;
 		case -1: return;  // continue with current waypoints
@@ -73,19 +73,22 @@ void CFightAction::Update(CCircuitAI* circuit)
 				unit->CmdJumpTo(jumpPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
 			}
 			if (isBadJump) {
+				FaceStep(step);
 				const AIFloat3& pos = pPath->posPath[step];
-				unit->CmdFightTo(pos, options, lastFrame + FRAMES_PER_SEC * 60);
+				unit->CmdFightTo(pos, options, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::FWALK);
 			}
 		} else {
+			FaceStep(step);
 			const AIFloat3& pos = pPath->posPath[step];
-			unit->CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
+			unit->CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::FWALK);
 		}
 		unit->CmdWantedSpeed(stepSpeed);
 
 		for (int i = 2; (step < pathMaxIndex) && (i < 3); ++i) {
 			step = std::min(step + increment, pathMaxIndex);
+			FaceStep(step);
 			const AIFloat3& pos = pPath->posPath[step];
-			unit->CmdFightTo(pos, options, lastFrame + FRAMES_PER_SEC * 60 * i);
+			unit->CmdFightTo(pos, options, lastFrame + FRAMES_PER_SEC * 60 * i, CCircuitUnit::OrdSrc::FWALK);
 		}
 	)
 }

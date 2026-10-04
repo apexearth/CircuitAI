@@ -106,9 +106,26 @@ public:
 
 	bool IsMoveFailed(int frame);
 	bool IsStuck() const { return isStuck; }
+	void ClearStuck() { isStuck = false; moveFails = 0; }
 
-	void ForceUpdate(int frame);
-	bool IsForceUpdate(int frame);
+	// A WAKE SAYS WHAT HAPPENED, NOT "RE-DECIDE EVERYTHING".
+	//
+	// ForceUpdate used to be one undifferentiated signal, so a unit taking a
+	// single hit re-opened its whole squad's destination question -- 0.33s
+	// later, per unit, OR'd across the squad. A squad in contact therefore
+	// re-elected where to go several times a second and closed ~0% of the
+	// distance to any of them (tools/goals.py, 2026-09-06). The damage
+	// reaction itself never needed this: OnUnitDamaged does KeepRange, dodge,
+	// counter-battery, coward-marking and the retreat vote inline, before the
+	// task ever runs.
+	//
+	// So the waker declares the level and the consumer declares what it will
+	// accept. REACT is "something hit us" -- per-unit business. RECONSIDER is
+	// "the world changed shape" (a sudden threat appearing), the only kind of
+	// news that should be allowed to move a squad's destination.
+	enum class Wake : int { REACT = 0, RECONSIDER = 1 };
+	void ForceUpdate(int frame, Wake w = Wake::REACT);
+	bool IsForceUpdate(int frame, Wake want = Wake::REACT);
 
 	void SetIsDead() { isDead = true; }
 	bool IsDead() const { return isDead; }
@@ -128,12 +145,73 @@ public:
 		}
 		return out;
 	}
+	// apex: ORDER CENSUS. Every engine order this AI sends leaves through one of
+	// the Cmd* below, and every one of them costs the ENGINE a command insert, a
+	// Lua AllowCommand pass and (for a move whose goal actually changed) a fresh
+	// path request -- cost that is billed to the engine, not to our own frame
+	// time. NoteOrder records what was last sent to this unit so a re-send of
+	// the same thing can be counted, and returns true when the re-send is a
+	// provable no-op AND apex_order_dedupe is on; CmdMoveTo then drops it.
+	enum class OrdKind: int { MOVE = 0, FIGHT, PATROL, ATTACK, TARGET, _SIZE };
+	// WHICH CALL SITE sent it. The kind/distance census says how much churn
+	// there is, never where it comes from, so every rule aimed at it has been
+	// a guess. Defaulted, so an unlabelled site lands in OTHER rather than
+	// being mis-attributed -- every site is now named, so a nonzero `other` in
+	// the order-src line means a NEW one was added without a tag.
+	enum class OrdSrc: int { OTHER = 0, RING, TRAVEL, DODGE, STANDOFF, POST,
+		RETREAT, BUILD, SCOUT, SETTGT, ATTACK, PATROL, ENGAGE, REGROUP, ESCORT,
+		SNIPER, MANUAL, SCRIPT, FWALK, COMBAT, GUARD, RALLY, _SIZE };
+	bool NoteOrder(OrdKind kind, short options, const springai::AIFloat3& pos, int id, int timeout,
+			OrdSrc src = OrdSrc::OTHER);
+	// One source of truth for the call-site names: the order census in
+	// CircuitAI and the per-unit trace in NoteOrder both read it, so a new
+	// OrdSrc cannot be named in one place and left numeric in the other.
+	static const char* OrdSrcName(int src);
+	// ORDER ARBITRATION. Sixteen call sites move units and the last writer won,
+	// so a threat-aware path from one was overwritten seconds later by a centre
+	// that decided under different assumptions -- measured 2026-09-06, one
+	// armham took 322 orders in 14 minutes from 9 sources, 30% of them replacing
+	// the previous order with a point 128+ elmos away inside 3s.
+	// apexearth's ranking: "retreat > dodge > standoff > guard".
+	static int OrdSrcPrio(int src);
+	const springai::AIFloat3& GetTravelGoal() const { return travelGoal; }
+	int GetTravelGoalFrame() const { return travelGoalFrame; }
+	// DO UNITS ACTUALLY GET CLOSER TO WHERE WE SEND THEM? apexearth: "we keep
+	// trying to move a unit between two fronts... they never get to either and
+	// hover in between". Every other measure here asks which order was sent;
+	// this asks whether the unit ever arrived. distStart is the gap when the
+	// goal was set, distMin the closest it ever came.
+	// Only restart the measurement when the destination actually MOVES. The
+	// median goal-jump is 0 -- most calls re-set the SAME place while the unit
+	// is still walking to it -- so resetting on every call zeroed the progress
+	// counter and made every task read 'closed 0%'.
+	void SetTravelGoal(const springai::AIFloat3& p, int frame) {
+		// travelGoal starts at -RgtVector, so a negative x means 'none yet'.
+		const bool moved = (travelGoal.x < 0.f) || (travelGoal.distance2D(p) > 128.f);
+		if (moved || (goalDistStart < 0.f)) {
+			goalDistStart = -1.f; goalDistMin = -1.f;
+			travelGoalFrame = frame;
+		}
+		travelGoal = p;
+	}
+	float GetGoalDistStart() const { return goalDistStart; }
+	float GetGoalDistMin() const { return goalDistMin; }
+	void NoteGoalDist(float d) {
+		if (goalDistStart < 0.f) { goalDistStart = d; }
+		if ((goalDistMin < 0.f) || (d < goalDistMin)) { goalDistMin = d; }
+	}
+
 	void SetDamagedFrame(int frame) { damagedFrame = frame; }
 	int GetDamagedFrame() const { return damagedFrame; }
 	void SetDamagedDir(const springai::AIFloat3& dir) { damagedDir = dir; }
 	const springai::AIFloat3& GetDamagedDir() const { return damagedDir; }
 	void SetDodgeFrame(int frame) { dodgeFrame = frame; }
 	int GetDodgeFrame() const { return dodgeFrame; }
+	// apex: last frame this unit's builder task ran the script re-election
+	// (IBuilderTask::Reevaluate) -- the throttle that keeps a walking
+	// builder from re-running the whole market every task update.
+	void SetElectFrame(int frame) { electFrame = frame; }
+	int GetElectFrame() const { return electFrame; }
 
 	bool HasDGun() const { return dgun != nullptr; }
 	bool HasWeapon() const { return weapon != nullptr; }
@@ -143,6 +221,15 @@ public:
 	bool IsDisarmed(int frame);
 	bool IsWeaponReady(int frame);
 	bool IsDGunReady(int frame, float energy);
+	float GetDGunCostE() const;
+	int GetDGunReloadFrame() const;
+	// A D-gun order stands until the shot is fired or its window passes: any
+	// other order in that window would replace it in the engine's queue (measured:
+	// every manual-fire order was followed by a move and a stop in the same
+	// frame, and no shot ever landed).
+	// NOT const: a held frame is an order the engine never got, and the black
+	// box has to say so -- a silent drop is invisible in every other log.
+	bool IsDGunHeld(int frame);
 	bool IsShieldCharged(float percent);
 	bool IsJumpReady();
 	bool IsJumping();
@@ -155,15 +242,24 @@ public:
 	float GetHealthPercent();
 
 	void CmdRemove(std::vector<float>&& params, short options = 0);
-	void CmdMoveTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX);
+	void CmdMoveTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX,
+			OrdSrc src = OrdSrc::OTHER);
 	void CmdRepeat(bool repeat, short options = 0, int timeout = INT_MAX);
 	void CmdJumpTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX);
-	void CmdFightTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX);
+	void CmdFightTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX,
+			OrdSrc src = OrdSrc::OTHER);
 	void CmdPatrolTo(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX);
 	void CmdAttackGround(const springai::AIFloat3& pos, short options = 0, int timeout = INT_MAX);
 	void CmdWantedSpeed(float speed = NO_SPEED_LIMIT);
 	void CmdStop(short options = 0, int timeout = INT_MAX);
 	void CmdSetTarget(CEnemyInfo* enemy);
+	// The one engine attack order; callers set the target themselves. A sniper
+	// gets a move to SniperHoldPos instead.
+	void CmdAttack(CEnemyInfo* enemy, short options = 0, int timeout = INT_MAX);
+	// Where a sniper stands to fire on tPos: its own surface range back along
+	// its current bearing, so a fight/attack order can be replaced by a move.
+	springai::AIFloat3 SniperHoldPos(const springai::AIFloat3& tPos);
+	void NoteSniperOrder(CCircuitDef::SniperOrder kind) const;
 	void CmdCloak(bool state);
 	void CmdFireAtRadar(bool state);
 	void CmdFindPad(int timeout = INT_MAX);
@@ -196,6 +292,24 @@ public:
 	void Guard(CCircuitUnit* target, int timeout);
 	void Gather(const springai::AIFloat3& groupPos, int timeout);
 
+	// A UNIT'S PLACE IN ITS SQUAD -- a property of the unit, not of one action.
+	//
+	// It used to live on ITravelAction, where only CMoveAction's mid-path
+	// waypoints ever read it. Every other way a squad is told where to go
+	// handed EVERY member the identical point: CFightAction's waypoints, both
+	// travel actions' arrival waypoint, CCircuitUnit::Gather, and the merge
+	// muster. Five leaks, and the squad balled up precisely on arrival and on
+	// regroup -- the moments the formation is worth having. apexearth, twice:
+	// "a squad should never have all of its units move to a single point".
+	//
+	// Held here and applied in the two command funnels below, so a call site
+	// cannot forget it -- there is no call site to forget.
+	void SetFormSlot(float lat, const springai::AIFloat3& dir) { formLateral = lat; formDir = dir; }
+	void SetFormDir(const springai::AIFloat3& dir) { formDir = dir; }
+	void ClearFormSlot() { formLateral = 0.f; formDir = -RgtVector; }
+	float GetFormLateral() const { return formLateral; }
+	springai::AIFloat3 InFormation(const springai::AIFloat3& p, OrdSrc src) const;
+
 	void Morph();
 	void StopMorph();
 	bool IsUpgradable();
@@ -210,6 +324,9 @@ public:
 
 	void ClearTarget() { target = nullptr; }
 	CEnemyInfo* GetTarget() const { return target; }
+	// apex: what we last set-targeted, by id -- census only, see CCircuitAI::tgtHeld.
+	Id GetTgtHeldId() const { return tgtHeldId; }
+	void SetTgtHeldId(Id id) { tgtHeldId = id; }
 	int GetTargetTile() const { return targetTile; }
 
 	void AddAttribute(CCircuitDef::AttrType type) { attr |= CCircuitDef::GetMask(static_cast<CCircuitDef::AttrT>(type)); }
@@ -224,6 +341,18 @@ private:
 	// NOTE: taskFrame assigned on task change and OnUnitIdle to workaround idle spam.
 	//       Proper fix: do not issue any commands OnUnitIdle, delay them until next frame?
 	int taskFrame;
+	// The live movement intent: whose decision the unit is carrying out, and
+	// when it was taken. A lower-ranked centre may not overwrite it while it is
+	// still running (apex_intent_hold).
+	int intentFrame = 0;
+	int intentPrio = -1;
+	// apex: the unit's actual GOAL, not the waypoint it is walking to. Kept on
+	// the UNIT rather than the travel action so it survives a task change --
+	// being handed to a new task IS the redirection we want to measure.
+	springai::AIFloat3 travelGoal = -RgtVector;
+	int travelGoalFrame = 0;
+	float goalDistStart = -1.f;
+	float goalDistMin = -1.f;
 	ETaskState taskState;
 	ITaskModule* manager;
 	terrain::SArea* area;  // = nullptr if a unit flies
@@ -235,10 +364,26 @@ private:
 	int failFrame;
 	std::string actRing[10];
 	int actHead = 0;
+	// apex: the last order of each kind sent to this unit. See NoteOrder.
+	struct SOrdShadow {
+		float x = -1e9f;
+		float z = -1e9f;
+		int id = -1;
+		int frame = -1000000;  // when it was sent
+		int timeout = 0;       // the frame the engine drops it
+		unsigned seq = 0;      // ordSeq when it was sent
+		short opts = 0;
+	};
+	SOrdShadow ordLast[static_cast<int>(OrdKind::_SIZE)];
+	unsigned ordSeq = 0;  // orders of any kind sent to this unit
 	int damagedFrame;
+	int electFrame;
 	springai::AIFloat3 damagedDir;
 	int dodgeFrame;
 	int execFrame;  // TODO: Replace by CExecuteAction?
+	Wake execWake = Wake::REACT;  // what the pending wake is FOR
+	float formLateral = 0.f;      // signed slot offset across the squad's front
+	springai::AIFloat3 formDir = -RgtVector;  // the squad's direction of travel
 	int disarmFrame;
 	int ammoFrame;
 
@@ -258,10 +403,14 @@ private:
 	springai::Command* command;  // current top command
 	CWeaponDef* dgunDef;
 	springai::Weapon* dgun;
+	int dgunHoldUntil = 0;
+	int dgunHoldReload = 0;
+	int dgunHoldNoteAt = -1;
 	springai::Weapon* weapon;  // main weapon
 	springai::Weapon* shield;
 
 	CEnemyInfo* target;
+	Id tgtHeldId = -1;
 	int targetTile;
 
 	CCircuitDef::AttrM attr;

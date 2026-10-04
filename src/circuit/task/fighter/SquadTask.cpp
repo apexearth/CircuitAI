@@ -5,24 +5,20 @@
  *      Author: rlcevg
  */
 
+#include <map>
 #include "task/fighter/SquadTask.h"
-#include "task/RetreatTask.h"
 #include "map/InfluenceMap.h"
 #include "map/ThreatMap.h"
 #include "module/BuilderManager.h"
 #include "module/MilitaryManager.h"
-#include "setup/SetupManager.h"
-#include "unit/enemy/EnemyManager.h"
 #include "terrain/TerrainManager.h"
 #include "terrain/path/PathFinder.h"
 #include "terrain/path/QueryLineMap.h"
 #include "unit/action/TravelAction.h"
 #include "CircuitAI.h"
 #include "util/Utils.h"
-#include "Log.h"
 
 #include <cmath>
-#include <vector>
 
 namespace circuit {
 
@@ -38,7 +34,7 @@ ISquadTask::ISquadTask(ITaskModule* mgr, FightType type, float powerMod)
 		, leader(nullptr)
 		, groupPos(-RgtVector)
 		, prevGroupPos(-RgtVector)
-		, pPath(std::shared_ptr<CPathInfo>(new CPathInfo()))
+		, pPath(std::make_shared<CPathInfo>())
 		, groupFrame(0)
 		, attackFrame(-1)
 {
@@ -48,41 +44,12 @@ ISquadTask::~ISquadTask()
 {
 }
 
-bool ISquadTask::IsChargeDef(const CCircuitDef* cdef)
-{
-	return (cdef != nullptr) && cdef->IsCharger();
-}
-
 void ISquadTask::AssignTo(CCircuitUnit* unit)
 {
 	IFighterTask::AssignTo(unit);
 
 	CCircuitDef* cdef = unit->GetCircuitDef();
-	// apexearth: "focus on getting to 50% with legion". Traced via a fresh-
-	// context agent's finding that Legion trades combat significantly worse
-	// than Cortex/Armada despite comparable economy (K/D log-ratio t=-2.16
-	// to -2.23 across two independent tournaments), and nine prior
-	// composition/unit-weight fix attempts across two sessions all failing
-	// to close it -- pointing at combat POSITIONING, not army composition.
-	//
-	// Squad rows are grouped by range so a row can stand at one shared
-	// distance from the target (see Attack() below). This used to group by
-	// GetMinRange() -- for a single-weapon unit that equals GetMaxRange(),
-	// no difference, which is why this was invisible for Cortex/Armada's
-	// mostly single-weapon rosters. But GetMinRange() is literally the
-	// SHORTEST range among ALL of a unit's weapon mounts (CircuitDef.cpp:
-	// minRange = std::min(minRange, range) across every mount). Legion's
-	// defining trait is multi-weapon units -- legkark (Karkinos, "Medium
-	// Dual-Weapon Infantry Bot") carries HEAT_RAY at range 360 and
-	// LEGION_SHOTGUN at range 251 (confirmed in units/Legion/Bots/
-	// legkark.lua's weapondefs). Grouped by min range, a legkark row was
-	// ordered to close to ~238 elmos (251 * STANDOFF_RANGE_MOD) from every
-	// target -- needlessly inside its own better weapon's reach, and inside
-	// any enemy with range 251-360 that it never needed to engage that
-	// close. GetMaxRange() is what the outranged-safety-margin standoff
-	// logic already treats as "this row's real engagement range" elsewhere
-	// in this same file; grouping should agree with it.
-	const float range = cdef->GetMaxRange();
+	const float range = cdef->GetMinRange();
 	rangeUnits[range].insert(unit);
 
 	if (leader == nullptr) {
@@ -113,7 +80,7 @@ void ISquadTask::RemoveAssignee(CCircuitUnit* unit)
 	IFighterTask::RemoveAssignee(unit);
 
 	CCircuitDef* cdef = unit->GetCircuitDef();
-	const float range = cdef->GetMaxRange();  // must match AssignTo's key
+	const float range = cdef->GetMinRange();
 	std::set<CCircuitUnit*>& setUnits = rangeUnits[range];
 	setUnits.erase(unit);
 	if (setUnits.empty()) {
@@ -141,21 +108,13 @@ void ISquadTask::Merge(ISquadTask* task)
 		if (unit->GetCircuitDef()->IsRoleSupport()) {
 			continue;
 		}
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->SetPath(lPath);
-		}
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->SetState(state);
-		}
+		unit->GetTravelAct()->SetPath(lPath);
+		unit->GetTravelAct()->SetState(state);
 	}
 	units.insert(rookies.begin(), rookies.end());
 	attackPower += task->GetAttackPower();
 	const std::set<CCircuitUnit*>& sh = task->GetShields();
 	shields.insert(sh.begin(), sh.end());
-	// Coward (wounded, standing rear) state was dropped on every merge -- the
-	// TODO above AttackTask's merge path acknowledged it. Same hierarchy, so
-	// the protected set is reachable directly.
-	cowards.insert(task->cowards.begin(), task->cowards.end());
 
 	const std::map<float, std::set<CCircuitUnit*>>& rangers = task->GetRangeUnits();
 	for (const auto& kv : rangers) {
@@ -163,150 +122,6 @@ void ISquadTask::Merge(ISquadTask* task)
 	}
 
 	FindLeader(rookies.begin(), rookies.end());
-}
-
-// The collective disengage. Measured (tools/deaths.py, four games 2026-08-16):
-// 40-45% of all lost metal died on solo RETREAT tasks, each unit peeling off
-// alone at its health bar and run down mid-map -- while CRetreatTask's own
-// line-spread logic sat dead because EnqueueRetreat news a one-unit task per
-// caller. When the squad's wounded (coward) power crosses apex_squad_retreat
-// of its total, everyone leaves TOGETHER on ONE retreat task: group pathing,
-// the line-spread finally live, no lone stragglers donating metal.
-bool ISquadTask::TrySquadRetreat(CCircuitUnit* unit)
-{
-	if ((unit == nullptr) || (units.size() < 2) || (attackPower <= 1.f)) {
-		return false;
-	}
-	CCircuitAI* circuit = manager->GetCircuit();
-	// AT HOME THERE IS NOWHERE TO RUN: a squad voting to retreat inside its
-	// own base is run down among its own buildings -- measured (Altored 4v4):
-	// 871 units, 40% of lost metal, dying on RETREAT at fwd 0.18 with
-	// fight-task deaths near zero. On our own ground the wounded stand rear
-	// with the squad and the squad fights; same influence test as the attack
-	// odds waiver. Defending is the one trade at home that favors us.
-	// GetAllyDefendInflAt, NOT GetAllyInflAt: ally influence counts our own
-	// mobile army, so a squad always stood on its own influence and this
-	// branch read "home" EVERYWHERE -- measured homeStand=3843 against
-	// squadVote=0 in one game; the vote below was unreachable. Defend
-	// influence is written only by our BUILDINGS, the real "at home".
-	// apex: "AT HOME" MUST MEAN DEFENDED, NOT "ANY TOWER'S BLEED". The bare
-	// INFL_EPS test intercepted 346 of 348 retreat elections in one game
-	// (retreat-src homeStand=346 squadVote=2) and held wounded units on the
-	// firing line to 10-19% hp -- the dominant death in every deaths.py
-	// table (defend->retreat(ordered), dead 1s after the switch). Standing
-	// is the right trade only where our static cover at least matches the
-	// enemy influence actually present; anywhere thinner falls through to
-	// the wounded-power vote below.
-	if (leader != nullptr) {
-		const AIFloat3& lp = leader->GetPos(circuit->GetLastFrame());
-		const float defInfl = circuit->GetInflMap()->GetAllyDefendInflAt(lp);
-		// Default 0 RESTORES the epsilon behavior: both tested ratios (1.0
-		// and 0.25) regressed W/L hard (1-13 and 1-9) -- disengaging near
-		// thin cover loses more ground than the late deaths cost. The knob
-		// stays for experiments; the shipped behavior is the measured one.
-		if ((defInfl > INFL_EPS)
-			&& (defInfl >= circuit->GetInflMap()->GetEnemyInflAt(lp)
-				* circuit->GetTunable("apex_home_stand_ratio", 0.f)))
-		{
-			cowards.insert(unit);
-			NoteHomeStand(circuit);
-			return true;
-		}
-	}
-	float woundedPower = unit->GetCircuitDef()->GetPower();
-	for (CCircuitUnit* u : cowards) {
-		// SLIVER-HP ONLY. Cowards now also hold rear-standers that entered at
-		// apex_coward_hp (~60%) with plenty of fight left; counting them here
-		// would trip the 35% vote on a squad that is merely scuffed.
-		if ((u != unit) && (u->GetCircuitDef() != nullptr)
-			&& (u->GetHealthPercent() <= u->GetCircuitDef()->GetRetreat()))
-		{
-			woundedPower += u->GetCircuitDef()->GetPower();
-		}
-	}
-	const float frac = circuit->GetTunable("apex_squad_retreat", 0.35f);
-	if (woundedPower < attackPower * frac) {
-		cowards.insert(unit);  // stands rear (COWARD_REAR_MOD) until the vote passes
-		NoteSquadStand(circuit);
-		return true;  // handled: stay with the squad rather than run alone
-	}
-	CRetreatTask* task = manager->EnqueueRetreat();
-	if (task == nullptr) {
-		return false;
-	}
-	NoteSquadVote(circuit);
-	circuit->LOG("apex: squad retreat units=%d wounded=%.0f/%.0f",
-			(int)units.size(), woundedPower, attackPower);
-	decltype(units) tmpUnits = units;
-	for (CCircuitUnit* u : tmpUnits) {
-		manager->AssignTask(u, task);
-	}
-	return true;
-}
-
-// THE SQUAD'S TOTAL HP IS THE TRIGGER, NOT EACH UNIT'S (apexearth
-// 2026-08-28: "if the squad's total HP is less than some %, like if total
-// squad health below 50% or something we pull back. (not each individual
-// unit)" -- refining "whole squad should fall back if they're all too
-// low... stop them from getting targeted by having them move back"). The
-// per-unit thresholds sit at 8-50% hp, so a mauled squad never enters
-// TrySquadRetreat at all -- it stands and is focused down one unit at a
-// time. Checked per update: when the squad's power-weighted health falls
-// under apex_squad_fall_hp the squad leaves together on ONE retreat task,
-// same group pathing as the wounded-power vote. Power-weighted so a swarm
-// of scratched Ticks cannot outvote a dying Mammoth; cowards COUNT here,
-// unlike GetHealthScale -- his rule reads the HP that exists, not the HP
-// still pressing. Committed pushes, dives and charger deliveries keep
-// pressing, and defended home ground stands -- the same exemptions the
-// vote and the attack-break carry.
-bool ISquadTask::TryAllLowFallback()
-{
-	if ((units.size() < 2) || IsDiveCommit()) {
-		return false;
-	}
-	CCircuitAI* circuit = manager->GetCircuit();
-	if (circuit->IsCommitted()
-		|| ((leader != nullptr) && IsChargeDef(leader->GetCircuitDef())))
-	{
-		return false;
-	}
-	const float bar = circuit->GetTunable("apex_squad_fall_hp", 0.5f);
-	if (bar <= 0.f) {
-		return false;
-	}
-	float total = .0f;
-	float alive = .0f;
-	for (CCircuitUnit* u : units) {
-		const float power = u->GetCircuitDef()->GetPower();
-		total += power;
-		float hp = u->GetHealthPercent();
-		hp = std::max(.0f, std::min(1.f, hp));  // capture progress drives it negative
-		alive += power * hp;
-	}
-	if ((total <= .0f) || (alive >= total * bar)) {
-		return false;
-	}
-	if (leader != nullptr) {
-		const AIFloat3& lp = leader->GetPos(circuit->GetLastFrame());
-		const float defInfl = circuit->GetInflMap()->GetAllyDefendInflAt(lp);
-		if ((defInfl > INFL_EPS)
-			&& (defInfl >= circuit->GetInflMap()->GetEnemyInflAt(lp)
-				* circuit->GetTunable("apex_home_stand_ratio", 0.f)))
-		{
-			return false;  // defended home ground stands, as in the vote above
-		}
-	}
-	CRetreatTask* task = manager->EnqueueRetreat();
-	if (task == nullptr) {
-		return false;
-	}
-	circuit->LOG("apex: squad all-low fallback units=%d hp=%.2f bar=%.2f",
-			(int)units.size(), alive / total, bar);
-	decltype(units) tmpUnits = units;
-	for (CCircuitUnit* u : tmpUnits) {
-		manager->AssignTask(u, task);
-	}
-	return true;
 }
 
 const AIFloat3& ISquadTask::GetLeaderPos(int frame) const
@@ -371,24 +186,11 @@ ISquadTask* ISquadTask::CheckMergeTask()
 	std::shared_ptr<CQueryLineMap> query = std::static_pointer_cast<CQueryLineMap>(
 			pathfinder->CreateLineMapQuery(leader, circuit->GetThreatMap(), pos));
 
-	// A garrison anchored to one breach must not merge back into one anchored to
-	// another -- CMilitaryManager::UpdateDefenceTasks gives each DEFEND pool the
-	// worst breach still unanswered, and a merge undoes that split immediately.
-	// Same radius the loss spots themselves are merged at, so "a different spot"
-	// means the same thing on both sides.
-	const bool isSplitAnchor = (fightType == FightType::DEFEND) && utils::is_valid(position);
-	const float anchorRadius = isSplitAnchor ? circuit->GetTunable("apex_hot_radius", 1000.f) : .0f;
-
 	const std::set<IFighterTask*>& tasks = static_cast<CMilitaryManager*>(manager)->GetTasks(fightType);
 	for (const IFighterTask* candidate : tasks) {
 		if ((candidate == this)
 			|| (candidate->GetAttackPower() < attackPower)
 			|| !candidate->CanAssignTo(leader))
-		{
-			continue;
-		}
-		if (isSplitAnchor && utils::is_valid(candidate->GetPosition())
-			&& (position.distance2D(candidate->GetPosition()) > anchorRadius))
 		{
 			continue;
 		}
@@ -401,14 +203,7 @@ ISquadTask* ISquadTask::CheckMergeTask()
 			continue;
 		}
 
-		// apex: passage tolerance scales with the COMBINED squad -- the whole
-		// point of merging is that together they can walk ground neither dares
-		// alone. THREAT_MIN (any-threat-refuses) kept 1-2 unit squads separate
-		// on every contested map; see QueryLineMap::IsSafeLine.
-		const float mergeThreat = std::max(THREAT_MIN,
-				(attackPower + candidate->GetAttackPower())
-						* circuit->GetTunable("apex_merge_threat", 0.5f));
-		if (!query->IsSafeLine(pos, taskPos, mergeThreat)) {  // ensure safe passage
+		if (!query->IsSafeLine(pos, taskPos)) {  // ensure safe passage
 			continue;
 		}
 
@@ -423,109 +218,31 @@ ISquadTask* ISquadTask::CheckMergeTask()
 	return const_cast<ISquadTask*>(task);
 }
 
+// All-terrain walkers never share a squad with units that cannot climb: the
+// leader is the least mobile member, so a Vanguard beside a tank walked the
+// tank's road (apexearth 2026-09-26). The pathfinder's own spider test.
+bool ISquadTask::SameClimb(CCircuitAI* circuit, CCircuitDef* a, CCircuitDef* b)
+{
+	static std::set<CCircuitDef::Id> logged;
+	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
+	auto climbs = [&](CCircuitDef* d) {
+		const SMobileType* mt = terrainMgr->GetMobileType(d->GetId());
+		const bool c = (mt != nullptr) && (mt->maxSlope > 0.99f);
+		if (logged.insert(d->GetId()).second) {
+			circuit->LOG("apex: climb %s allterrain=%i maxSlope=%.3f", d->GetDef()->GetName(),
+					c ? 1 : 0, (mt != nullptr) ? mt->maxSlope : -1.f);
+		}
+		return c;
+	};
+	return climbs(a) == climbs(b);
+}
+
 ISquadTask* ISquadTask::GetMergeTask()
 {
-	// A squad that just refused a target it nearly qualified for hunts a
-	// partner at 4x the normal cadence instead of wandering for another
-	// half-minute -- the near-miss fix picked by the bestRef distribution.
-	const bool nearMiss = (lastRefused >= manager->GetCircuit()
-			->GetTunable("apex_nearmiss_merge", 0.7f)) && (updCount % 8 == 5);
-	// apex: every 8th update, not every 32nd -- at 32 a small squad crossed
-	// half the map between merge attempts, and stayed small for the fight
-	// that killed it. Tunable so the cadence can be measured, not argued.
-	const int every = std::max(2, (int)manager->GetCircuit()
-			->GetTunable("apex_merge_every", 8.f));
-	if ((updCount % every == 1) || nearMiss) {
+	if (updCount % 32 == 1) {
 		return IsMergeSafe() ? CheckMergeTask() : nullptr;
 	}
 	return nullptr;
-}
-
-// A slot on a curved line facing the enemy, rather than the centre point itself.
-//
-// Regrouping sent every unit to ONE position, which is how a squad becomes a
-// ball -- and a ball is a single AOE footprint. apexearth: "units should be
-// organized into curved lines against the general area of influence of the
-// enemy. we don't organize into balls, we organize into curves/lines."
-//
-// The line runs perpendicular to enemy-influence direction, so it presents a
-// front rather than a column. It bows slightly forward at the centre, which is
-// what makes it a curve: the flanks trail, so the shape wraps toward the enemy
-// instead of being a flat wall.
-AIFloat3 ISquadTask::LinePos(CCircuitUnit* unit, const AIFloat3& centre) const
-{
-	if (units.size() < 2) {
-		return centre;
-	}
-	CCircuitAI* circuit = manager->GetCircuit();
-	const AIFloat3& foe = circuit->GetEnemyManager()->GetEnemyPos();
-	float fx = foe.x - centre.x;
-	float fz = foe.z - centre.z;
-	const float flen = sqrtf(fx * fx + fz * fz);
-	if (flen < 1.f) {
-		return centre;
-	}
-	fx /= flen;
-	fz /= flen;
-
-	// Stable slot per unit: iteration order of `units` is by pointer and does not
-	// churn between updates, so a unit keeps its place instead of swapping.
-	int idx = 0;
-	for (CCircuitUnit* u : units) {
-		if (u == unit) {
-			break;
-		}
-		++idx;
-	}
-	const int n = int(units.size());
-	const float off = (float(idx) - float(n - 1) * 0.5f) * LINE_SPACING;
-
-	// Perpendicular to the enemy direction.
-	AIFloat3 pos = centre;
-	pos.x += -fz * off;
-	pos.z +=  fx * off;
-	// Bow: the centre stands forward of the flanks by up to a third of the span.
-	const float half = float(n - 1) * 0.5f * LINE_SPACING;
-	const float bow = (half > 1.f) ? (1.f - (off * off) / (half * half)) : 0.f;
-	pos.x += fx * bow * LINE_SPACING;
-	pos.z += fz * bow * LINE_SPACING;
-
-	CTerrainManager::CorrectPosition(pos);
-	return pos;
-}
-
-// Mean distance from the squad's centroid. apexearth: "take all their locations
-// and calculate the overall positional radius averaged.... if they're all spread
-// out then you do NOT have a strong fighting force."
-float ISquadTask::GetSpreadRadius() const
-{
-	if (units.empty()) {
-		return .0f;
-	}
-	const float count = float(units.size());
-	AIFloat3 centroid = ZeroVector;
-	for (CCircuitUnit* unit : units) {
-		centroid += unit->GetLastPos();
-	}
-	centroid /= count;
-
-	float sum = .0f;
-	for (CCircuitUnit* unit : units) {
-		sum += centroid.distance2D(unit->GetLastPos());
-	}
-	return sum / count;
-}
-
-// Derate the squad's rated power by how strung out it is. Twenty units spanning
-// the map are not twenty units in a fight -- they arrive a few at a time and are
-// beaten in detail.
-float ISquadTask::GetCohesionScale() const
-{
-	const float spread = GetSpreadRadius();
-	if (spread <= COHESION_MAX_SPREAD) {
-		return 1.f;
-	}
-	return std::max(COHESION_MIN_SCALE, COHESION_MAX_SPREAD / spread);
 }
 
 bool ISquadTask::IsMustRegroup()
@@ -534,9 +251,7 @@ bool ISquadTask::IsMustRegroup()
 		return false;
 	}
 
-	// apex: ground squads may now regroup outside friendly influence. Refusing
-	// to re-cohere in contested ground is what makes them arrive piecemeal.
-	if (!leader->GetCircuitDef()->IsAbleToFly() ? false : !IsMergeSafe()) {
+	if (!IsMergeSafe()) {  // (circuit->GetInflMap()->GetEnemyInflAt(leader->GetPos(frame)) > INFL_EPS) ?
 		state = State::ROAM;
 		return false;
 	}
@@ -573,7 +288,21 @@ bool ISquadTask::IsMustRegroup()
 	}
 
 	if (State::REGROUP != state) {
-		groupPos = bestPlace->GetLastPos();
+		// apex: the squad gathers at its FRONT, the member nearest the target
+		// (apexearth 2026-09-30: "have the squad stay up towards the front and
+		// wait for the reinforcements to come up").
+		CCircuitUnit* front = bestPlace;
+		if (utils::is_valid(position)) {
+			float frontSq = std::numeric_limits<float>::max();
+			for (CCircuitUnit* unit : validUnits) {
+				const float sq = unit->GetPos(frame).SqDistance2D(position);
+				if (sq < frontSq) {
+					frontSq = sq;
+					front = unit;
+				}
+			}
+		}
+		groupPos = front->GetLastPos();
 		groupFrame = frame;
 	} else if (frame >= groupFrame + FRAMES_PER_SEC * 60) {
 		// eliminate buggy units
@@ -601,10 +330,6 @@ bool ISquadTask::IsMustRegroup()
 		return false;
 	}
 
-	// Back to upstream THREAT_MIN. Widening this to 8x for ground let the block
-	// below run while the squad was in contact, and that block ends in
-	// Garbage(leader), which routes to UnitDestroyed + UnregisterTeamUnit: the AI
-	// drops a LIVE unit from its own records and never orders it again.
 	if (threatMap->GetThreatAt(groupPos) >= THREAT_MIN) {
 		validUnits.clear();
 		state = State::ROAM;
@@ -614,17 +339,34 @@ bool ISquadTask::IsMustRegroup()
 	bool wasRegroup = (State::REGROUP == state);
 	state = State::ROAM;
 
-	// Back to upstream's count-scaled spread. Capping it at an absolute 700 while
-	// CanAssignTo admits units up to ASSIGN_RADIUS 3000 apart made REGROUP the
-	// squad's normal state: it could not satisfy cohesion it was assembled to
-	// violate, so it gathered instead of fighting, and fed the block below.
-	const float spread = SQUARE_SIZE * 8 * validUnits.size();
-	const float sqMaxDist = SQUARE(std::max<float>(spread, highestRange));
+	// apex: wait only while less than half the squad's power stands together at
+	// the front; one reinforcement walking up is not worth stopping for
+	// (apexearth: "10 units turning into 11 -- are you really going to wait?").
+	const float sqMaxDist = SQUARE(std::max<float>(SQUARE_SIZE * 8 * validUnits.size(), highestRange));
+	float powNear = 0.f, powAll = 0.f;
+	bool anyOut = false;
 	for (CCircuitUnit* unit : validUnits) {
-		const float sqDist = groupPos.SqDistance2D(unit->GetLastPos());
-		if (sqDist > sqMaxDist) {
-			state = State::REGROUP;
-			break;
+		const float p = std::max(unit->GetCircuitDef()->GetPower(), 1.f);
+		powAll += p;
+		if (groupPos.SqDistance2D(unit->GetLastPos()) > sqMaxDist) {
+			anyOut = true;
+		} else {
+			powNear += p;
+		}
+	}
+	if (anyOut && (powNear * 2.f < powAll)) {
+		state = State::REGROUP;
+	}
+	{
+		struct Tally { int hold = 0, go = 0, logAt = 0; };
+		static std::map<const CCircuitAI*, Tally> tally;
+		Tally& t = tally[circuit];
+		if (anyOut) {
+			++((State::REGROUP == state) ? t.hold : t.go);
+		}
+		if (frame >= t.logAt) {
+			t.logAt = frame + FRAMES_PER_SEC * 60;
+			circuit->LOG("apex: regroup held=%i kept-going=%i", t.hold, t.go);
 		}
 	}
 
@@ -646,76 +388,9 @@ bool ISquadTask::IsMustRegroup()
 
 void ISquadTask::ActivePath(float speed)
 {
-	// TRAVEL LINE-ABREAST, not single file. Every unit gets the same path, so
-	// without a per-unit offset the squad walks onto one point and meets contact
-	// as a column with only the leaders able to fire. Spread them perpendicular
-	// to the path instead: the squad arrives as a wall, every gun bearing, and a
-	// wall is also what stops raiders leaking between units.
-	// apexearth: "they should really be forming a wall against the enemy so when
-	// the enemy comes in to attack we have that 'wall of fire' coming out of all
-	// our nicely positioned units... also it helps to block enemy 'leaks'."
-	//
-	// Centred on the path, so the squad's centre of mass still follows the route
-	// the pathfinder chose and nothing about target or route selection changes.
-	// Width is bounded: a line wider than this stops being one fight.
-	//
-	// The gap is per-NEIGHBOUR-PAIR, not one width shared out, because a charger
-	// needs CHARGE_SPACING from whatever stands next to it while the ordinary
-	// units either side of it stay at SQUAD_FILE_SPACING. Sharing one uniform
-	// step would either pack the chargers into one D-gun line or blow the whole
-	// squad apart to keep them separated.
-	const int n = int(units.size());
-	std::vector<float> offset;
-	offset.reserve(n);
-	float span = 0.f;
-	float cap = SQUAD_FILE_MAX_WIDTH;
-	const CCircuitDef* prevDef = nullptr;
 	for (CCircuitUnit* unit : units) {
-		const CCircuitDef* cdef = unit->GetCircuitDef();
-		const bool isCharge = IsChargeDef(cdef);
-		if (prevDef != nullptr) {
-			span += (isCharge || IsChargeDef(prevDef)) ? CHARGE_SPACING : SQUAD_FILE_SPACING;
-		}
-		if (isCharge) {
-			// A charger squad is allowed to be wider than one fight: its units
-			// each survive alone, which is the whole reason to separate them.
-			cap = std::max(cap, CHARGE_SPACING * float(n));
-		}
-		offset.push_back(span);
-		prevDef = cdef;
+		unit->GetTravelAct()->SetPath(pPath, speed);
 	}
-	const float scale = (span > cap) ? (cap / span) : 1.f;
-	const float half = span * scale * 0.5f;
-	int i = 0;
-	for (CCircuitUnit* unit : units) {
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->SetPath(pPath, speed);
-		}
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->SetLateral((n > 1) ? (offset[i] * scale - half) : 0.f);
-		}
-		++i;
-	}
-}
-
-float ISquadTask::GetHealthScale() const
-{
-	float total = .0f;
-	float alive = .0f;
-	for (CCircuitUnit* unit : units) {
-		const float power = unit->GetCircuitDef()->GetPower();
-		total += power;
-		// apexearth: "A retreating unit should have 0 power. It is no longer
-		// fighting." A coward stands rear by design; whatever HP it keeps, it
-		// contributes nothing to the fight being sized.
-		if (cowards.find(unit) != cowards.end()) {
-			continue;
-		}
-		float hp = unit->GetHealthPercent();
-		hp = std::max(.0f, std::min(1.f, hp));  // capture progress drives it negative
-		alive += power * hp;
-	}
-	return (total > .0f) ? (alive / total) : 1.f;
 }
 
 NSMicroPather::HitFunc ISquadTask::GetHitTest() const
@@ -771,21 +446,8 @@ void ISquadTask::Attack(const int frame)
 void ISquadTask::Attack(const int frame, const bool isGround)
 {
 	const AIFloat3& tPos = GetTarget()->GetPos();
-	// apexearth: "keeping our units close to their maximum range against
-	// enemies, and to almost always stay moving. standing still leads to
-	// death much quicker." Previously 3s: a squad reaches its computed
-	// standoff position (below) and then holds it -- moving only when the
-	// target's tile/range bucket changes -- for up to 3 full seconds even
-	// though the target is very likely drifting the whole time. Shortened
-	// to 1s so position re-evaluates roughly 3x more often, without going
-	// so low it fights the engine's own per-frame unit AI or spams orders.
-	const bool isRepeatAttack = (frame >= attackFrame + FRAMES_PER_SEC * 1);
+	const bool isRepeatAttack = (frame >= attackFrame + FRAMES_PER_SEC * 3);
 	attackFrame = isRepeatAttack ? frame : attackFrame;
-
-	// One direction per task, derived from its identity rather than randomly, so
-	// it is stable across passes and two neighbouring squads do not orbit the
-	// same way into each other.
-	const float orbitDir = ((reinterpret_cast<uintptr_t>(this) >> 4) & 1u) ? 1.f : -1.f;
 
 	auto it = rangeUnits.begin()->second.begin();
 	std::advance(it, rangeUnits.begin()->second.size() / 2);  // TODO: Optimize
@@ -797,9 +459,7 @@ void ISquadTask::Attack(const int frame, const bool isGround)
 				if (unit->Blocker() != nullptr) {
 					continue;  // Do not interrupt current action
 				}
-				if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-					unit->GetTravelAct()->StateWait();
-				}
+				unit->GetTravelAct()->StateWait();
 
 				unit->Attack(GetTarget(), isGround, frame + FRAMES_PER_SEC * 60);
 			}
@@ -814,283 +474,22 @@ void ISquadTask::Attack(const int frame, const bool isGround)
 	// incorrect, it should check aoe in vicinity
 	const float aoe = (edef != nullptr) ? edef->GetAoe() : SQUARE_SIZE;
 
-	const float rangeMod = manager->GetCircuit()->GetTunable("apex_range_mod", STANDOFF_RANGE_MOD);
-	const bool losStandoff = manager->GetCircuit()->GetTunable("apex_los_standoff", 1.f) > 0.f;
-
-	// apexearth: "certain lower hp units have to be way more careful than
-	// high hp units." Baseline is THIS squad's own average health, not a
-	// global constant -- whatever mix of units is actually fighting together
-	// sets its own reference point, so a Hound reads as fragile next to
-	// Mammoths without a per-unit-type special case, and the same code path
-	// covers any low-HP def on any faction.
-	float squadHealthSum = 0.f;
-	float squadPowerSum = 0.f;
-	int squadUnitCount = 0;
-	for (const auto& kv : rangeUnits) {
-		CCircuitDef* def = (*kv.second.begin())->GetCircuitDef();
-		if (def != nullptr) {
-			squadHealthSum += def->GetHealth() * kv.second.size();
-			squadPowerSum += def->GetPower() * kv.second.size();
-			squadUnitCount += (int)kv.second.size();
-		}
-	}
-	// apexearth, watching live: a raider squad of Pawns hovered at "110%" of a
-	// tower's range -- unable to shoot, trickle-dying to pathing jitter -- when
-	// they could easily overwhelm it. A STATIC cannot chase, so standing at its
-	// range is never useful: either the squad wins the dive and must commit, or
-	// the target should not be pressed from here at all. The per-row
-	// powerDominant test cannot see this: one Pawn loses the trade, eight win
-	// it, so the test is squad AGGREGATE power against the target.
-	CCircuitDef* atkDef = (GetTarget() != nullptr) ? GetTarget()->GetCircuitDef() : nullptr;
-	// Against the LOCAL threat at the target, not the lone target's power: the
-	// ground a static stands on is covered by everything beside it, and reading
-	// only the target made a squad "overwhelm" one tower in a row of five and
-	// dive through the rest -- apexearth, after 41% of lost metal died in
-	// attack tasks at 0.72 forward: "We have some false belief that we are
-	// overwhelming something that is superior." GetThreatAt sums every armed
-	// enemy covering the spot, on the same power scale as GetPower().
-	bool squadOverwhelms = false;
-	if ((atkDef != nullptr) && !atkDef->IsMobile() && (leader != nullptr)) {
-		const float localThreat = manager->GetCircuit()->GetThreatMap()
-				->GetThreatAt(leader, GetTarget()->GetPos());
-		// apex: the squad counts the ALLIES STANDING BESIDE IT, not just
-		// itself. Squads average ~3 units, and each fragment testing its own
-		// power against everything at the target is the structural trickle --
-		// on choke maps every fight funnels through one seam, so the
-		// fragmentation penalty is maximal there (Altair: kill/loss 0.31 vs
-		// 0.79 open-map, the campaign's terminal cause). Same aggregation
-		// pattern as the enemy-side group influence: our own ATTACK/DEFEND
-		// squads near this squad's leader fight as the force they jointly are.
-		float allyNear = squadPowerSum;
-		if (manager->GetCircuit()->GetTunable("apex_ally_aggregate", 1.f) > 0.f) {
-			const AIFloat3& lp = leader->GetPos(manager->GetCircuit()->GetLastFrame());
-			CMilitaryManager* mm = static_cast<CMilitaryManager*>(manager);
-			for (IFighterTask::FightType ft : {IFighterTask::FightType::ATTACK,
-			                                   IFighterTask::FightType::DEFEND}) {
-				for (IFighterTask* other : mm->GetTasks(ft)) {
-					if (other == static_cast<IFighterTask*>(this)) {
-						continue;
-					}
-					ISquadTask* st = static_cast<ISquadTask*>(other);
-					CCircuitUnit* ol = st->GetLeader();
-					if ((ol == nullptr)
-						|| (ol->GetPos(manager->GetCircuit()->GetLastFrame())
-							.SqDistance2D(lp) > SQUARE(800.f)))
-					{
-						continue;
-					}
-					allyNear += other->GetAttackPower();
-				}
-			}
-		}
-		squadOverwhelms = allyNear > std::max(localThreat, atkDef->GetPower())
-				* manager->GetCircuit()->GetTunable("apex_static_commit", POWER_DOMINANCE_RATIO);
-	}
-	const float avgSquadHealth = (squadUnitCount > 0) ? (squadHealthSum / squadUnitCount) : 1.f;
-	const float fragileCap = manager->GetCircuit()->GetTunable("apex_fragile_cap", FRAGILE_CAP);
-	const float fragileScale = manager->GetCircuit()->GetTunable("apex_fragile_standoff_scale", FRAGILE_STANDOFF_SCALE);
-
 	int row = 0;
 	for (const auto& kv : rangeUnits) {
 		CCircuitDef* rowDef = (*kv.second.begin())->GetCircuitDef();
-		// >1 only when this row is below the squad's own average health;
-		// clamped at 1 so an above-average (tankier) row is never given LESS
-		// caution than the flat baseline -- this only ever adds standoff, it
-		// never removes it.
-		const float fragility = (rowDef != nullptr)
-				? std::min(std::max(avgSquadHealth / std::max(rowDef->GetHealth(), 1.f), 1.f), fragileCap)
-				: 1.f;
-		// Each row stands at ITS OWN weapon range. A fraction of 0.8 walked every row
-		// 20% inside its reach, which throws away the whole point of keeping the
-		// long-ranged units in an outer row -- a Banisher at 800 was standing at
-		// 640, inside the tanks it was supposed to shoot over.
-		//
-		// apexearth: "some units easily die on the first hit... if enemies are
-		// within 900 [of my 1000 range] i absolutely have to move away from
-		// them... if i am just 10% out of range of that enemy unit, i absolutely
-		// must move away from them." When the CURRENT TARGET outranges this row's
-		// own weapon (edef->GetMaxRange() > kv.first), standing at our own range
-		// puts us inside theirs -- exactly backwards, we would be standing still
-		// getting hit while unable to answer. Stand at their range plus a safety
-		// margin instead, so we are never inside a reach we cannot match.
-		//
-		// EXCEPT indirect fire. apexearth: "some enemies are indirect fire --
-		// like rocket launcher units. We can be within range of those as long as
-		// we keep moving and avoid wherever their missile is going... Arbiters
-		// [corhrk, role="artillery" -> IsRoleArty()] have very long range but are
-		// super vulnerable if you get up close." Retreating from a dodgeable,
-		// close-range-weak target is backwards for the same reason standing
-		// still inside a direct-fire weapon's range is -- so arty targets keep
-		// the normal own-range standoff instead of backing off to theirs.
-		// Restored: bisection (armada-bisect-outrange-revert-8) crashed the
-		// native DLL in all 8 games at ~1.2 minutes, but that batch also
-		// carried a real bug in the jammer-veto AngelScript path (called
-		// GetBuildPos() on a non-BUILDER task, same crash signature) that was
-		// new in that same deploy and this change was not. The prior 0-8 read
-		// (armada-unitdistance-check-8) that prompted the bisection ran to
-		// completion with no crash -- a real loss, but indistinguishable from
-		// this session's established small-batch noise until re-tested clean.
-		const bool isArty = (edef != nullptr) && edef->IsRoleArty();
-		// apexearth, watching live: "our thug style units are afraid of
-		// rocket bots because they have more range. thugs/maces are more
-		// powerful than rocket bots so that's unfortunate." A rocket bot
-		// (armrock/corrock) is direct-fire, not IsRoleArty(), so it was
-		// getting the same kite-away treatment as a real long-range threat
-		// even though a heavy assault bot standing at its own range shrugs
-		// off rocket fire and wins the trade -- kiting away just throws that
-		// advantage out for no reason.
-		//
-		// First attempt used cost as the "who wins" proxy and was wrong:
-		// checked against tools/unitdef.py, corthud (Thug) is 140 metal,
-		// armham (Mace) 130, armrock (Rocketeer) 120 -- all similar T1 bot
-		// costs, nowhere near a dominance ratio. GetPower() is the right
-		// signal instead: CCircuitDef precomputes damage*sqrt(health) per
-		// def (CircuitDef.cpp), the same formula CThreatMap::GetUnitPower
-		// uses for live units, and it is what the threat map itself is
-		// already built from -- Thug/Mace's low range but high alpha and
-		// health should score well above Rocketeer's glass-cannon poke
-		// (its own description: "good vs. static defenses") on this metric
-		// even though cost alone could not tell them apart.
-		const bool powerDominant = (edef != nullptr) && (rowDef != nullptr)
-				&& (rowDef->GetPower() > edef->GetPower() * POWER_DOMINANCE_RATIO);
-		// TEMPORARY diagnostic, apexearth: "remember good diagnostics and
-		// instrumentation are important!" GetPower() at the def level is
-		// unverified for this exact matchup -- log both sides' power whenever
-		// a row actually outranges its target, so a smoke test can confirm
-		// powerDominant fires true for Thug/Mace vs Rocketeer specifically
-		// before trusting the mechanism. Time-rate-limited rather than
-		// call-count-capped: a 60-call cap exhausted in the first 30 seconds
-		// of a 15-minute smoke test and never got another sample, so it
-		// never actually saw a Thug/Mace-vs-Rocketeer pairing at all.
-		static int sLastPowerDiagFrame = -1000000;
-		const int diagFrame = manager->GetCircuit()->GetLastFrame();
-		if ((edef != nullptr) && (rowDef != nullptr) && (edef->GetMaxRange() > kv.first)
-			&& (diagFrame >= sLastPowerDiagFrame + FRAMES_PER_SEC * 5))
-		{
-			sLastPowerDiagFrame = diagFrame;
-			manager->GetCircuit()->GetLog()->DoLog(utils::string_format(
-				std::string("apex: outrange-power-diag row=%s (pwr=%.1f hp=%.0f) target=%s (pwr=%.1f hp=%.0f) dominant=%d glass=%d"),
-				rowDef->GetDef()->GetName(), rowDef->GetPower(), rowDef->GetHealth(),
-				edef->GetDef()->GetName(), edef->GetPower(), edef->GetHealth(),
-				powerDominant, (edef->GetHealth() < rowDef->GetHealth())).c_str());
-		}
-		// A target that outranges us AND is more fragile than we are loses the
-		// race the moment we close, so backing off to its range hands it a free
-		// win -- it simply keeps shooting and we never arrive. apexearth: "we
-		// stop when we are afraid of sniper-like units... we need to dive in and
-		// ignore that 'stay at range' strat if we really want to commit to
-		// killing/engaging them."
-		//
-		// Keyed on HEALTH rather than the role or the "siege" attribute, both of
-		// which were checked against the configs and are wrong for this. Read
-		// from the pinned tree: Sharpshooter (armsnipe, the actual sniper) has
-		// 580 health against a Mace's 1000 -- fragile, dive it. But role
-		// anti_heavy also covers Starlight (2800) and Arquebus (2200), and the
-		// siege attribute covers Vanguard, kamikazes, ships and subs; exempting
-		// either group would send squads diving into things that comfortably win
-		// the close fight. Health separates them cleanly and needs no list to
-		// maintain.
-		const bool glassCannon = (edef != nullptr) && (rowDef != nullptr)
-				&& (edef->GetHealth() < rowDef->GetHealth());
-		// apex: a weaponless escort (radar/jammer) keys row 0 -- "stand at
-		// your own range" told it to stand ON the target, which is why the
-		// sensors died first. It has no reach to hold; it holds BEHIND the
-		// squad's longest row on the same enemy-away axis (apexearth:
-		// "Jammer/Radar units should always angle themselves behind their
-		// squad relative to the direction of the enemy").
-		const float rowRange = (kv.first <= (float)SQUARE_SIZE)
-				? (highestRange + manager->GetCircuit()->GetTunable("apex_escort_standoff", 240.f))
-				: kv.first;
-		// apex: AN ADVANCING WALL VOIDS THE STANDOFF. Against a static that
-		// outranges the row, the safety standoff parks us beyond ITS reach --
-		// where we deal zero damage -- and a porc-creep simply builds its next
-		// tower closer and walks the standoff backward forever: the Altair
-		// campaign's terminal mechanism (13 hypotheses; the wall advanced
-		// 150-250 elmos/min unfought to our base by minute 26). A static
-		// target standing on OUR side of the map is a wall at the door:
-		// commit and kill the frontier tower, the dominance/aggregation tests
-		// above still decide whether we jointly can.
-		bool wallAtDoor = false;
-		if (isStatic && (manager->GetCircuit()->GetTunable("apex_wall_commit", 1.f) > 0.f)) {
-			const AIFloat3& ourBase = manager->GetCircuit()->GetSetupManager()->GetBasePos();
-			const AIFloat3& foePos = manager->GetCircuit()->GetEnemyManager()->GetEnemyPos();
-			if (utils::is_valid(foePos)) {
-				wallAtDoor = tPos.SqDistance2D(ourBase) < tPos.SqDistance2D(foePos);
-			}
-		}
-		const bool outranged = !isArty && !powerDominant && !glassCannon && !squadOverwhelms
-				&& !wallAtDoor
-				&& (edef != nullptr) && (edef->GetMaxRange() > rowRange);
-		const float standoff = outranged ? (edef->GetMaxRange() * OUTRANGED_SAFETY_MARGIN) : rowRange;
-		// A fragile row (below the squad's own average health) stands further
-		// out on top of the normal 90% margin -- e.g. fragility==2 (half the
-		// squad's average HP) at the default scale adds 25% more standoff.
-		float range = standoff * rangeMod * (1.f + (fragility - 1.f) * fragileScale);
-		// apexearth, watching, same night as the LOS-static fix: "I see rocket
-		// bots walk into turrets and die too... hounds still make this
-		// mistake" -- reported AFTER that fix was live, so this is a second,
-		// distinct cause. When `!outranged` (our row's raw range >= the
-		// target's), standoff is OUR OWN range with no reference to theirs, and
-		// rangeMod then shrinks it by 10% unconditionally. A target whose range
-		// sits within that 10% band -- corhlt 620 vs Hound's 650, 650*0.9=585 --
-		// reads as "outranged=false" (we do out-range it) yet the shrunk
-		// standoff (585) lands INSIDE its 620 reach. Floor at the target's own
-		// range only in this genuinely-outranging branch; the intentional dives
-		// (isArty/powerDominant/glassCannon, which route standoff through
-		// kv.first for the opposite reason -- closing on purpose) are
-		// unaffected because none of those leave `weOutrange` true without also
-		// being a real range edge.
-		const bool weOutrange = !outranged && (edef != nullptr) && (edef->GetMaxRange() <= rowRange)
-				&& !isArty && !powerDominant && !glassCannon;
-		if (weOutrange) {
-			range = std::max(range, edef->GetMaxRange() * OUTRANGED_SAFETY_MARGIN);
-		}
+		const float range = kv.first * RANGE_MOD;
 		// NOTE: 1st unit in 1st row will scout, ignoring GetTarget()->IsInRadarOrLOS()
 		//       as unit may wobble back and forth without firing if turret turn is slow.
-		// Floored at `range`. apexearth, watching Hounds (650 weapon range,
-		// 400 sight -- see the 2026-08-09 EyesForTheGuns note): "I see our
-		// hound units running much too deep into enemy territory while
-		// fighting enemies from too close up." min(kv.first, losRadius) is
-		// exactly sight radius whenever sight is the smaller of the two --
-		// true by construction for any unit this scouting behaviour was
-		// meant to matter for -- so the scout used to walk in to 400 on a
-		// 650-range gun, well inside the safe standoff. The mobile-radar
-		// escort (EyesForTheGuns) is the intended fix for a blind gun now;
-		// this block should never send the gun itself in closer than the
-		// standoff it would otherwise hold. For any row whose sight already
-		// reaches past its own standoff distance, min(...)*rangeMod already
-		// equals `range`, so the max() below is a no-op there.
 		float range0 = range;
-		if ((row++ == 0) && losStandoff && (isStatic || !GetTarget()->IsInRadarOrLOS())) {
-			range0 = std::max(range, std::min(kv.first, rowDef->GetLosRadius()) * rangeMod);
+		if ((row++ == 0) && (isStatic || !GetTarget()->IsInRadarOrLOS())) {
+			range0 = std::min(kv.first, rowDef->GetLosRadius()) * RANGE_MOD;
 		}
-		// The arc a row may occupy. At 0.9*PI a squad packs into a half circle on
-		// one side of the target, which is a single AOE footprint -- and the wider
-		// the squad, the tighter the packing, because this is divided by the unit
-		// count. apexearth: "if we had a whole bunch of tiger tanks, we would
-		// surround the enemy units, form a circle... ideally... our banishers
-		// would stay at a distance." Rows are already keyed by weapon range, so
-		// the second half of that is done; this is the first half.
-		const float maxDelta = (M_PI
-				* manager->GetCircuit()->GetTunable("apex_arc_span", ARC_SPAN))
-				/ kv.second.size();
+		const float maxDelta = (M_PI * 0.9f) / kv.second.size();
 		// NOTE: float delta = asinf(cdef->GetRadius() / range);
 		//       but sin of a small angle is similar to that angle, omit asinf() call
 		float delta = (3.0f * (rowDef->GetRadius() + aoe)) / (range + DIV0_SLACK);
 		if (delta > maxDelta) {
 			delta = maxDelta;
-		}
-		// A charger row gets a FLOOR on its spacing, applied after the cap so
-		// the cap cannot take it back: maxDelta shrinks with the unit count, so
-		// the more Behemoths arrive the tighter they were packing -- exactly
-		// backwards for the one thing a commander can kill them with. Bounded so
-		// the arc can close into a full ring but never wrap over itself.
-		if (IsChargeDef(rowDef)) {
-			const float minDelta = std::min(CHARGE_SPACING / (range + DIV0_SLACK),
-					float(2.0 * M_PI) / float(kv.second.size()));
-			if (delta < minDelta) {
-				delta = minDelta;
-			}
 		}
 
 		float beta = -delta * (kv.second.size() / 2);
@@ -1098,411 +497,28 @@ void ISquadTask::Attack(const int frame, const bool isGround)
 		const float end2 = alpha - beta;
 		AIFloat3 newPos1(tPos.x + range * cosf(end1), tPos.y, tPos.z + range * sinf(end1));
 		AIFloat3 newPos2(tPos.x + range * cosf(end2), tPos.y, tPos.z + range * sinf(end2));
-		// A ring end around a target near the map border lands off-map, and
-		// GetThreatAt indexes the threat array UNCHECKED (its bounds assert is
-		// compiled out in release) -- crashed a live watched game 2026-08-15
-		// (frame ~0x, AV in CThreatMap::GetThreatAt from this exact call).
-		// Same clamp the per-unit standoff path below already applies.
-		CTerrainManager::CorrectPosition(newPos1);
-		CTerrainManager::CorrectPosition(newPos2);
-		CCircuitUnit* testUnit = *kv.second.begin();
-		const AIFloat3 testPos = testUnit->GetPos(frame);
-		// apexearth: "we should try to choose safer angles." The two ring ends
-		// are geometrically equivalent (same range, mirrored arc); which one this
-		// row actually walks toward used to be picked on distance alone -- purely
-		// "which side is less travel," with no regard for what is on that side.
-		// Reuses the same GetThreatAt this function already calls per-unit below
-		// for the standoff veto, just sampled once per row on the two candidate
-		// ends instead of the one position a unit is already walking to. Distance
-		// stays the tiebreak when neither side is meaningfully more dangerous, so
-		// a squad does not zigzag between two near-identical tiles.
-		CThreatMap* angleThreatMap = manager->GetCircuit()->GetThreatMap();
-		const float threat1 = angleThreatMap->GetThreatAt(testUnit, newPos1);
-		const float threat2 = angleThreatMap->GetThreatAt(testUnit, newPos2);
-		// A fragile row needs a smaller threat gap to prefer the safer side --
-		// same 10% baseline, tightened by the row's own fragility so a Hound
-		// picks the safer angle more decisively than a Mammoth on the same pair
-		// of candidate spots.
-		const float threatSpread = std::max(threat1, threat2) * (0.1f / fragility);
-		const bool flipForSafety = (std::fabs(threat1 - threat2) > threatSpread) && (threat2 < threat1);
-		const bool flipForDistance = (std::fabs(threat1 - threat2) <= threatSpread)
-				&& (testPos.SqDistance2D(newPos1) > testPos.SqDistance2D(newPos2));
-		if (flipForSafety || flipForDistance) {
+		const AIFloat3 testPos = (*kv.second.begin())->GetPos(frame);
+		if (testPos.SqDistance2D(newPos1) > testPos.SqDistance2D(newPos2)) {
 			delta = -delta;
 			beta = -beta;
 		}
 
-		// apex: KITING. The ring above is anchored to the current TARGET only --
-		// nothing here reacted when a DIFFERENT enemy closed on the row, and with
-		// the fragility pushback defaulted off a rocketbot row stood still trading
-		// into a shrinking gap ("rocketbots stand still firing... without trying
-		// to keep their distance"). If the nearest armed enemy group has closed
-		// well inside this row's own standoff, each unit's slot moves away from
-		// that enemy to re-open the gap. Charge/melee rows and short-ranged rows
-		// keep closing -- kiting is a long-gun move -- and a squad committed to
-		// overwhelming a static does not back off mid-dive.
-		AIFloat3 kiteFoe = -RgtVector;
-		float kiteFoeRange = 0.f;
-		bool kiteFoeStatic = false;
-		// 250, was 400: the 400 floor excluded every mid-range riot/skirm row
-		// (~300 range) from kiting entirely -- apexearth 2026-08-19: "us walk
-		// up close with units like thugs and maces, and they just get
-		// absolutely creamed." Melee/charge rows are already excluded by role.
-		const float kiteMin = manager->GetCircuit()->GetTunable("apex_kite_min_range", 250.f);
-		const float kiteFrac = manager->GetCircuit()->GetTunable("apex_kite_frac", 0.7f);
-		// apex: A COLOSSUS SHOOTS THE MOST VALUABLE THING IN REACH WHILE IT
-		// MARCHES. apexearth 2026-08-29: "They should focus on shooting the
-		// most valuable target within range while continuing to move into the
-		// enemy base." Engine auto-targeting picks by its own heuristics;
-		// set-target overrides it and unit_target_on_the_move keeps it live
-		// while the unit walks. Same class test as the colossus election.
-		CEnemyInfo* valFoe = nullptr;
-		float valFoeCost = 0.f;
-		// apex: FINISH THE WOUNDED (apexearth 2026-08-29, watching arena
-		// rounds: "have our units concentrate their firing on enemies which
-		// are lowest HP to 'finish' them sooner"). The row's set-target
-		// becomes the lowest-health enemy in its own reach, so the whole row
-		// focuses one kill at a time and enemy DPS leaves the field fastest.
-		// Colossi keep the richest-target rule instead.
-		// v3 (apexearth: "Focus fire should be a set target thing only, and
-		// overkill volleys should be thought about some"): a LIST of wounded
-		// targets, lowest absolute HP first, and the row's units are dealt
-		// across it in LETHAL DOSES -- each target gets ~enough dps-seconds
-		// to die, then the next unit aims at the next target. Set-target
-		// only; the engine still overrides when it cannot hit. v1/v2 dumped
-		// the whole row on one target and measured harmful (overkill).
-		const int FIN_N = 6;
-		CEnemyInfo* finCand[FIN_N] = { nullptr };
-		float finHp[FIN_N];
-		const bool rowColossus = (rowDef != nullptr)
-				&& (rowDef->IsCharger() || (rowDef->GetCostM()
-					>= manager->GetCircuit()->GetTunable("apex_super_cost", 7000.f)));
-		const bool kiteOk = (kiteFrac > 0.f) && (kv.first >= kiteMin)
-				&& !IsChargeDef(rowDef) && !squadOverwhelms;
-		if (kiteOk || rowColossus)
-		{
-			// Individual armed enemies, NOT group centroids -- but never a
-			// walk of the whole enemy registry: ghosts of units killed out
-			// of LOS are never unregistered, so that map grows with game AGE
-			// and a per-row full scan compounded into the worst-frame spikes
-			// apexearth reported ("performance continuously gets worse";
-			// spikeMs 5 -> 78 over 28 minutes with unit count flat). Coarse
-			// pass over the bounded cluster list finds the one nearby group;
-			// the per-unit pass runs only inside it. A Behemoth beside the
-			// row is in whatever cluster is nearest, so the original blind
-			// spot (centroid far, unit close) stays covered at cluster cost.
-			float bestSq = SQUARE(kv.first);
-			CCircuitAI* kc = manager->GetCircuit();
-			const CEnemyManager::SEnemyGroup* nearGroup = nullptr;
-			float bestGroupSq = SQUARE(kv.first * 3.f);
-			for (const CEnemyManager::SEnemyGroup& g : kc->GetEnemyManager()->GetEnemyGroups()) {
-				const float sq = g.pos.SqDistance2D(testPos);
-				if ((g.influence > 0.f) && (sq < bestGroupSq)) {
-					bestGroupSq = sq;
-					nearGroup = &g;
-				}
-			}
-			if (nearGroup != nullptr) {
-				for (const ICoreUnit::Id eId : nearGroup->units) {
-					CEnemyInfo* e = kc->GetEnemyInfo(eId);
-					if ((e == nullptr) || e->IsHidden()) {
-						continue;
-					}
-					CCircuitDef* ed = e->GetCircuitDef();
-					if ((ed == nullptr) || ed->IsAbleToFly()) {
-						continue;
-					}
-					const float sq = e->GetPos().SqDistance2D(testPos);
-					// The value pick has no armed filter: an enemy fusion in
-					// reach IS the most valuable target in range.
-					if (rowColossus && (sq < SQUARE(kv.first))
-						&& (ed->GetCostM() > valFoeCost))
-					{
-						valFoeCost = ed->GetCostM();
-						valFoe = e;
-					}
-					if (!rowColossus && (sq < SQUARE(kv.first))
-						&& (e->GetHealth() > 0.f))
-					{
-						const float maxH = (ed->GetHealth() > 1.f) ? ed->GetHealth() : 1.f;
-						if (e->GetHealth() / maxH < 0.9f) {
-							const float hp = e->GetHealth();
-							for (int fi = 0; fi < FIN_N; ++fi) {
-								if ((finCand[fi] == nullptr) || (hp < finHp[fi])) {
-									for (int fj = FIN_N - 1; fj > fi; --fj) {
-										finCand[fj] = finCand[fj - 1];
-										finHp[fj] = finHp[fj - 1];
-									}
-									finCand[fi] = e;
-									finHp[fi] = hp;
-									break;
-								}
-							}
-						}
-					}
-					if (!kiteOk || !ed->IsAttacker()) {
-						continue;
-					}
-					if (sq < bestSq) {
-						bestSq = sq;
-						kiteFoe = e->GetPos();
-						kiteFoeRange = ed->GetMaxRange();
-						kiteFoeStatic = !ed->IsMobile();
-					}
-				}
-			}
-		}
-
-		int finIdx = 0;
-		float finDosed = 0.f;
 		int iterNum = 0;
 		for (CCircuitUnit* unit : kv.second) {
 			if (unit->Blocker() != nullptr) {
 				continue;  // Do not interrupt current action
 			}
-			if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-				unit->GetTravelAct()->StateWait();
-			}
+			unit->GetTravelAct()->StateWait();
 
 			if (isRepeatAttack
 				|| (unit->GetTarget() != GetTarget())
 				|| (unit->GetTargetTile() != targetTile))
 			{
-				// KEEP MOVING. The slot is already a point on a circle of this
-				// row's weapon range around the target -- but the angle came
-				// only from the CURRENT bearing, so a unit walked to its slot
-				// and then stood there until the target moved. Standing at the
-				// right distance is still standing still.
-				//
-				// Precess the whole ring instead. Every unit keeps its own arc
-				// slot relative to its neighbours, so the formation holds, while
-				// the ring rotates slowly around the target: units strafe
-				// laterally at constant range, changing heading continuously.
-				// Projectiles lead their target, so a unit that never holds a
-				// heading eats fewer of them -- and the standoff distance, which
-				// is the point of the arc, is unchanged because rotation is
-				// perpendicular to it.
-				//
-				// This is only useful because CmdSetTarget is now live: before
-				// that a move order meant not shooting, so orbiting would have
-				// traded damage for evasion. Now it is free.
-				// apexearth: "our units could kinda circle around the enemies
-				// they want to shoot at... staying on the move, boosting their
-				// evasion when they keep changing their movement direction."
-				//
-				// Rate is per-task and constant, so the squad turns as one body
-				// rather than scattering. The existing threat check below still
-				// vetoes any step into worse ground, so this cannot orbit a unit
-				// into a second enemy.
-				const float orbit = ORBIT_RATE * (frame / (float)FRAMES_PER_SEC) * orbitDir;
-				const float angle = alpha + beta + orbit;
-				float r = (iterNum == 0) ? range0 : range;
-				// Screened, not withdrawn: a coward stands further out on the
-				// same ring instead of leaving the fight, so healthier
-				// squadmates on the same bearing sit between it and the
-				// target. This is not the reverted "never retreat" change --
-				// that forced EVERY unit to fight to the death in place; this
-				// only repositions a unit that OnUnitDamaged already judged
-				// safe enough not to need a full retreat.
-				if (cowards.find(unit) != cowards.end()) {
-					r *= manager->GetCircuit()->GetTunable("apex_coward_rear_mod", COWARD_REAR_MOD);
-					// REAR BUT STILL FIRING for the 60%-band stander: 1.35x
-					// the 90% standoff is ~1.22x the row's own weapon range,
-					// a slot that contributes nothing -- and parking every
-					// sub-60% unit there halved the A/B's K/D ratio twice.
-					// Capped inside the row's reach it screens by angle and
-					// margin, not by silence. A sliver coward (at or under
-					// its own retreat bar) keeps the full out-of-range
-					// screen: at 8-15% hp survival outweighs its DPS.
-					if (unit->GetHealthPercent() > unit->GetCircuitDef()->GetRetreat()) {
-						r = std::min(r, kv.first * 0.98f);
-					}
-				}
+				const float angle = alpha + beta;
+				const float r = (iterNum == 0) ? range0 : range;
 				AIFloat3 newPos(tPos.x + r * cosf(angle), tPos.y, tPos.z + r * sinf(angle));
 				CTerrainManager::CorrectPosition(newPos);
-				// The kite step overrides the ring slot: distance to the closing
-				// enemy is restored to this row's own standoff, along the line
-				// away from it. The threat veto below still applies.
-				if (utils::is_valid(kiteFoe)) {
-					const AIFloat3& kcur = unit->GetPos(frame);
-					const float sqFoe = kcur.SqDistance2D(kiteFoe);
-					// apex: THE TRIGGER IS THEIR RANGE, NOT A FRACTION OF OURS.
-					// "they need to be smart enough to back up when enemies are
-					// close to getting in range to fire back" (apexearth,
-					// 2026-08-19, on siege). A row backs off when the closing
-					// enemy is within its own weapon range plus a pad -- and
-					// re-opens to outside that reach, never closer than its own
-					// standoff. The old our-range-fraction stays as the floor
-					// for short-armed chasers.
-					const float foeReach = kiteFoeRange
-							+ manager->GetCircuit()->GetTunable("apex_kite_foe_pad", 120.f);
-					// apex: SIEGE FEARS PROXIMITY. apexearth 2026-08-20: "In
-					// general siege should be afraid of enemy units getting
-					// too close to it." A siege row's fear radius is nearly
-					// its whole weapon range (not the 70% default), it
-					// reopens to FULL range, and the anti-yo-yo guard relaxes
-					// to its own reach -- backing off inside one's own range
-					// is always the right move for a unit that wins at arm's
-					// length and dies in anyone else's.
-					const bool siegeRow = (rowDef != nullptr) && rowDef->IsAttrSiege();
-					const float rowFrac = siegeRow
-							? manager->GetCircuit()->GetTunable("apex_siege_fear_frac", 0.9f)
-							: kiteFrac;
-					const float openTo = siegeRow ? kv.first : (kv.first * rangeMod);
-					const float trigger = std::max(kv.first * rowFrac, foeReach);
-					// apex: OUTRANGING THE FOE ALWAYS PERMITS THE BACKSTEP. The
-					// yo-yo guard compared foeReach (their range + the pad)
-					// against our SHAVED standoff (range * rangeMod), so a pad
-					// plus the 10% shave ate a real range advantage whole: a
-					// Rocko (475) was forbidden to kite a Stumpy (350) --
-					// 470 !< 427 -- and the row stood trading at the shorter
-					// gun's range (apexearth, watching exactly this fight:
-					// "we just stood there while they surrounded us... If we
-					// sense too many enemies can shoot at us we should
-					// immediately back up instead of waiting to be hit").
-					// Raw range against raw range is the yo-yo question; the
-					// old shaved test stays only as the fallback that lets a
-					// row back off from a short-armed chaser it cannot
-					// out-stand.
-					// apex: A TOWER CANNOT CHASE, SO IT IS ALWAYS KITED.
-					// Backing off from an equal-range MOBILE loses DPS to a
-					// chaser forever; backing beyond a STATIC's reach is a
-					// pure win -- it stops hitting us and gains nothing.
-					// Measured (winrate6, 16 games): 48,582 metal of our
-					// mobiles died to enemy towers, 58% of it MID-MAP --
-					// stock creeps forward porc and our rows stood inside
-					// tower reach trading with guns they could not
-					// outrange, because this veto only allowed the backstep
-					// when we outranged the foe. The dive exemption above
-					// (squadOverwhelms) still lets a committed overwhelm
-					// press through.
-					// apex: NEVER BACK TO WHERE OUR OWN GUNS ARE DRY.
-					// The open distance is max(standoff, their reach + pad);
-					// for a brawler whose range edge is smaller than the pad
-					// that spot is outside its OWN range -- the row walks
-					// backwards forever, firing nothing, chased the whole
-					// way. apexearth (arena, twice): "our amphibious tanks
-					// act very very cowardly" -- every amph brawler is a
-					// raider-role short gun, exactly this shape. A mobile-foe
-					// kite whose destination is dry is cancelled: stand and
-					// brawl. Statics keep the unconditional back-out -- the
-					// tower stops hitting us and gains nothing.
-					const float open = std::max(openTo, foeReach);
-					const bool wetKite = kiteFoeStatic || (open <= kv.first)
-							|| (manager->GetCircuit()->GetTunable("apex_brawl_stand", 1.f) <= 0.f);
-					const bool mayKite = wetKite && (siegeRow
-							? (kiteFoeStatic || (foeReach < kv.first))
-							: (kiteFoeStatic || (kiteFoeRange < kv.first)
-								|| (trigger < kv.first * rangeMod)));
-					if ((sqFoe < SQUARE(trigger)) && mayKite) {
-						AIFloat3 away = kcur - kiteFoe;
-						if (away.SqLength2D() > 1.f) {
-							away.SafeNormalize2D();
-							newPos = kcur + away * (open - sqrtf(sqFoe));
-							CTerrainManager::CorrectPosition(newPos);
-						}
-					}
-				}
-
-				// apexearth: "sometimes our retreat logic takes us into new
-				// threats... it specifically appears to be the logic where we
-				// keep our distance from enemies we're actively fighting."
-				// newPos is computed purely from THIS target's range and this
-				// row's arc slot -- it never checks whether stepping there
-				// walks the unit into a second enemy's range it wasn't
-				// already in. Compare threat at the candidate standoff spot
-				// against threat where the unit already stands; if backing
-				// off would make things worse rather than better, hold
-				// position (still attack-move there, at 0 distance, so the
-				// engine's own turret tracking keeps firing) instead of
-				// stepping into the hotter spot. Small multiplicative
-				// tolerance so a unit doesn't flip-flop between two tiles of
-				// near-identical threat every isRepeatAttack tick.
-				//
-				// Gated on already being in range. The candidate ring point sits
-				// at THIS unit's own weapon range of the target, which is by
-				// construction inside (or adjacent to) the target's own threat
-				// radius -- so for a unit still closing distance, newPos reads
-				// higher threat than curPos on essentially every step, and the
-				// veto held it at curPos forever: CmdSetTarget still went out
-				// below, so the unit showed a target with no move ever following
-				// it. Only a unit already standing within its own standoff range
-				// (i.e. already trading fire, which is what the comment above
-				// describes) should be offered the choice to hold instead of
-				// stepping into a hotter spot.
-				CThreatMap* threatMap = manager->GetCircuit()->GetThreatMap();
-				const AIFloat3& curPos = unit->GetPos(frame);
-				const bool alreadyInRange = (curPos.SqDistance2D(tPos) <= SQUARE(r * 1.05f));
-				if (alreadyInRange
-					&& (threatMap->GetThreatAt(unit, newPos) > threatMap->GetThreatAt(unit, curPos) * 1.5f))
-				{
-					newPos = curPos;
-				}
-
-				// apex: A STATIC THAT CANNOT REPLY IS SHOT, NOT ORBITED. The
-				// ring + orbit + set-target dance exists to dodge lead shots
-				// from things that fight back; against an unarmed building, or
-				// a tower whose reach ends short of this unit's slot, the
-				// churn only spreads the squad around the target and delays
-				// its death (apexearth, watching: "we use this 'move' logic
-				// instead of just attacking it... it doesn't work well"). A
-				// plain attack order lets the engine close to exact weapon
-				// range and hold fire on it -- StopMove on bearing is the
-				// desired outcome here, not the bug it is against mobiles.
-				// ...AND NOTHING ELSE COVERS THE SPOT. The target's own gun is
-				// not the only fire that lands there: a unit parked still at an
-				// unarmed solar inside a defended base eats every tower beside
-				// it (measured: 2-14 with the target-only test, 5-10 with the
-				// orbit restored -- standing still was the whole regression).
-				// GetThreatAt sums every armed enemy covering the spot, so the
-				// plain attack applies only where standing is actually free.
-				const bool staticCantReply = isStatic && (edef != nullptr)
-						&& (!edef->IsAttacker() || (edef->GetMaxRange() * 1.05f < r))
-						&& (threatMap->GetThreatAt(unit, newPos) <= THREAT_MIN);
-				// apex: MICRO ONLY WHAT HAS A RANGE EDGE. The no-control arena
-				// diagnostic (3 seed-pairs): units stripped of our orders beat
-				// stock CONSISTENTLY (+0.047 mean, tight), while commanded
-				// units averaged the same with wild variance -- the ring adds
-				// nothing to a row that cannot out-stand its enemy, and costs
-				// DPS while it orbits. A row without a real range edge over
-				// the nearest armed foe hands the brawl to the engine (plain
-				// attack, auto-targeting); rows that outrange something keep
-				// the standoff machinery, which is their whole value.
-				const bool rowBrawls = (manager->GetCircuit()->GetTunable("apex_brawl_pass", 0.f) > 0.f)
-						&& !rowColossus && !kiteFoeStatic
-						&& (kiteFoeRange > 0.f)
-						&& (kv.first < kiteFoeRange + 60.f);
-				if (rowBrawls) {
-					unit->Attack(GetTarget(), isGround, frame + FRAMES_PER_SEC * 60);
-				} else if (staticCantReply
-					&& (manager->GetCircuit()->GetTunable("apex_static_plain_attack", 1.f) > 0.f))
-				{
-					unit->Attack(GetTarget(), isGround, frame + FRAMES_PER_SEC * 60);
-				} else {
-					unit->Attack(newPos, GetTarget(), targetTile, isGround, isStatic, frame + FRAMES_PER_SEC * 60);
-				}
-				// Attack() set-targeted the ELECTED target; for a colossus the
-				// preference is overridden to the richest thing in reach right
-				// now, while the move above keeps carrying it at the objective.
-				if (rowColossus && (valFoe != nullptr)) {
-					TRY_UNIT(manager->GetCircuit(), unit,
-						unit->CmdSetTarget(valFoe);
-					)
-				} else if ((finCand[0] != nullptr) && (finIdx < FIN_N)
-					&& (finCand[finIdx] != nullptr)
-					&& (manager->GetCircuit()->GetTunable("apex_focus_finish", 0.f) > 0.f))
-				{
-					TRY_UNIT(manager->GetCircuit(), unit,
-						unit->CmdSetTarget(finCand[finIdx]);
-					)
-					const float dose = ((rowDef != nullptr)
-							? rowDef->GetRawDps() : 10.f) * 2.5f;
-					finDosed += dose;
-					if (finDosed >= finHp[finIdx] * 1.15f) {
-						++finIdx;
-						finDosed = 0.f;
-					}
-				}
+				unit->Attack(newPos, GetTarget(), targetTile, isGround, isStatic, frame + FRAMES_PER_SEC * 60);
 			}
 
 			beta += delta;
@@ -1518,13 +534,52 @@ void ISquadTask::Log()
 
 	CCircuitAI* circuit = manager->GetCircuit();
 	circuit->LOG("pPath: %i | size: %i | TravelAct: %i", pPath.get(), pPath ? pPath->posPath.size() : 0,
-			if (leader->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-				leader->GetTravelAct()->GetState());
-			}
+			leader->GetTravelAct()->GetState());
 	if (leader != nullptr) {
 		circuit->GetDrawer()->AddPoint(leader->GetPos(circuit->GetLastFrame()), leader->GetCircuitDef()->GetDef()->GetName());
 	}
 }
 #endif
+
+// Kept across the fight revert for AntiAirTask/AntiHeavyTask, which size their
+// odds with it. The apex version also zeroed a retreating unit's power
+// (apexearth: "A retreating unit should have 0 power"), but that read the
+// coward set, which went back to stock with the rest of the squad behaviour.
+// Health-weighted power is the half the surviving callers use.
+float ISquadTask::GetHealthScale() const
+{
+	float total = .0f;
+	float alive = .0f;
+	for (CCircuitUnit* unit : units) {
+		const float power = unit->GetCircuitDef()->GetPower();
+		total += power;
+		float hp = unit->GetHealthPercent();
+		hp = std::max(.0f, std::min(1.f, hp));  // capture progress drives it negative
+		alive += power * hp;
+	}
+	return (total > .0f) ? (alive / total) : 1.f;
+}
+
+// Kept across the fight revert: SupportAction reads it to decide how far an
+// escort trails its squad, and escorts are staying (apexearth kept the 2 radar
+// / 2 jammer cap as a build rule).
+float ISquadTask::GetSpreadRadius() const
+{
+	if (units.empty()) {
+		return .0f;
+	}
+	const float count = float(units.size());
+	AIFloat3 centroid = ZeroVector;
+	for (CCircuitUnit* unit : units) {
+		centroid += unit->GetLastPos();
+	}
+	centroid /= count;
+
+	float sum = .0f;
+	for (CCircuitUnit* unit : units) {
+		sum += centroid.distance2D(unit->GetLastPos());
+	}
+	return sum / count;
+}
 
 } // namespace circuit

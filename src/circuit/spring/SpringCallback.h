@@ -42,10 +42,17 @@ public:
 	const std::vector<springai::Unit*>& GetFriendlyUnitsIn(const springai::AIFloat3& pos, float radius, bool spherical = true);
 	bool IsFriendlyUnitsIn(const springai::AIFloat3& pos, float radius, bool spherical = true) const;
 	const std::vector<int>& GetFriendlyUnitIdsIn(const springai::AIFloat3& pos, float radius, bool spherical = true);
+	// apex: ids only -- GetFriendlyUnits() news a WrappUnit per unit, and the
+	// ally-list diff only needs a wrapper for a unit it has never seen.
+	// Leaf use only -- shared buffer, a nested query overwrites it.
+	const std::vector<int>& GetFriendlyUnitIds();
+	springai::Unit* WrapUnit(int unitId) const;
 
 	const std::vector<springai::Unit*>& GetEnemyUnits();
 	const std::vector<springai::Unit*>& GetEnemyUnitsIn(const springai::AIFloat3& pos, float radius, bool spherical = true);
 	bool IsEnemyUnitsIn(const springai::AIFloat3& pos, float radius, bool spherical = true) const;
+	// apex: the count alone, with no WrappUnit allocated per enemy.
+	int CountEnemyUnitsIn(const springai::AIFloat3& pos, float radius, bool spherical = true) const;
 	const std::vector<int>& GetEnemyUnitIdsIn(const springai::AIFloat3& pos, float radius, bool spherical = true);
 
 	const std::vector<springai::Unit*>& GetNeutralUnits();
@@ -70,6 +77,22 @@ public:
 
 	bool Feature_IsResurrectable(int featureId) const;
 
+	// apex: id-only feature access. GetFeaturesIn() news a WrappFeature per
+	// feature and every getter on it news another wrapper, so a sweep of a
+	// wreck field is a few thousand heap round trips on top of the engine
+	// calls -- and wrecks are what grows in a long game. These take ids.
+	// Fills the shared buffer and returns how many; read it with GetFeatureIdBuf().
+	// Leaf use only -- one buffer, so a nested query overwrites the outer one.
+	int GetFeatureIdsIn(const springai::AIFloat3& pos, float radius, bool spherical = false);
+	int GetFeatureIds();   // every feature the team can see, same buffer
+	const int* GetFeatureIdBuf() const { return featureIds.data(); }
+	int Feature_GetDefId(int featureId) const;
+	int Feature_GetResurrectDefId(int featureId) const;
+	float Feature_GetReclaimLeft(int featureId) const;
+	springai::AIFloat3 Feature_GetPosition(int featureId) const;
+	float FeatureDef_GetContainedResource(int featureDefId, int resourceId) const;
+	const char* FeatureDef_GetName(int featureDefId) const;
+
 	bool UnitDef_HasYardMap(int unitDefId) const;
 
 private:
@@ -79,6 +102,7 @@ private:
 
 	std::vector<int> unitIds;
 	std::vector<springai::Unit*> units;
+	std::vector<int> featureIds;
 };
 
 } // namespace circuit

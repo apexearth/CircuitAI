@@ -32,6 +32,89 @@ namespace circuit {
 using namespace springai;
 using namespace terrain;
 
+void CEnemyManager::FillAggregates() const
+{
+	const int frame = circuit->GetLastFrame();
+	if (aggFrame == frame) {
+		return;
+	}
+	aggFrame = frame;
+	AIFloat3 sum(0.f, 0.f, 0.f);
+	float posCost = 0.f;
+	float cost = 0.f;
+	for (const auto& kv : circuit->GetEnemyInfos()) {
+		const CEnemyInfo* e = kv.second;
+		const CCircuitDef* cdef = e->GetCircuitDef();
+		if ((cdef == nullptr) || cdef->IsMobile()) {
+			continue;
+		}
+		cost += e->GetCost();
+		if (e->GetCost() > 0.f) {
+			sum += e->GetPos() * e->GetCost();
+			posCost += e->GetCost();
+		}
+	}
+	aggStructCost = cost;
+	aggStructPos = (posCost <= 0.f) ? AIFloat3(-1.f, -1.f, -1.f) : (sum / posCost);
+	float best = 0.f;
+	for (CEnemyUnit* e : enemyUpdates) {
+		if ((e == nullptr) || e->IsDying()) {
+			continue;
+		}
+		CCircuitDef* cdef = e->GetCircuitDef();
+		if ((cdef == nullptr) || !cdef->IsMobile() || cdef->IsBuilder()) {
+			continue;
+		}
+		const float c = cdef->GetCostM();
+		if (c > best) {
+			best = c;
+		}
+	}
+	aggMaxMobileCostM = best;
+}
+
+AIFloat3 CEnemyManager::GetEnemyStructPos() const
+{
+	FillAggregates();
+	return aggStructPos;
+}
+
+// REMEMBERED ENEMY STRUCTURE METAL NEAR A POSITION. The raid director wanted
+// this and had no way to ask: it scored spots with CCircuitAI::GetEnemyCostAt,
+// whose script-side comment says "enemy metal standing on it" but which returns
+// a COUNT OF CURRENTLY-VISIBLE UNITS. We ran zero scout tasks in the measured
+// game, so that count was zero everywhere and all 58 raid asks refused with
+// "no enemy ground seen" -- while this very registry held 57,777 metal of their
+// buildings the whole time. Same sweep and same filter as the two aggregates
+// above; only the radius test is new. GetEnemyCostAt is left alone -- ten other
+// callers use it as "how many enemies are on top of me", which is what it is.
+float CEnemyManager::GetEnemyStructCostAt(const springai::AIFloat3& pos, float radius) const
+{
+	if (radius <= 0.f) {
+		return 0.f;
+	}
+	const float sqRadius = radius * radius;
+	float cost = 0.f;
+	for (const auto& kv : circuit->GetEnemyInfos()) {
+		const CEnemyInfo* e = kv.second;
+		const CCircuitDef* cdef = e->GetCircuitDef();
+		if ((cdef == nullptr) || cdef->IsMobile()) {
+			continue;
+		}
+		if (e->GetPos().SqDistance2D(pos) > sqRadius) {
+			continue;
+		}
+		cost += e->GetCost();
+	}
+	return cost;
+}
+
+float CEnemyManager::GetEnemyStructCost() const
+{
+	FillAggregates();
+	return aggStructCost;
+}
+
 CEnemyManager::CEnemyManager(CCircuitAI* circuit)
 		: circuit(circuit)
 		, enemyIterator(0)
@@ -253,7 +336,7 @@ void CEnemyManager::EnqueueUpdate()
 //	}
 	isUpdating = true;
 
-	circuit->GetScheduler()->RunPriorityJob(CScheduler::WorkJob(&CEnemyManager::Update, this));
+	circuit->GetScheduler()->RunPriorityJob(CScheduler::WorkJob(&CEnemyManager::Update, this), "enemyMgr");
 }
 
 bool CEnemyManager::UnitInLOS(CEnemyUnit* data)
@@ -414,29 +497,14 @@ void CEnemyManager::DyingEnemy(CEnemyUnit* enemy, int frame)
 // Same guarded walk the air survey uses: the circuit-level map holds wrappers
 // whose data dies before the deferred erase, and iterating it from script
 // crashed at every commander blast.
+// BUILDERS EXCLUDED, COMMANDER ABOVE ALL. It is mobile and costs 2700, so it
+// outranks every T1 combat unit and made this read 2700 from frame one -- a
+// permanent 'they are ahead' that says nothing about tier. The caller's own
+// side excludes builders too. The walk is in FillAggregates.
 float CEnemyManager::GetEnemyMaxMobileCostM() const
 {
-	float best = 0.f;
-	for (CEnemyUnit* e : enemyUpdates) {
-		if ((e == nullptr) || e->IsDying()) {
-			continue;
-		}
-		CCircuitDef* cdef = e->GetCircuitDef();
-		// BUILDERS EXCLUDED, COMMANDER ABOVE ALL. It is mobile and costs 2700,
-		// so it outranks every T1 combat unit and made this read 2700 from
-		// frame one -- a permanent 'they are ahead' that says nothing about
-		// tier. The caller's own side excludes builders too; comparing the
-		// two on different bases is the mismatch this whole reading exists
-		// to avoid.
-		if ((cdef == nullptr) || !cdef->IsMobile() || cdef->IsBuilder()) {
-			continue;
-		}
-		const float c = cdef->GetCostM();
-		if (c > best) {
-			best = c;
-		}
-	}
-	return best;
+	FillAggregates();
+	return aggMaxMobileCostM;
 }
 
 float CEnemyManager::GetEnemyAirCostNear(const springai::AIFloat3& pos, float radius) const
@@ -462,6 +530,24 @@ float CEnemyManager::GetEnemyAirCostNear(const springai::AIFloat3& pos, float ra
 // apex: the longest weapon range among a group's known members. The danger a
 // standing group poses depends on what it can SHELL, not where it walks --
 // artillery reaches ~1500 and must read dangerous from that far out.
+int CEnemyManager::GetEnemyGroupUnitCount(int i) const
+{
+	return ((i >= 0) && (i < (int)enemyGroups.size())) ? (int)enemyGroups[i].units.size() : 0;
+}
+
+CCircuitDef::Id CEnemyManager::GetEnemyGroupUnitDef(int i, int k) const
+{
+	if ((i < 0) || (i >= (int)enemyGroups.size())) {
+		return 0;
+	}
+	const std::vector<ICoreUnit::Id>& us = enemyGroups[i].units;
+	if ((k < 0) || (k >= (int)us.size())) {
+		return 0;
+	}
+	CEnemyInfo* e = circuit->GetEnemyInfo(us[k]);
+	return ((e != nullptr) && (e->GetCircuitDef() != nullptr)) ? e->GetCircuitDef()->GetId() : 0;
+}
+
 float CEnemyManager::GetEnemyGroupRange(int idx) const
 {
 	if ((idx < 0) || (idx >= (int)enemyGroups.size())) {
@@ -682,6 +768,10 @@ void CEnemyManager::KMeansIteration()
 	const auto enemySize = hostileDatas.size() + peaceDatas.size();
 	int newK = std::min(KMEANS_BASE_MAX_K, 1 + (int)sqrtf(enemySize));
 
+	perfKmeansOps.fetch_add(uint64_t(enemySize) * newK, std::memory_order_relaxed);
+	perfKmeansEnemies.fetch_add(enemySize, std::memory_order_relaxed);
+	perfKmeansK.store(newK, std::memory_order_relaxed);
+
 	// change the number of means according to newK
 	assert(newK > 0/* && enemyGoups.size() > 0*/);
 	// add a new means, just use one of the positions
@@ -697,7 +787,11 @@ void CEnemyManager::KMeansIteration()
 
 	{
 		int i = 0;
-		for (const std::vector<SEnemyData>& datas : {hostileDatas, peaceDatas}) {
+		// apex: {a, b} builds an initializer_list<vector>, i.e. a full COPY of
+		// both enemy vectors. Pointers are the same iteration, no copy.
+		const std::vector<SEnemyData>* datasets[2] = {&hostileDatas, &peaceDatas};
+		for (const std::vector<SEnemyData>* datasPtr : datasets) {
+			const std::vector<SEnemyData>& datas = *datasPtr;
 			for (const SEnemyData& enemy : datas) {
 				float closestDistance = std::numeric_limits<float>::max();
 				int closestIndex = -1;
@@ -732,11 +826,17 @@ void CEnemyManager::KMeansIteration()
 		std::fill(eg.roleCosts.begin(), eg.roleCosts.end(), 0.f);
 		eg.cost = 0.f;
 		eg.influence = 0.f;
+		eg.vel = 0.f;  // was never reset: a group kept its fastest-ever member
+		eg.velVec = springai::AIFloat3(0.f, 0.f, 0.f);
 	}
 
 	{
 		int i = 0;
-		for (const std::vector<SEnemyData>& datas : {hostileDatas, peaceDatas}) {
+		// apex: {a, b} builds an initializer_list<vector>, i.e. a full COPY of
+		// both enemy vectors. Pointers are the same iteration, no copy.
+		const std::vector<SEnemyData>* datasets[2] = {&hostileDatas, &peaceDatas};
+		for (const std::vector<SEnemyData>* datasPtr : datasets) {
+			const std::vector<SEnemyData>& datas = *datasPtr;
 			for (const SEnemyData& enemy : datas) {
 				int meanIndex = unitsClosestMeanID[i++];
 				SEnemyGroup& eg = newMeans[meanIndex];
@@ -747,6 +847,11 @@ void CEnemyManager::KMeansIteration()
 
 				if (!enemy.IsFake()) {
 					eg.units.push_back(enemy.id);
+				}
+				const float v = sqrtf(enemy.vel.SqLength2D()) * FRAMES_PER_SEC;
+				if (v > eg.vel) {
+					eg.vel = v;
+					eg.velVec = enemy.vel * FRAMES_PER_SEC;
 				}
 
 				if (enemy.cdef != nullptr) {

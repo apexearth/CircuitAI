@@ -185,44 +185,7 @@ void CFactoryManager::InitHandlers()
 			// FIXME: BA
 		)
 
-		// check factory nano belongs to
-		const float radius = unit->GetCircuitDef()->GetBuildDistance() * 0.9f;
-		const float sqRadius = SQUARE(radius);
-		SAssistToFactory& af = assists[unit];
-		for (SFactory& fac : factories) {
-			if (assPos.SqDistance2D(fac.unit->GetPos(frame)) >= sqRadius) {
-				continue;
-			}
-			auto it = fac.nanos.find(unit->GetCircuitDef());
-			if (it == fac.nanos.end()) {
-				fac.nanos[unit->GetCircuitDef()].incomeMod = unit->GetCircuitDef()->GetWorkerTime() / fac.unit->GetCircuitDef()->GetWorkerTime();
-			}
-			SAssistant& assist = fac.nanos[unit->GetCircuitDef()];
-			const float metalUse = fac.miRequire * assist.incomeMod;
-			const float energyUse = fac.eiRequire * assist.incomeMod + unit->GetCircuitDef()->GetUpkeepE();
-			af.metalRequire = std::max(af.metalRequire, metalUse);
-			af.energyRequire = std::max(af.energyRequire, energyUse);
-			fac.miRequireTotal += metalUse;
-			fac.eiRequireTotal += energyUse;
-			assist.units.insert(unit);
-			++fac.nanoSize;
-			af.factories.insert(fac.unit);
-		}
-		if (!af.factories.empty()) {
-			metalRequire += af.metalRequire;
-			energyRequire += af.energyRequire;
-
-			bool isInHaven = false;
-			for (const AIFloat3& hav : havens) {
-				if (assPos.SqDistance2D(hav) < sqRadius) {
-					isInHaven = true;
-					break;
-				}
-			}
-			if (!isInHaven) {
-				havens.push_back(assPos);
-			}
-		}
+		AttachAssist(unit, assPos, frame);
 
 		UnitAdded(unit, UseAs::ASSIST);
 	};
@@ -237,41 +200,7 @@ void CFactoryManager::InitHandlers()
 		if (task->GetType() == IUnitTask::Type::NIL) {
 			return;
 		}
-		const AIFloat3& assPos = unit->GetPos(this->circuit->GetLastFrame());
-		const float radius = unit->GetCircuitDef()->GetBuildDistance();
-		const float sqRadius = SQUARE(radius);
-		for (SFactory& fac : factories) {
-			auto fit = fac.nanos.find(unit->GetCircuitDef());
-			if (fit == fac.nanos.end()) {
-				continue;
-			}
-			SAssistant& assist = fit->second;
-			if (assist.units.erase(unit) == 0) {
-				continue;
-			}
-			const float metalUse = fac.miRequire * assist.incomeMod;
-			const float energyUse = fac.eiRequire * assist.incomeMod + unit->GetCircuitDef()->GetUpkeepE();
-			fac.miRequireTotal -= metalUse;
-			fac.eiRequireTotal -= energyUse;
-			if (--fac.nanoSize > 0) {
-				continue;
-			}
-			auto it = havens.begin();
-			while (it != havens.end()) {
-				if (it->SqDistance2D(assPos) < sqRadius) {
-					*it = havens.back();
-					havens.pop_back();
-				} else {
-					++it;
-				}
-			}
-		}
-		SAssistToFactory& af = assists[unit];
-		if (!af.factories.empty()) {
-			metalRequire -= af.metalRequire;
-			energyRequire -= af.energyRequire;
-		}
-		assists.erase(unit);
+		DetachAssist(unit, unit->GetPos(this->circuit->GetLastFrame()));
 
 		UnitRemoved(unit, UseAs::ASSIST);
 	};
@@ -713,12 +642,15 @@ void CFactoryManager::Init()
 		CScheduler* scheduler = circuit->GetScheduler().get();
 		const int interval = 4;
 		const int offset = circuit->GetSkirmishAIId() % interval;
-		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::UpdateIdle, this), interval, offset + 0);
-		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::Update, this), interval, offset + 2);
+		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::UpdateIdle, this), 1, offset + 0, "facIdle");  // apex: per frame; CIdleTask slices for it
+		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::Update, this), interval, offset + 2, "facUpd");
+
+		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::PullNanoOffBuilding, this),
+								FRAMES_PER_SEC, offset + 3, "nanoPull");
 
 		scheduler->RunJobEvery(CScheduler::GameJob(&CFactoryManager::Watchdog, this),
 								FRAMES_PER_SEC * 60,
-								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 11);
+								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 11, "wdog");
 	};
 
 	circuit->GetSetupManager()->ExecOnFindStart(subinit);
@@ -1180,11 +1112,6 @@ CCircuitDef* CFactoryManager::DefaultGetFactoryToBuild(const AIFloat3& position,
 {
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	return nullptr;
-	CCircuitDef* facDef = factoryData->GetFactoryToBuild(circuit, position, isStart, isReset);
-	if ((facDef == nullptr) && utils::is_valid(position)) {
-		facDef = factoryData->GetFactoryToBuild(circuit, -RgtVector, isStart, isReset);
-	}
-	return facDef;
 }
 
 void CFactoryManager::EnableFactory(CCircuitUnit* unit)
@@ -1461,6 +1388,7 @@ IUnitTask* CFactoryManager::CreateAssistTask(CCircuitUnit* unit)
 	bool isMetalEmpty = economyMgr->IsMetalEmpty();
 	CAllyUnit* repairTarget = nullptr;
 	CAllyUnit* buildTarget = nullptr;
+	bool haveMobile = false;   // a factory's own output has claimed this turret
 	const AIFloat3& pos = unit->GetPos(circuit->GetLastFrame());
 	float radius = unit->GetCircuitDef()->GetBuildDistance();
 
@@ -1483,16 +1411,36 @@ IUnitTask* CFactoryManager::CreateAssistTask(CCircuitUnit* unit)
 			CCircuitDef* cdef = cand->GetCircuitDef();
 			const float maxHealth = u->GetMaxHealth();
 			const float buildTime = cdef->GetBuildTime() * (maxHealth - u->GetHealth()) / maxHealth;
-			if (buildTime >= curCost) {
+			// FACTORY OUTPUT OUTRANKS A BUILDING OUTRIGHT (apexearth: "Buildings
+			// which take a long time to create often capture nanoattention for a
+			// lot longer and can make it so a factory loses a lot of its output
+			// for a significant amount of time. Therefore, I do not feel bad
+			// about pulling nanos off of buildings"). Selection was purely
+			// least-remaining-buildTime and only the PRIORITY below told mobile
+			// from static apart -- so a half-done building won on being nearer
+			// to finished, and the Repair task then held the turret for the rest
+			// of that build. Among mobiles the least-remaining race is unchanged.
+			const bool candMobile = cdef->IsMobile();
+			if (haveMobile && !candMobile) {
 				continue;
 			}
-			if (IsHighPriority(cand) ||
+			const bool firstMobile = candMobile && !haveMobile;
+			if (!firstMobile && (buildTime >= curCost)) {
+				continue;
+			}
+			// ...whatever the metal bank reads: with the bank empty a T3
+			// hull failed the cost bar, the turret took the building beside
+			// it, PullNanoOffBuilding freed it a second later and the pair
+			// thrashed (1,650 pulls in one game of his).
+			if (candMobile ||
+				IsHighPriority(cand) ||
 				(!isMetalEmpty && cdef->IsAssistable()) ||
 				(*cdef == *terraDef) ||
 				(buildTime < maxCost))
 			{
 				curCost = buildTime;
 				buildTarget = cand;
+				haveMobile = candMobile;
 			}
 		} else if ((repairTarget == nullptr) && (u->GetHealth() < u->GetMaxHealth())) {
 			repairTarget = cand;
@@ -1546,6 +1494,102 @@ void CFactoryManager::Watchdog()
 	for (auto& kv : assists) {
 		checkIdler(kv.first);
 	}
+}
+
+// A NANO ALREADY LOCKED TO A BUILDING NEVER RECONSIDERS. CreateAssistTask now
+// prefers factory output when it CHOOSES, but a Repair task on a half-built
+// structure runs to completion -- and apexearth's whole point is that the slow
+// ones are the expensive ones: "Buildings which take a long time to create often
+// capture nanoattention for a lot longer and can make it so a factory loses a
+// lot of its output for a significant amount of time."
+//
+// ONE TURRET PER TICK, round-robin. The range scan is a GetFriendlyUnitsIn per
+// nano; doing the whole fleet on one frame is the batching this AI keeps being
+// bitten by, and a nano freed a few seconds later is no worse off.
+void CFactoryManager::PullNanoOffBuilding()
+{
+	// THE FUNNEL IS LOGGED, NOT JUST THE OUTCOME. The first two versions of
+	// this pass were silently dead (wrong task Type), and a zero pull count
+	// alone cannot say WHICH precondition refused. Every stage counts.
+	if (assists.empty()) {
+		return;
+	}
+	const int frame = circuit->GetLastFrame();
+	if (frame >= nanoPullLogAt) {
+		nanoPullLogAt = frame + FRAMES_PER_SEC * 30;
+		circuit->LOG("apex: nanopull turrets=%d seen=%d repair=%d static=%d"
+				" hasOutput=%d pulled=%d",
+				(int)assists.size(), nanoSeen, nanoOnRepair, nanoOnStatic,
+				nanoHasOut, nanoPulled);
+	}
+
+	// EVERY REGISTERED TURRET, EVERY SECOND. The first cut walked one nano per
+	// call and hung off the 60-SECOND watchdog, so it examined one turret a
+	// minute -- it fired, and it was throttled to irrelevance. `assists` holds a
+	// handful (measured: 1-3), so the whole sweep is cheaper than the round-robin
+	// bookkeeping was.
+	for (auto& kv : assists) {
+		CCircuitUnit* nano = kv.first;
+	if ((nano == nullptr) || nano->IsDead() || (nano->GetCircuitDef() == nullptr)) {
+		continue;
+	}
+	++nanoSeen;
+	IUnitTask* held = nano->GetTask();
+	// A NANO'S REPAIR TASK IS Type::FACTORY, NOT Type::BUILDER (CSRepairTask
+	// passes Type::FACTORY to IRepairTask). Testing for BUILDER here returned
+	// early every time and the whole pass was dead. Type::FACTORY also covers
+	// CRecruitTask, so the BuildType below discriminates.
+	if ((held == nullptr) || (held->GetType() != IUnitTask::Type::FACTORY)) {
+		continue;
+	}
+	IBuilderTask* bt = static_cast<IBuilderTask*>(held);
+	if (bt->GetBuildType() != IBuilderTask::BuildType::REPAIR) {
+		continue;
+	}
+	++nanoOnRepair;
+	// Only a task serving a STATIC target is worth interrupting: it is already
+	// on factory output otherwise.
+	CCircuitUnit* tgt = bt->GetTarget();
+	if ((tgt == nullptr) || (tgt->GetCircuitDef() == nullptr)
+		|| tgt->GetCircuitDef()->IsMobile())
+	{
+		continue;
+	}
+	++nanoOnStatic;
+	// ...and only when there is somewhere better to go, or the re-election
+	// hands it straight back and the pair of us thrash.
+	if (!HasFactoryOutputInRange(nano)) {
+		continue;
+	}
+	++nanoHasOut;
+	++nanoPulled;
+	held->RemoveAssignee(nano);   // to IdleTask; CreateAssistTask re-runs next frame
+	break;   // one task mutated per pass; the rest are re-read next second
+	}
+}
+
+// Is a factory's own output -- a MOBILE unit under construction -- inside this
+// turret's build reach? Exactly apexearth's definition of near: "however many
+// nanos can actually reach the unit that is trying to be built."
+bool CFactoryManager::HasFactoryOutputInRange(CCircuitUnit* nano)
+{
+	const AIFloat3& pos = nano->GetPos(circuit->GetLastFrame());
+	const float radius = nano->GetCircuitDef()->GetBuildDistance();
+	circuit->UpdateFriendlyUnits();
+	auto& units = circuit->GetCallback()->GetFriendlyUnitsIn(pos, radius * 0.9f);
+	bool found = false;
+	for (Unit* u : units) {
+		auto [cand, isTeam] = circuit->GetTeamOrAllyUnit(u);
+		if ((cand == nullptr) || (cand == nano) || (cand->GetCircuitDef() == nullptr)) {
+			continue;
+		}
+		if (u->IsBeingBuilt() && cand->GetCircuitDef()->IsMobile()) {
+			found = true;
+			break;
+		}
+	}
+	utils::free(units);
+	return found;
 }
 
 void CFactoryManager::SetLastRequiredDef(CCircuitDef::Id facId, CCircuitDef* cdef,
@@ -1810,6 +1854,112 @@ CCircuitDef* CFactoryManager::GetFacRoleDef(CCircuitDef::RoleT role, const SFact
 	candidates.clear();
 
 	return buildDef;
+}
+
+void CFactoryManager::AttachAssist(CCircuitUnit* unit, const AIFloat3& assPos, int frame)
+{
+	const float radius = unit->GetCircuitDef()->GetBuildDistance() * 0.9f;
+	const float sqRadius = SQUARE(radius);
+	SAssistToFactory& af = assists[unit];
+	for (SFactory& fac : factories) {
+		if (assPos.SqDistance2D(fac.unit->GetPos(frame)) >= sqRadius) {
+			continue;
+		}
+		auto it = fac.nanos.find(unit->GetCircuitDef());
+		if (it == fac.nanos.end()) {
+			fac.nanos[unit->GetCircuitDef()].incomeMod = unit->GetCircuitDef()->GetWorkerTime() / fac.unit->GetCircuitDef()->GetWorkerTime();
+		}
+		SAssistant& assist = fac.nanos[unit->GetCircuitDef()];
+		const float metalUse = fac.miRequire * assist.incomeMod;
+		const float energyUse = fac.eiRequire * assist.incomeMod + unit->GetCircuitDef()->GetUpkeepE();
+		af.metalRequire = std::max(af.metalRequire, metalUse);
+		af.energyRequire = std::max(af.energyRequire, energyUse);
+		fac.miRequireTotal += metalUse;
+		fac.eiRequireTotal += energyUse;
+		assist.units.insert(unit);
+		++fac.nanoSize;
+		af.factories.insert(fac.unit);
+	}
+	if (!af.factories.empty()) {
+		metalRequire += af.metalRequire;
+		energyRequire += af.energyRequire;
+
+		bool isInHaven = false;
+		for (const AIFloat3& hav : havens) {
+			if (assPos.SqDistance2D(hav) < sqRadius) {
+				isInHaven = true;
+				break;
+			}
+		}
+		if (!isInHaven) {
+			havens.push_back(assPos);
+		}
+	}
+}
+
+void CFactoryManager::DetachAssist(CCircuitUnit* unit, const AIFloat3& assPos)
+{
+	const float radius = unit->GetCircuitDef()->GetBuildDistance();
+	const float sqRadius = SQUARE(radius);
+	for (SFactory& fac : factories) {
+		auto fit = fac.nanos.find(unit->GetCircuitDef());
+		if (fit == fac.nanos.end()) {
+			continue;
+		}
+		SAssistant& assist = fit->second;
+		if (assist.units.erase(unit) == 0) {
+			continue;
+		}
+		const float metalUse = fac.miRequire * assist.incomeMod;
+		const float energyUse = fac.eiRequire * assist.incomeMod + unit->GetCircuitDef()->GetUpkeepE();
+		fac.miRequireTotal -= metalUse;
+		fac.eiRequireTotal -= energyUse;
+		if (--fac.nanoSize > 0) {
+			continue;
+		}
+		auto it = havens.begin();
+		while (it != havens.end()) {
+			if (it->SqDistance2D(assPos) < sqRadius) {
+				*it = havens.back();
+				havens.pop_back();
+			} else {
+				++it;
+			}
+		}
+	}
+	SAssistToFactory& af = assists[unit];
+	if (!af.factories.empty()) {
+		metalRequire -= af.metalRequire;
+		energyRequire -= af.energyRequire;
+	}
+	assists.erase(unit);
+}
+
+// apex: a structure an air transport set down somewhere else. The engine sends
+// an AI no load/unload event, so the script that flew it reports the landing.
+void CFactoryManager::UnitRelocated(CCircuitUnit* unit, const AIFloat3& from)
+{
+	if ((unit == nullptr) || unit->IsDead() || unit->GetCircuitDef()->IsMobile()) {
+		return;
+	}
+	const int frame = circuit->GetLastFrame();
+	const AIFloat3& to = unit->GetPos(frame);
+	int facing = UNIT_FACING_SOUTH;
+	TRY_UNIT(circuit, unit,
+		facing = unit->GetUnit()->GetBuildingFacing();
+	)
+	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
+	terrainMgr->DelBlocker(unit->GetCircuitDef(), from, facing, true);
+	terrainMgr->AddBlocker(unit->GetCircuitDef(), to, facing, true);
+	int before = -1, after = -1;
+	if (assists.find(unit) != assists.end()) {
+		before = assists[unit].factories.size();
+		DetachAssist(unit, from);
+		AttachAssist(unit, to, frame);
+		after = assists[unit].factories.size();
+	}
+	circuit->LOG("apex: relocated %s #%d %.0f,%.0f -> %.0f,%.0f factories %d -> %d",
+		unit->GetCircuitDef()->GetDef()->GetName(), unit->GetId(), from.x, from.z, to.x, to.z, before, after);
 }
 
 } // namespace circuit

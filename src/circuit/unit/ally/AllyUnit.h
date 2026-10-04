@@ -23,6 +23,9 @@ public:
 	virtual ~CAllyUnit();
 
 	CCircuitDef* GetCircuitDef() const { return circuitDef; }
+	// apex: the ally list is diffed in place now, so a morph has to be able to
+	// re-point the def on a unit that already exists.
+	void SetAllyCircuitDef(CCircuitDef* cdef) { circuitDef = cdef; }
 	IUnitTask* GetTask() const { return task; }
 	const springai::AIFloat3& GetPos(int frame);
 	const springai::AIFloat3& GetLastPos() const { return position; }

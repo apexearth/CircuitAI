@@ -33,10 +33,226 @@
 
 #include "AISCommands.h"
 #include "Log.h"
+#include <cstdlib>
+#include <limits>
 
 namespace circuit {
 
+// Lattice rings walked before a taken slot falls to the wide site search.
+// The lattice walk's reach and its work slice: rings 0..7 are 225 cells, and
+// a probe is one build-square mask test plus the site predicate.
+static constexpr int LATTICE_RINGS = 8;
+static constexpr int LATTICE_PROBES = 200;
+
+
 using namespace springai;
+
+// A site the script chose and the lattice must not move: an extractor sits on
+// its spot or not at all, and a turret, a factory or a pylon was placed for
+// where it is. Everything else is farm and belongs on the grid.
+static inline bool IsFixedSite(IBuilderTask::BuildType buildType)
+{
+	return (buildType == IBuilderTask::BuildType::MEX)
+		|| (buildType == IBuilderTask::BuildType::MEXUP)
+		|| (buildType == IBuilderTask::BuildType::GEO)
+		|| (buildType == IBuilderTask::BuildType::GEOUP)
+		|| (buildType == IBuilderTask::BuildType::DEFENCE)
+		|| (buildType == IBuilderTask::BuildType::BUNKER)
+		|| (buildType == IBuilderTask::BuildType::BIG_GUN)
+		|| (buildType == IBuilderTask::BuildType::PYLON)
+		|| (buildType == IBuilderTask::BuildType::FACTORY)
+		|| (buildType == IBuilderTask::BuildType::TERRAFORM);
+}
+
+// A spot names its own ground: an extractor or a geo plant is built on the
+// vent or not at all, so it is never moved off it to keep a builder standing.
+static inline bool IsSpotSite(IBuilderTask::BuildType buildType)
+{
+	return (buildType == IBuilderTask::BuildType::MEX)
+		|| (buildType == IBuilderTask::BuildType::MEXUP)
+		|| (buildType == IBuilderTask::BuildType::GEO)
+		|| (buildType == IBuilderTask::BuildType::GEOUP);
+}
+
+// A BUILDING IS NOT SITED ON THE SQUARE ITS OWN BUILDER IS STANDING ON. The
+// site search reads a mobile unit as empty ground, so the nearest legal square
+// to a constructor inside its own base is the one under its feet, and the order
+// cannot start until the builder has been shoved off the footprint it just
+// claimed (apexearth, on the commander: "it is inefficient to have to step out
+// of the way for every building that you want to make"). A static builder is
+// already in the blocker map, so only mobile ones are asked.
+// The bar is the two half-footprints summed -- a def of N cells reaches
+// N * SQUARE_SIZE from its centre -- and 0 means "keep no clearance".
+float SelfClearance(CCircuitUnit* builder, CCircuitDef* buildDef)
+{
+	if ((builder == nullptr) || (buildDef == nullptr)
+		|| !builder->GetCircuitDef()->IsMobile())
+	{
+		return 0.f;
+	}
+	CCircuitDef* bdef = builder->GetCircuitDef();
+	return float(std::max(buildDef->GetFootX(), buildDef->GetFootZ())
+			+ std::max(bdef->GetFootX(), bdef->GetFootZ())) * SQUARE_SIZE;
+}
+
+// DOES THE BUILDER KEEP A WAY OUT if this cell is built? A mobile builder
+// standing inside the lattice it fills can wall itself in: its build range
+// covers the cells around it, so it never has to move, and the last free cell
+// beside it is a legal site (the commander he watched sat inside its own
+// wind cluster for 37 minutes). Flood the free cells of the def's lattice
+// out from the builder's cell with the candidate counted as taken. Only asked
+// when the candidate lands within two cells of the builder -- further away it
+// closes nothing.
+// Flood the free cells of the def's lattice out from (si, sj) with the
+// candidate (0,0) taken; true when some cell R rings out or off the grid is
+// reached. Free = FindBuildSite returns the cell itself.
+// R is eight rings: at four, a corridor five cells long between the lab and
+// the farm read as an exit, and the commander stood in it two minutes (gate,
+// Frozen Ford, 7 of 9 runs). The window is shared across one candidate's
+// neighbours: cells one flood proved open (3) or closed (4) answer the next
+// flood on arrival, so the whole window is probed at most once.
+struct ExitWindow {
+	static constexpr int R = 8;
+	static constexpr int W = 2 * R + 1;
+	std::vector<char> state;   // 0 unknown, 1 visiting, 2 taken, 3 open, 4 pocket
+	ExitWindow() : state(W * W, 0) { state[Idx(0, 0)] = 2; }
+	static int Idx(int i, int j) { return (j + R) * W + (i + R); }
+};
+
+static bool CellHasExit(CCircuitAI* circuit, CTerrainManager* terrainMgr, CCircuitDef* buildDef,
+		int facing, float slot, const AIFloat3& cand, int si, int sj, ExitWindow& win)
+{
+	constexpr int R = ExitWindow::R;
+	auto idx = [](int i, int j) { return ExitWindow::Idx(i, j); };
+	std::vector<char>& state = win.state;
+	const char s0 = state[idx(si, sj)];
+	if (s0 == 3) {
+		return true;
+	}
+	if ((s0 == 2) || (s0 == 4)) {
+		return false;
+	}
+	std::vector<std::pair<int, int>> queue;
+	std::vector<int> visited;
+	queue.emplace_back(si, sj);
+	state[idx(si, sj)] = 1;
+	visited.push_back(idx(si, sj));
+	bool open = false;
+	while (!queue.empty() && !open) {
+		const auto [ci, cj] = queue.back();
+		queue.pop_back();
+		if ((std::abs(ci) >= R) || (std::abs(cj) >= R)) {
+			open = true;
+			break;
+		}
+		for (int dj = -1; dj <= 1 && !open; ++dj) {
+			for (int di = -1; di <= 1; ++di) {
+				const int ni = ci + di, nj = cj + dj;
+				if (((di == 0) && (dj == 0)) || (std::abs(ni) > R) || (std::abs(nj) > R)) {
+					continue;
+				}
+				const char st = state[idx(ni, nj)];
+				if (st == 3) {
+					open = true;
+					break;
+				}
+				if (st != 0) {
+					continue;
+				}
+				AIFloat3 c;
+				if (!circuit->LatticeNeighbour(cand, buildDef, facing, ni, nj, c)) {
+					open = true;   // off the grid: open ground
+					break;
+				}
+				const AIFloat3 probe = terrainMgr->FindBuildSite(buildDef, c, SQUARE_SIZE * 2, facing);
+				const bool freeCell = utils::is_valid(probe)
+						&& (probe.SqDistance2D(c) <= SQUARE(SQUARE_SIZE));
+				state[idx(ni, nj)] = freeCell ? 1 : 2;
+				if (freeCell) {
+					queue.emplace_back(ni, nj);
+					visited.push_back(idx(ni, nj));
+				}
+			}
+		}
+	}
+	for (int k : visited) {
+		state[k] = open ? 3 : 4;
+	}
+	return open;
+}
+
+// DOES THE GROUND KEEP ITS EXITS if this cell is built? A mobile builder
+// standing inside the lattice it fills can wall itself in, and so can any
+// unit standing in a cell the next turbine closes: with no walkways in the
+// rear (his ruling) a flush block is solid, and the one cell a unit stands
+// in cannot be built over, so it becomes a pocket (the commander he watched
+// sat inside its own wind cluster for 37 minutes; a gate game had 46 of
+// ours in the ring around him). So: the builder's own cell, and every FREE
+// cell touching the candidate, must still reach open ground with the
+// candidate taken -- then no pocket can form, whoever stands where.
+static bool KeepsExit(CCircuitAI* circuit, CTerrainManager* terrainMgr, CCircuitUnit* builder,
+		CCircuitDef* buildDef, int facing, float slot, const AIFloat3& cand, ExitWindow& win)
+{
+	// Every free neighbour of the candidate keeps an exit.
+	for (int j = -1; j <= 1; ++j) {
+		for (int i = -1; i <= 1; ++i) {
+			if ((i == 0) && (j == 0)) {
+				continue;
+			}
+			AIFloat3 c;
+			if (!circuit->LatticeNeighbour(cand, buildDef, facing, i, j, c)) {
+				continue;
+			}
+			const AIFloat3 probe = terrainMgr->FindBuildSite(buildDef, c, SQUARE_SIZE * 2, facing);
+			const bool freeCell = utils::is_valid(probe)
+					&& (probe.SqDistance2D(c) <= SQUARE(SQUARE_SIZE));
+			if (freeCell && !CellHasExit(circuit, terrainMgr, buildDef, facing, slot, cand, i, j, win)) {
+				return false;
+			}
+		}
+	}
+	// ...and the builder's own cell, wherever it stands within two cells.
+	if ((builder == nullptr) || !builder->GetCircuitDef()->IsMobile()) {
+		return true;
+	}
+	const AIFloat3 self = builder->GetPos(circuit->GetLastFrame());
+	int bi = 0, bj = 0;
+	float bestSq = -1.f;
+	for (int j = -2; j <= 2; ++j) {
+		for (int i = -2; i <= 2; ++i) {
+			AIFloat3 c;
+			if (!circuit->LatticeNeighbour(cand, buildDef, facing, i, j, c)) {
+				continue;
+			}
+			const float sq = c.SqDistance2D(self);
+			if ((bestSq < .0f) || (sq < bestSq)) {
+				bestSq = sq;
+				bi = i;
+				bj = j;
+			}
+		}
+	}
+	if ((bestSq < .0f) || (bestSq > SQUARE(2.f * slot)) || ((bi == 0) && (bj == 0))) {
+		return true;
+	}
+	return CellHasExit(circuit, terrainMgr, buildDef, facing, slot, cand, bi, bj, win);
+}
+
+// The builder itself and the COMMANDER: another hand's turbine closes his
+// exit as surely as his own (the cure freed him twice in one gate game).
+static bool KeepsExits(CCircuitAI* circuit, CTerrainManager* terrainMgr, CCircuitUnit* builder,
+		CCircuitDef* buildDef, int facing, float slot, const AIFloat3& cand)
+{
+	ExitWindow win;
+	if (!KeepsExit(circuit, terrainMgr, builder, buildDef, facing, slot, cand, win)) {
+		return false;
+	}
+	CCircuitUnit* com = circuit->GetSetupManager()->GetCommander();
+	if ((com != nullptr) && (com != builder) && !com->IsDead()) {
+		return KeepsExit(circuit, terrainMgr, com, buildDef, facing, slot, cand, win);
+	}
+	return true;
+}
 
 IBuilderTask::BuildName IBuilderTask::buildNames = {
 	{"factory", IBuilderTask::BuildType::FACTORY},
@@ -76,6 +292,25 @@ IBuilderTask::IBuilderTask(ITaskModule* mgr, Priority priority,
 	CEconomyManager* economyMgr = manager->GetCircuit()->GetEconomyManager();
 	savedIncome.metal = economyMgr->GetAvgMetalIncome();
 	savedIncome.energy = economyMgr->GetAvgEnergyIncome();
+	// A BIG FRAME'S CELL IS RESERVED WHEN ASKED, not when the builder
+	// arrives: the commit came 20-100 s after the script proved the cell
+	// free, and in a busy turret blob other hands had filled it (measured:
+	// four to six of our own buildings on the asked cell, the reactor carried
+	// 480 elmo to bare ground). The blocking map is what every probe reads,
+	// so a reservation here is a cell nothing else takes; Execute drops and
+	// re-probes it, Cancel releases it.
+	if ((buildDef != nullptr) && utils::is_valid(position) && !IsFixedSite(buildType)) {
+		const float slot = std::max(buildDef->GetFootX(), buildDef->GetFootZ()) * SQUARE_SIZE * 2;
+		if (slot >= SQUARE_SIZE * 12) {
+			CCircuitAI* circuit = manager->GetCircuit();
+			AIFloat3 cell;
+			const int f = circuit->GetBaseGridFacing(position);
+			if (circuit->SnapToBaseGrid(position, cell, buildDef, f)) {
+				facing = f;
+				SetBuildPos(cell);
+			}
+		}
+	}
 }
 
 IBuilderTask::IBuilderTask(ITaskModule* mgr, Type type, BuildType buildType)
@@ -145,8 +380,11 @@ void IBuilderTask::AssignTo(CCircuitUnit* unit)
 		// apex: dgun range only, not LOS. At LOS radius the DGun order (queue-
 		// replacing, no SHIFT) walks a working commander after anything he can
 		// see -- the chase-and-forget apexearth watched. Close threats his
-		// regular gun already answers; the D-gun stays point-blank.
-		unit->PushDGunAct(new CDGunAction(unit, unit->GetDGunRange()));
+		// regular gun already answers; the D-gun stays point-blank -- EXCEPT
+		// for a target worth more than the owner itself (mayClose): a Titan
+		// at laser range one-shots for the price of a short walk, and trading
+		// lasers with it instead is how a commander dies with the dgun ready.
+		unit->PushDGunAct(new CDGunAction(unit, unit->GetDGunRange(), true));
 	}
 	if (unit->GetCircuitDef()->IsAbleToCapture()) {
 		unit->PushBack(new CCaptureAction(unit, 500.f));
@@ -166,10 +404,20 @@ void IBuilderTask::AssignTo(CCircuitUnit* unit)
 	unit->SetAllowedToJump(cdef->IsAbleToJump() && cdef->IsAttrJump());
 }
 
+bool IBuilderTask::sInReelect = false;
+
 void IBuilderTask::RemoveAssignee(CCircuitUnit* unit)
 {
 	if (initiator == unit) {
 		initiator = nullptr;
+	}
+	// apex: who strands a fresh frame -- the engine kills a nanoframe at
+	// zero progress the moment no one lathes it.
+	if ((target != nullptr) && (units.size() == 1) && (units.count(unit) > 0)
+		&& (buildDef != nullptr) && (target->GetUnit()->GetHealth() < target->GetUnit()->GetMaxHealth() * 0.02f))
+	{
+		manager->GetCircuit()->LOG("apex: strand %s at=%.0f,%.0f reelect=%d dead=%d", buildDef->GetDef()->GetName(),
+				buildPos.x, buildPos.z, sInReelect ? 1 : 0, IsDead() ? 1 : 0);
 	}
 
 	IUnitTask::RemoveAssignee(unit);
@@ -179,8 +427,28 @@ void IBuilderTask::RemoveAssignee(CCircuitUnit* unit)
 	HideAssignee(unit);
 }
 
+// apex: where a task's first order goes missing (apex_task_trace=1). A unit
+// held a build task 12 s with an empty command queue and no order sent.
+static bool TaskTraceOn(CCircuitAI* circuit)
+{
+	static int at = -1000;
+	static bool on = false;
+	const int frame = circuit->GetLastFrame();
+	if (frame - at >= 150) {
+		at = frame;
+		on = circuit->GetTunable("apex_task_trace", 0.f) > 0.f;
+	}
+	return on;
+}
+
 void IBuilderTask::Start(CCircuitUnit* unit)
 {
+	if (TaskTraceOn(manager->GetCircuit())) {
+		ITravelAction* tr = unit->GetTravelAct();
+		manager->GetCircuit()->LOG("apex: ttrace start #%d %s task=%p travel=%s", unit->GetId(),
+				(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "-", static_cast<void*>(this),
+				(tr == nullptr) ? "null" : (tr->IsFinished() ? "fin" : (tr->IsWait() ? "wait" : "act")));
+	}
 	Update(unit);
 }
 
@@ -254,6 +522,11 @@ void IBuilderTask::Cancel()
 bool IBuilderTask::Execute(CCircuitUnit* unit)
 {
 	executors.insert(unit);
+	if (TaskTraceOn(manager->GetCircuit())) {
+		manager->GetCircuit()->LOG("apex: ttrace execute #%d task=%p target=%d possible=%d", unit->GetId(), static_cast<void*>(this),
+				(target != nullptr) ? 1 : 0,
+				(utils::is_valid(buildPos) && (buildDef != nullptr) && manager->GetCircuit()->GetMap()->IsPossibleToBuildAt(buildDef->GetDef(), buildPos, facing)) ? 1 : 0);
+	}
 
 	CCircuitAI* circuit = manager->GetCircuit();
 	TRY_UNIT(circuit, unit,
@@ -302,11 +575,7 @@ bool IBuilderTask::Execute(CCircuitUnit* unit)
 	// opposite reason -- packing labs into the lattice is what leaves no room to
 	// tech up, and the point of the lattice is to keep that room free for them.
 	AIFloat3 pos;
-	const bool isFixed = (buildType == BuildType::MEX) || (buildType == BuildType::MEXUP)
-			|| (buildType == BuildType::GEO) || (buildType == BuildType::GEOUP)
-			|| (buildType == BuildType::DEFENCE) || (buildType == BuildType::BUNKER)
-			|| (buildType == BuildType::BIG_GUN) || (buildType == BuildType::PYLON)
-			|| (buildType == BuildType::FACTORY) || (buildType == BuildType::TERRAFORM);
+	const bool isFixed = IsFixedSite(buildType);
 	// Facing first (FindBuildSite recomputes it identically): the parity snap
 	// needs it because the engine swaps xsize/zsize for east/west.
 	FindFacing(position);
@@ -337,7 +606,17 @@ bool IBuilderTask::Execute(CCircuitUnit* unit)
 	}
 	const bool onGrid = !isFixed && circuit->SnapToBaseGrid(origin, pos, buildDef, facing);
 	if (!onGrid) {
-		pos = (shake > .0f) ? utils::get_near_pos(origin, shake) : origin;
+		// A LAB IS ASKED FOR ON ITS OWN LATTICE, though searched as the fixed
+		// site it is: a 6-cell lab on its 96 pitch shares every edge line
+		// with the 48-pitch turrets and converters that pack against it, so
+		// the block around it is flush. Off it, the first ring of turrets
+		// stood a part-cell short of the lab (the census's nano misses were
+		// all at labs). The move is at most half its footprint.
+		if ((buildType != BuildType::FACTORY)
+			|| !circuit->SnapToBaseGrid(origin, pos, buildDef, facing))
+		{
+			pos = (shake > .0f) ? utils::get_near_pos(origin, shake) : origin;
+		}
 	}
 	CTerrainManager::CorrectPosition(pos);
 
@@ -357,17 +636,171 @@ bool IBuilderTask::Execute(CCircuitUnit* unit)
 	// reservation.
 	float searchRadius = 200 * SQUARE_SIZE;
 	if (onGrid) {
+		CTerrainManager* terrainMgr = circuit->GetTerrainManager();
 		const float slot = std::max(buildDef->GetFootX(), buildDef->GetFootZ())
 				* SQUARE_SIZE * 2;
-		CTerrainManager* terrainMgr = manager->GetCircuit()->GetTerrainManager();
-		const AIFloat3 probe = terrainMgr->FindBuildSite(buildDef, pos, slot, facing);
-		if (utils::is_valid(probe) && (probe.SqDistance2D(pos) <= SQUARE(SQUARE_SIZE))) {
-			searchRadius = slot;   // the slot is free: hold the task to it
-		} else {
-			circuit->NoteBuildBlocked(pos);   // script decides whether to clear it
+		// A stale reservation of our own reads as a taken cell.
+		if (utils::is_valid(buildPos)) {
+			SetBuildPos(-RgtVector);
 		}
+		// A slot the builder is itself standing in is not a slot that is taken:
+		// widening lets the search step to the neighbouring one instead of the
+		// builder stepping aside, and the ground is NOT reported blocked --
+		// script would then avoid it for as long as the mark lives.
+		const float clear = SelfClearance(unit, buildDef);
+		const AIFloat3 self = unit->GetPos(frame);
+		// THE CELL, EXACTLY. The probe radius is one build square, so the
+		// engine can only answer with the cell itself; a wider radius answered
+		// with the nearest free square and the row lost its phase. The commit's
+		// own predicate (reach, threat, lanes, lava) is applied here too, so a
+		// cell taken here is a cell the commit will accept.
+		CTerrainManager::TerrainPredicate pred = SitePredicate(unit, clear, circuit->HasLava());
+		auto cellFree = [&](const AIFloat3& c) {
+			const AIFloat3 p = terrainMgr->FindBuildSite(buildDef, c, SQUARE_SIZE * 2, facing, pred);
+			return utils::is_valid(p) && (p.SqDistance2D(c) <= SQUARE(SQUARE_SIZE));
+		};
+		// THE NEXT SLOT, NOT THE NEXT SQUARE. A taken slot once fell straight
+		// to the wide search, which steps by one build square and lands the
+		// building a few squares off the row (apexearth: "a converter only
+		// builds up, left, down, or right. not up and slightly to the side.
+		// snap to a grid of the building's own size"). Rings of the def's own
+		// lattice, nearest first, under a probe budget; the wide search only
+		// when no ring in the budget has a free slot -- and even then its
+		// answer is put back on the lattice below.
+		const AIFloat3 snapped = pos;
+		bool found = false;
+		bool slotFree = false;
+		bool searched = false;
+		int budget = LATTICE_PROBES;
+		int ringTaken = 0, ringExit = 0;
+		for (int ring = 0; (ring <= LATTICE_RINGS) && !found && (budget > 0); ++ring) {
+			float bestSq = -1.f;
+			AIFloat3 best;
+			for (int j = -ring; j <= ring; ++j) {
+				for (int i = -ring; i <= ring; ++i) {
+					if ((std::abs(i) != ring) && (std::abs(j) != ring)) {
+						continue;
+					}
+					AIFloat3 cell;
+					if (!circuit->LatticeNeighbour(snapped, buildDef, facing, i, j, cell)) {
+						continue;
+					}
+					const float sq = cell.SqDistance2D(snapped);
+					if ((bestSq >= .0f) && (sq >= bestSq)) {
+						continue;
+					}
+					if (--budget < 0) {
+						break;
+					}
+					const bool free = cellFree(cell);
+					if (ring == 0) {
+						slotFree = free;
+					}
+					if (!free) {
+						++ringTaken;
+						continue;
+					}
+					if (!KeepsExits(circuit, terrainMgr, unit, buildDef, facing, slot, cell)) {
+						++ringExit;
+						continue;
+					}
+					bestSq = sq;
+					best = cell;
+				}
+			}
+			if (bestSq >= .0f) {
+				pos = best;
+				searchRadius = SQUARE_SIZE * 2;   // the cell is free: hold the task to it
+				found = true;
+			}
+		}
+		// A big frame that leaves its asked cell says why the cell was refused:
+		// the script verified a footprint there without this predicate.
+		if ((slot >= SQUARE_SIZE * 12) && (!found || (pos.SqDistance2D(snapped) > SQUARE(slot)))) {
+			const bool possible = circuit->GetMap()->IsPossibleToBuildAt(buildDef->GetDef(), snapped, facing);
+			// What stands on the cell: a parked unit is not a taken cell.
+			int nMobile = 0, nStatic = 0;
+			circuit->UpdateFriendlyUnits();
+			auto& onCell = circuit->GetCallback()->GetFriendlyUnitsIn(snapped, slot * 0.5f);
+			for (springai::Unit* u : onCell) {
+				CCircuitDef* cd = circuit->GetCircuitDef(circuit->GetCallback()->Unit_GetDefId(u->GetUnitId()));
+				if (cd == nullptr) continue;
+				if (cd->IsMobile()) ++nMobile; else ++nStatic;
+			}
+			utils::free(onCell);
+			circuit->LOG("apex: cell-refused t=%i %s origin=%.0f,%.0f asked=%.0f,%.0f facing=%i to=%.0f,%.0f possible=%i lane=%i threat=%.1f selfD=%.0f ringTaken=%i ringExit=%i onCell=%im/%is",
+					circuit->GetTeamId(), buildDef->GetDef()->GetName(),
+					origin.x, origin.z, snapped.x, snapped.z, facing, found ? pos.x : -1.f, found ? pos.z : -1.f,
+					possible ? 1 : 0, circuit->IsInBaseLane(snapped) ? 1 : 0,
+					circuit->GetBuilderThreatAt(snapped), self.distance2D(snapped),
+					ringTaken, ringExit, nMobile, nStatic);
+		}
+		if (!found) {
+			// Blocked ground is ground with no free slot on ANY ring: marked
+			// on the first taken cell, the script's probe ring took over the
+			// placement it was meant to back up (ring-scatter 20% on the
+			// seat the day the grid came back).
+			if (!slotFree) {
+				circuit->NoteBuildBlocked(pos, buildDef);   // script decides whether to clear it
+			}
+			// THE WIDE SEARCH ANSWERS OFF THE LATTICE; put it back on. The
+			// ground it found is free, so the lattice cell over it or one of
+			// that cell's neighbours nearly always is too. Only when none is
+			// does the building stand off the row, and it says so.
+			FindBuildSite(unit, pos, searchRadius);
+			searched = true;
+			if (utils::is_valid(buildPos)) {
+				const AIFloat3 wide = buildPos;
+				SetBuildPos(-RgtVector);   // the commit reserved it; probe without that
+				AIFloat3 cell;
+				float bestSq = -1.f;
+				AIFloat3 best;
+				int nTaken = 0, nExit = 0;
+				if (circuit->SnapToBaseGrid(wide, cell, buildDef, facing)) {
+					for (int ring = 0; (ring <= 2) && (bestSq < .0f); ++ring) {
+						for (int j = -ring; j <= ring; ++j) {
+							for (int i = -ring; i <= ring; ++i) {
+								if ((std::abs(i) != ring) && (std::abs(j) != ring)) {
+									continue;
+								}
+								AIFloat3 c;
+								if (!circuit->LatticeNeighbour(cell, buildDef, facing, i, j, c)) {
+									continue;
+								}
+								const float sq = c.SqDistance2D(wide);
+								if ((bestSq >= .0f) && (sq >= bestSq)) {
+									continue;
+								}
+								if (!cellFree(c)) {
+									++nTaken;
+									continue;
+								}
+								if (!KeepsExits(circuit, terrainMgr, unit, buildDef, facing, slot, c)) {
+									++nExit;
+									continue;
+								}
+								bestSq = sq;
+								best = c;
+							}
+						}
+					}
+				}
+				if (bestSq >= .0f) {
+					SetBuildPos(best);
+				} else {
+					circuit->LOG("apex: off-lattice t=%i %s at=%.0f,%.0f asked=%.0f,%.0f taken=%i exit=%i",
+							circuit->GetTeamId(), buildDef->GetDef()->GetName(),
+							wide.x, wide.z, snapped.x, snapped.z, nTaken, nExit);
+					SetBuildPos(wide);
+				}
+			}
+		}
+		if (!searched) {
+			FindBuildSite(unit, pos, searchRadius);
+		}
+	} else {
+		FindBuildSite(unit, pos, searchRadius);
 	}
-	FindBuildSite(unit, pos, searchRadius);
 
 	// WHY A TASK NEVER BECOMES A BUILDING. Everything upstream is logged --
 	// the want, the price, the request -- and this step, where the site search
@@ -379,9 +812,22 @@ bool IBuilderTask::Execute(CCircuitUnit* unit)
 				circuit->GetTeamId(),
 				(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?",
 				int(buildType), position.x, position.z, pos.x, pos.z, searchRadius);
+		// Marked so the script's probe steps around ground no search can fill.
+		if ((buildDef != nullptr)
+			&& (std::max(buildDef->GetFootX(), buildDef->GetFootZ()) * SQUARE_SIZE * 2 >= SQUARE_SIZE * 12)) {
+			circuit->NoteBuildBlocked(position, buildDef);
+		}
 	}
 
 	if (utils::is_valid(buildPos)) {
+		if (TaskTraceOn(circuit)) {
+			const AIFloat3& up = unit->GetPos(frame);
+			circuit->LOG("apex: ttrace site #%d task=%p %s at=%.0f,%.0f unit=%.0f,%.0f facing=%d enginePossible=%d held=%d reach=%d",
+					unit->GetId(), static_cast<void*>(this), buildDef->GetDef()->GetName(), buildPos.x, buildPos.z, up.x, up.z, facing,
+					circuit->GetMap()->IsPossibleToBuildAt(buildDef->GetDef(), buildPos, facing) ? 1 : 0,
+					unit->IsDGunHeld(frame) ? 1 : 0,
+					circuit->GetTerrainManager()->CanReachAt(unit, buildPos, unit->GetCircuitDef()->GetBuildDistance()) ? 1 : 0);
+		}
 		TRY_UNIT(circuit, unit,
 			unit->CmdBuild(buildDef, buildPos, facing, 0, frame + FRAMES_PER_SEC * 60);
 		)
@@ -420,6 +866,7 @@ void IBuilderTask::OnUnitIdle(CCircuitUnit* unit)
 		// A genuinely unbuildable spot is already refused by FindBuildSite (which
 		// logs apex: site-fail), so the blocker was insuring against a case the
 		// site search answers on its own.
+		SetDeathNote("build-failed");
 		manager->AbortTask(this);
 	}
 }
@@ -619,7 +1066,16 @@ CCircuitUnit* IBuilderTask::GetNextAssignee()
 
 void IBuilderTask::Update(CCircuitUnit* unit)
 {
-	if (Reevaluate(unit)) {
+	const bool re = Reevaluate(unit);
+	if (TaskTraceOn(manager->GetCircuit())) {
+		ITravelAction* tr = unit->GetTravelAct();
+		manager->GetCircuit()->LOG("apex: ttrace update #%d task=%p re=%d travel=%s traveled=%d exec=%d q=%d", unit->GetId(),
+				static_cast<void*>(this), re ? 1 : 0,
+				(tr == nullptr) ? "null" : (tr->IsFinished() ? "fin" : (tr->IsWait() ? "wait" : "act")),
+				static_cast<int>(traveled.count(unit)), static_cast<int>(executors.count(unit)),
+				manager->GetCircuit()->GetCallback()->Unit_HasCommands(unit->GetId()) ? 1 : 0);
+	}
+	if (re) {
 		// Reevaluate runs the script pipeline, which can REASSIGN the unit to
 		// a different task -- RemoveAssignee clears its actions, so the travel
 		// act read here can be null. Crashed a watched game at 3 minutes the
@@ -680,7 +1136,7 @@ bool IBuilderTask::Reevaluate(CCircuitUnit* unit)
 				TRY_UNIT(circuit, unit,
 					AIFloat3 awayPos = utils::get_radial_pos(pos, 64.f);
 					CTerrainManager::CorrectPosition(awayPos);
-					unit->CmdMoveTo(awayPos, UNIT_CMD_OPTION, frame + FRAMES_PER_SEC * 60);
+					unit->CmdMoveTo(awayPos, UNIT_CMD_OPTION, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::BUILD);
 				)
 			}
 			return true;
@@ -713,8 +1169,44 @@ bool IBuilderTask::Reevaluate(CCircuitUnit* unit)
 			unit->CmdWait(false);
 		)
 	}
+	// apex: a walking builder's re-election is a CONFIRMATION, not a request
+	// for work -- measured 3,047 hook calls a minute at 647 builders with
+	// only ~318 electing anything new, each confirmation paying the script
+	// crossing plus the ladder preamble (~1s of every game-minute). Ask the
+	// market again at most every few seconds; a finished or aborted task
+	// still elects immediately through the idle path. Commanders keep every
+	// update (their safety check lives inside the election) and so do rez
+	// bots (their flee does too).
+	{
+		constexpr int REELECT_FRAMES = 3 * FRAMES_PER_SEC;
+		CCircuitDef* rdef = unit->GetCircuitDef();
+		if ((rdef != nullptr) && !rdef->IsRoleComm() && !rdef->IsAbleToResurrect()
+			&& (frame - unit->GetElectFrame() < REELECT_FRAMES))
+		{
+			return true;
+		}
+		unit->SetElectFrame(frame);
+	}
+	// apex: a builder past halfway to a far site finishes the walk (apexearth
+	// 2026-09-30: engineers walked half the map to the front and were turned
+	// home nearly there). Still re-elected where the enemy is, so it can flee.
+	{
+		const AIFloat3& home = circuit->GetSetupManager()->GetBasePos();
+		const AIFloat3& site = GetPosition();
+		const float sqTrip = home.SqDistance2D(site);
+		const float sqHere = pos.SqDistance2D(site);
+		if (utils::is_valid(site) && (sqTrip > SQUARE(1000.f))
+			&& (sqHere * 4.f < sqTrip)
+			&& (sqHere > SQUARE(unit->GetCircuitDef()->GetBuildDistance() + 64.f))
+			&& (circuit->GetInflMap()->GetEnemyInflAt(pos) < INFL_EPS))
+		{
+			return true;
+		}
+	}
 	HideAssignee(unit);
+	sInReelect = true;   // apex: strand census (see RemoveAssignee)
 	IUnitTask* task = manager->MakeTask(unit);
+	sInReelect = false;
 	ShowAssignee(unit);
 	if ((task != nullptr)
 		&& ((task->GetType() != IUnitTask::Type::BUILDER)
@@ -732,38 +1224,124 @@ void IBuilderTask::UpdatePath(CCircuitUnit* unit)
 	// TODO: Check IsForceUpdate, shield charge and retreat
 
 	CCircuitDef* cdef = unit->GetCircuitDef();
-	const float range = cdef->GetBuildDistance();
+	// The engine builds from buildDistance + the buildee's radius (CBuilder);
+	// testing the bare distance to a shipyard's CENTRE refused every shore
+	// site a bot con could actually build from.
+	const float range = cdef->GetBuildDistance()
+			+ ((buildDef != nullptr) ? buildDef->GetRadius() : 0.f);
 	const AIFloat3& endPos = GetPosition();
+	// A path for this move type into this sector failed a moment ago: another
+	// query would fail the same way (2,736 rez-bot nopaths in one 20-min 8v8).
+	if (!IsFixedSite(buildType) && circuit->IsNoPath(cdef, endPos)
+		&& (unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos) > SQUARE(range + SQUARE_SIZE * 4)))
+	{
+		SetDeathNote("no-path-mark");
+		manager->AbortTask(this);
+		return;
+	}
 	// A DEFENCE IS BUILT INTO THE THREAT IT ANSWERS. The safe-reach veto
 	// killed every front tower task ever created (s43: all bt=7 deaths
 	// why=unreach-safe; 960 front elections won, 0 towers built) -- the
 	// ground a tower is for is exactly the ground this refused. Defence
 	// types test pure reachability; everything else keeps the threat term.
+	// ...and a FIXED site: the script priced the spot's danger when it chose
+	// it (MexHeat, ThreatFor) and lets the walk go if the ground turns hot;
+	// tested again here at a constructor's bar of 1.0, a reading of 1.2 --
+	// one raider in the neighbourhood -- turned the con around at the mex
+	// (his watch: "walk out and then just turn around more than 80% of the
+	// time"; 62 unreach armmex at gap=36-48 of a 154 range in one game).
 	const bool intoThreat = (buildType == BuildType::DEFENCE)
 			|| (buildType == BuildType::BUNKER)
-			|| (buildType == BuildType::BIG_GUN);
+			|| (buildType == BuildType::BIG_GUN)
+			|| IsFixedSite(buildType);
+	// THE BAR FOR ECONOMY IS NOT THE BUILDER'S OWN POWER. A constructor's power
+	// is ~0, so a site was refused at threat 0.1 -- the residue of a raider
+	// that passed minutes ago -- and on a raided map the cons built nothing
+	// at all (Frozen Ford 2v2, watched: 3 of 34 spots held at 30 min, 21 of
+	// 26 mex tasks refused at threats of 0.1-3). The bar is OUR OWN GUNS'
+	// influence at the site, the same power scale as the threat: ground our
+	// towers reach is built under them, ground they do not is refused while
+	// it is hot -- and that gap is what the defence market prices first.
+	float safeBar = cdef->GetPower();
+	if (!intoThreat) {
+		safeBar = std::max(safeBar, std::max(THREAT_MIN, circuit->GetAllyDefendInflAt(endPos)));
+	}
 	if ((target == nullptr)
 		&& !(intoThreat
 			? circuit->GetTerrainManager()->CanReachAt(unit, endPos, range)
-			: circuit->GetTerrainManager()->CanReachAtSafe(unit, endPos, range, cdef->GetPower())))
+			: circuit->GetTerrainManager()->CanReachAtSafe(unit, endPos, range, safeBar)))
 	{
 		// The chooser tested reachability from HOME (CanDefReach); this
 		// stricter per-unit test disagreeing is exactly the loop where a
 		// deterministic site is re-elected and aborted forever (t5's no-lab
 		// pocket, SI 8v8 s106). Mark the ground so ProbedSite steps around
-		// it on the next election.
-		circuit->NoteBuildBlocked(endPos);
+		// it on the next election -- but only ground the unit cannot REACH.
+		// A site refused for threat is the unsafe list's, not a three-minute
+		// block: the raider leaves and the dead mex stayed unbuilt (his watch).
+		if (intoThreat || !circuit->GetTerrainManager()->CanReachAt(unit, endPos, range)) {
+			circuit->NoteBuildBlocked(endPos, buildDef);
+		}
+		{
+			const float gap = circuit->GetTerrainManager()->ReachGap(unit->GetArea(), endPos);
+			circuit->LOG("apex: unreach %s bt=%i by %s at=%.0f,%.0f gap=%.0f range=%.0f threat=%.1f/%.1f",
+					(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?", int(buildType),
+					cdef->GetDef()->GetName(), endPos.x, endPos.z, gap, range,
+					circuit->GetThreatMap()->GetThreatAt(endPos), cdef->GetPower());
+		}
 		SetDeathNote("unreach-safe");
+		if (!intoThreat) {
+			circuit->NoteUnsafeSite(endPos);
+		}
 		manager->AbortTask(this);
 		return;
 	}
 
 	const AIFloat3& startPos = unit->GetPos(circuit->GetLastFrame());
 
-	if ((startPos.SqDistance2D(endPos) < SQUARE(range))
-		|| ((circuit->GetSetupManager()->GetBasePos().SqDistance2D(startPos) < SQUARE(circuit->GetMilitaryManager()->GetBaseDefRange()))
-			&& (circuit->GetSetupManager()->GetBasePos().SqDistance2D(endPos) < SQUARE(circuit->GetMilitaryManager()->GetBaseDefRange()))))
-	{
+	// NO PATH IS COMPUTED FOR AN IN-BASE BUILD. That is right when the builder
+	// is at the site and wrong when it is 700 elmos away with a 145 build
+	// range -- it is told nothing and stands there until the stuck watchdog
+	// aborts the task. baseDefRange is terrainDiagonal * 0.3, so most of the
+	// map can qualify. Counted before anything is changed: `inRange` is the
+	// legitimate case, `farInBase` is the suspect one, and their ratio is the
+	// whole question.
+	const bool inRange = startPos.SqDistance2D(endPos) < SQUARE(range);
+	const bool bothInBase =
+			(circuit->GetSetupManager()->GetBasePos().SqDistance2D(startPos) < SQUARE(circuit->GetMilitaryManager()->GetBaseDefRange()))
+			&& (circuit->GetSetupManager()->GetBasePos().SqDistance2D(endPos) < SQUARE(circuit->GetMilitaryManager()->GetBaseDefRange()));
+	// A BUILDER IS ONLY EXCUSED FROM PATHING WHEN IT CAN ALREADY REACH THE JOB.
+	// The in-base shortcut excused it whenever builder AND site were inside
+	// baseDefRange -- a 1,120-elmo radius, so a 2,240-elmo disc -- and 69% of
+	// the time it fired the builder was NOT in build range: measured
+	// inRange=29 farInBase=66, worst 1,952 elmos against a 112 build range.
+	// Those builders are handed no path, no move, and nothing to do; they
+	// stand where they are until the stuck watchdog aborts the task at 30s.
+	// Every stuck builder measured sat 500-1,175 elmos from its site with
+	// progress 0.00 and no move failure, because no move was ever ordered.
+	// Pathing every in-base build was measured and bought nothing; the pathless
+	// builders are not the parked ones. Off by default, table in docs/27.
+	const bool skipPath = inRange || (bothInBase
+			&& (circuit->GetTunable("apex_inbase_path", 0.f) <= 0.f));
+	if (TaskTraceOn(circuit)) {
+		circuit->LOG("apex: ttrace path #%d task=%p skip=%d inRange=%d", unit->GetId(), static_cast<void*>(this), skipPath ? 1 : 0, inRange ? 1 : 0);
+	}
+	if (skipPath) {
+		static unsigned sInRange = 0, sFarInBase = 0, sFarWorst = 0;
+		static int sPathSkipLogAt = 0;
+		if (inRange) {
+			++sInRange;
+		} else {
+			++sFarInBase;
+			const unsigned d = (unsigned)sqrtf(startPos.SqDistance2D(endPos));
+			if (d > sFarWorst) { sFarWorst = d; }
+		}
+		const int f = circuit->GetLastFrame();
+		if (f >= sPathSkipLogAt) {
+			sPathSkipLogAt = f + FRAMES_PER_SEC * 60;
+			circuit->LOG("apex: pathskip t=%i inRange=%u farInBase=%u worst=%u range=%.0f baseR=%.0f",
+					circuit->GetTeamId(), sInRange, sFarInBase, sFarWorst, range,
+					circuit->GetMilitaryManager()->GetBaseDefRange());
+		}
 		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
 			unit->GetTravelAct()->StateFinish();
 		}
@@ -774,10 +1352,20 @@ void IBuilderTask::UpdatePath(CCircuitUnit* unit)
 		return;
 	}
 
+	// THE ROAD IS HELD TO THE DOORSTEP'S BAR. Every safety test above reads
+	// the site, and a walk through the enemy army to a spot behind it passed
+	// them all. The pathfinder skips squares above maxThreat, so a road hotter than
+	// our own guns' reach at the site has no path -- ApplyPath tells that
+	// apart from terrain. Defence walks into the threat it answers.
+	const bool roadFree = (buildType == BuildType::DEFENCE)
+			|| (buildType == BuildType::BUNKER)
+			|| (buildType == BuildType::BIG_GUN);
+	const float roadBar = roadFree ? std::numeric_limits<float>::max()
+			: std::max(cdef->GetPower(), std::max(THREAT_MIN, circuit->GetAllyDefendInflAt(endPos)));
 	CPathFinder* pathfinder = circuit->GetPathfinder();
 	std::shared_ptr<IPathQuery> query = pathfinder->CreatePathSingleQuery(
 			unit, circuit->GetThreatMap(),
-			startPos, endPos, range);
+			startPos, endPos, range, nullptr, roadBar);
 	pathQueries[unit] = query;
 
 	pathfinder->RunQuery(circuit->GetScheduler().get(), query, [this](const IPathQuery* query) {
@@ -796,14 +1384,133 @@ void IBuilderTask::ApplyPath(const CQueryPathSingle* query)
 		return;
 	}
 
+	if (TaskTraceOn(manager->GetCircuit())) {
+		manager->GetCircuit()->LOG("apex: ttrace applypath #%d task=%p size=%d", unit->GetId(), static_cast<void*>(this), static_cast<int>(pPath->path.size()));
+	}
 	if (pPath->path.size() > 2) {
 		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
 			unit->GetTravelAct()->SetPath(pPath);
 		}
-	} else {
-		if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
-			unit->GetTravelAct()->StateFinish();
+		return;
+	}
+	if (query->GetMaxThreat() < std::numeric_limits<float>::max()) {
+		// Terrain or threat? Ask once more with no bar: a road that exists
+		// unbounded was refused for its heat.
+		CCircuitAI* circuit = manager->GetCircuit();
+		CPathFinder* pathfinder = circuit->GetPathfinder();
+		const float range = unit->GetCircuitDef()->GetBuildDistance()
+				+ ((buildDef != nullptr) ? buildDef->GetRadius() : 0.f);
+		std::shared_ptr<IPathQuery> again = pathfinder->CreatePathSingleQuery(
+				unit, circuit->GetThreatMap(),
+				unit->GetPos(circuit->GetLastFrame()), GetPosition(), range);
+		pathQueries[unit] = again;
+		pathfinder->RunQuery(circuit->GetScheduler().get(), again, [this](const IPathQuery* q) {
+			this->ApplyPathUnbounded(static_cast<const CQueryPathSingle*>(q));
+		});
+		return;
+	}
+	OnNoPath(unit);
+}
+
+void IBuilderTask::ApplyPathUnbounded(const CQueryPathSingle* query)
+{
+	CCircuitUnit* unit = query->GetUnit();
+	if ((unit == nullptr) || (unit->GetTravelAct() == nullptr)) {
+		return;
+	}
+	if (query->GetPathInfo()->path.size() <= 2) {
+		OnNoPath(unit);
+		return;
+	}
+	CCircuitAI* circuit = manager->GetCircuit();
+	const AIFloat3& endPos = GetPosition();
+	const float range = unit->GetCircuitDef()->GetBuildDistance()
+			+ ((buildDef != nullptr) ? buildDef->GetRadius() : 0.f);
+	if (!utils::is_valid(endPos)
+		|| (unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos) <= SQUARE(range + SQUARE_SIZE * 4)))
+	{
+		unit->GetTravelAct()->StateFinish();  // already there: no road to refuse
+		return;
+	}
+	// One far hand's hot road is that hand's problem: a crew already on the job
+	// or a frame already standing keeps the site (16-hand reactors were aborted).
+	if ((target != nullptr) || (units.size() > 1)) {
+		circuit->LOG("apex: hot-road-leave %s by %s at=%.0f,%.0f dist=%.0f crew=%i",
+				(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?",
+				unit->GetCircuitDef()->GetDef()->GetName(), endPos.x, endPos.z,
+				sqrtf(unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos)),
+				static_cast<int>(units.size()));
+		RemoveAssignee(unit);
+		return;
+	}
+	// How hot: the worst square on the road that exists, against the bar it
+	// was held to, in units of one Pawn's threat (scout-hot or squad-hot).
+	float roadMax = 0.f;
+	{
+		CThreatMap* tm = circuit->GetThreatMap();
+		tm->SetThreatType(unit);
+		for (const springai::AIFloat3& p : query->GetPathInfo()->posPath) {
+			const float th = tm->GetThreatAt(unit, p);
+			if (th > roadMax) {
+				roadMax = th;
+			}
 		}
+	}
+	const float roadBarLog = std::max(unit->GetCircuitDef()->GetPower(),
+			std::max(THREAT_MIN, circuit->GetAllyDefendInflAt(endPos)));
+	CCircuitDef* pawnDef = circuit->GetCircuitDef("armpw");
+	const float pawn = (pawnDef != nullptr) ? pawnDef->GetPower() : 0.f;
+	circuit->LOG("apex: hot-road %s by %s at=%.0f,%.0f dist=%.0f roadMax=%.1f bar=%.1f pawn=%.1f",
+			(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?",
+			unit->GetCircuitDef()->GetDef()->GetName(), endPos.x, endPos.z,
+			sqrtf(unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos)),
+			roadMax, roadBarLog, pawn);
+	circuit->NoteBuildBlocked(endPos, buildDef);
+	SetDeathNote("hot-road");
+	manager->AbortTask(this);
+}
+
+void IBuilderTask::OnNoPath(CCircuitUnit* unit)
+{
+	// NO PATH AND NOT THERE: the travel step used to finish anyway and the
+	// build order went to the engine, which could not path either -- the
+	// builder stood with its task until the script's watch aborted it at
+	// 30 s and the next election sent it back (Frozen Ford: 85 of 99 such
+	// aborts on one con). The site is marked and the task dies here.
+	CCircuitAI* circuit = manager->GetCircuit();
+	const AIFloat3& endPos = GetPosition();
+	const float range = unit->GetCircuitDef()->GetBuildDistance()
+			+ ((buildDef != nullptr) ? buildDef->GetRadius() : 0.f);
+	if (utils::is_valid(endPos)
+		&& (unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos) > SQUARE(range + SQUARE_SIZE * 4)))
+	{
+		// A FIXED SITE WALKS ON THE ENGINE'S PATH. Our sector pathfinder
+		// answered "no path" to mexes 190-390 elmo away whose reach test
+		// had passed (146 nopath armmex in one game), and the task died
+		// with the con standing short of the spot. The engine paths it;
+		// the stuck watch still ends a walk that never arrives.
+		if (IsFixedSite(buildType)) {
+			circuit->LOG("apex: nopath-engine %s by %s at=%.0f,%.0f dist=%.0f",
+					(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?",
+					unit->GetCircuitDef()->GetDef()->GetName(), endPos.x, endPos.z,
+					sqrtf(unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos)));
+			if (unit->GetTravelAct() != nullptr) {
+				unit->GetTravelAct()->StateFinish();
+			}
+			return;
+		}
+		circuit->NoteBuildBlocked(endPos, buildDef);
+		circuit->NoteNoPath(unit->GetCircuitDef(), endPos);
+		circuit->LOG("apex: nopath %s by %s at=%.0f,%.0f dist=%.0f",
+				(buildDef != nullptr) ? buildDef->GetDef()->GetName() : "?",
+				unit->GetCircuitDef()->GetDef()->GetName(), endPos.x, endPos.z,
+				sqrtf(unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos)));
+		SetDeathNote("no-path");
+		manager->AbortTask(this);
+		return;
+	}
+	if (unit->GetTravelAct() != nullptr) {  // null after ClearAct: path unwanted
+		unit->GetTravelAct()->StateFinish();
 	}
 }
 
@@ -866,10 +1573,13 @@ CAllyUnit* IBuilderTask::FindSameAlly(CCircuitUnit* builder, const std::vector<U
 	return nullptr;
 }
 
-void IBuilderTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, float searchRadius)
+// The one test of a site, shared by the lattice walk and the wide search so
+// a cell the walk accepts is a cell the commit accepts (a walk without it
+// took a cell the commit's reach test refused, and the commit stepped one
+// build square off the row).
+CTerrainManager::TerrainPredicate IBuilderTask::SitePredicate(CCircuitUnit* builder,
+		float selfBar, bool aboveCrest)
 {
-	FindFacing(pos);
-
 	CTerrainManager* terrainMgr = manager->GetCircuit()->GetTerrainManager();
 	// A DEFENCE TASK MAY STAND ON GROUND THAT IS NOT PERFECTLY QUIET.
 	//
@@ -901,11 +1611,124 @@ void IBuilderTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, flo
 	if ((buildType == BuildType::DEFENCE) && (buildDef != nullptr)) {
 		threatBar = std::max(THREAT_MIN, buildDef->GetPower());
 	}
-	CTerrainManager::TerrainPredicate predicate = [terrainMgr, builder, threatBar](const AIFloat3& p) {
+	// THE STREETS ARE A RULE HERE, NOT ONLY AT THE SNAP.
+	//
+	// SnapToBaseGrid pushes a placement out of a walkway, and then this search
+	// runs -- at 3200 elmos whenever the slot it snapped to was taken, which in
+	// a filling base is most of the time. Every one of those searches was free
+	// to settle in a corridor, so the lanes held early and quietly closed as the
+	// base packed. Measured over 657 matches: 414 units walled in by our own
+	// buildings, and the wall was the eco farm (solar 133, wind 98, converter 58,
+	// nano 69) rather than anything on the line.
+	//
+	// A FIXED task is exempt: a mex sits on its spot or not at all, and refusing
+	// the spot loses the mex rather than moving it.
+	CCircuitAI* circuit = manager->GetCircuit();
+	const bool keepLanes = !IsFixedSite(buildType);
+	// NOTHING IS BUILT UNDER LAVA. The rising-tide maps flood a basin over a
+	// couple of minutes and everything standing in it burns down; a nanoframe
+	// raised there is metal handed to the map. This catches the farm -- the
+	// generators, converters and nanos the lattice is free to move. It shares
+	// the lanes' exemption for a FIXED site, which is one the script chose
+	// deliberately (an extractor's spot, a turret's slot, a factory's apron);
+	// those are filtered where they are chosen instead, in manager/lava.as.
+	// Costs nothing off a lava map -- HasLava is one cached compare.
+	const bool dryOnly = keepLanes && circuit->HasLava();
+	CCircuitDef* siteDef = buildDef;
+	const AIFloat3 builderPos = builder->GetPos(circuit->GetLastFrame());
+	// Everything captured BY VALUE. An earlier version flipped one
+	// captured-by-reference flag between two passes; FindBuildSite takes the
+	// predicate by non-const reference and the AI crashed with an access
+	// violation on two of twelve games. Nothing here outlives this frame.
+	return CTerrainManager::TerrainPredicate([terrainMgr, builder, threatBar, circuit, keepLanes, dryOnly, siteDef, aboveCrest, builderPos, selfBar](const AIFloat3& p) {
+		if ((selfBar > 0.f) && (p.SqDistance2D(builderPos) < SQUARE(selfBar))) {
+			return false;
+		}
+		if (keepLanes && circuit->IsInBaseLane(p)) {
+			return false;
+		}
+		if (dryOnly && circuit->IsUnderLava(p, siteDef)) {
+			return false;
+		}
+		if (aboveCrest && !circuit->AboveLavaCrest(p)) {
+			return false;
+		}
 		return terrainMgr->CanReachAtSafe(builder, p,
 				builder->GetCircuitDef()->GetBuildDistance(), threatBar);
+	});
+}
+
+void IBuilderTask::FindBuildSite(CCircuitUnit* builder, const AIFloat3& pos, float searchRadius)
+{
+	FindFacing(pos);
+
+	CCircuitAI* circuit = manager->GetCircuit();
+	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
+	const bool dryOnly = !IsFixedSite(buildType) && circuit->HasLava();
+	// NOT ON THE BUILDER'S OWN FEET (see SelfClearance): the search reads a
+	// mobile unit as empty ground and hands back the square it is standing on,
+	// which cannot be started until the builder has been pushed clear of it.
+	// A spot site is exempt -- it is that vent or nothing.
+	const float selfClear = IsSpotSite(buildType) ? 0.f : SelfClearance(builder, buildDef);
+	auto makePredicate = [this, builder](bool aboveCrest, float selfBar) {
+		return SitePredicate(builder, selfBar, aboveCrest);
 	};
-	SetBuildPos(terrainMgr->FindBuildSite(buildDef, pos, searchRadius, facing, predicate));
+	// ABOVE THE HIGH-WATER MARK FIRST. The submerged veto only refuses ground
+	// the tide is on RIGHT NOW, so at low tide the whole basin reads dry and
+	// the farm fills it, to burn on the next climb. The crest is the mark it
+	// has proven it reaches; the farm takes ground over that when any exists,
+	// and falls back to the ordinary search when none does -- returning
+	// nothing here releases the builder to a FallbackTask, which is how
+	// forward defence quietly went unstaffed once already.
+	auto search = [&](float selfBar) {
+		CTerrainManager::TerrainPredicate predicate = makePredicate(dryOnly, selfBar);
+		AIFloat3 s = terrainMgr->FindBuildSite(buildDef, pos, searchRadius, facing, predicate);
+		if (dryOnly && !utils::is_valid(s)) {
+			CTerrainManager::TerrainPredicate wet = makePredicate(false, selfBar);
+			s = terrainMgr->FindBuildSite(buildDef, pos, searchRadius, facing, wet);
+		}
+		return s;
+	};
+	AIFloat3 site = search(selfClear);
+	// Nowhere in reach BUT under our own feet: take it and step aside, exactly
+	// as before. Returning nothing here releases the builder to a FallbackTask,
+	// which is how forward defence quietly went unstaffed once already.
+	if ((selfClear > 0.f) && !utils::is_valid(site)) {
+		site = search(0.f);
+	}
+	// EVERY BUILD, not only the lattice walk: nano turrets and converter
+	// yards come through here and closed the commander's pocket in every
+	// gate game after the ring walk learned the rule. The chosen site is
+	// tested once; a site that closes a pocket is refused and the search
+	// rerun without it, three times, then the ground is marked.
+	if (utils::is_valid(site) && (buildDef != nullptr)) {
+		const float slot = std::max(buildDef->GetFootX(), buildDef->GetFootZ()) * SQUARE_SIZE * 2;
+		std::vector<AIFloat3> refused;
+		for (int tries = 0; tries < 3; ++tries) {
+			if (KeepsExits(circuit, terrainMgr, builder, buildDef, facing, slot, site)) {
+				break;
+			}
+			refused.push_back(site);
+			circuit->LOG("apex: exit-kept %s by %s at=%.0f,%.0f (site search)",
+					buildDef->GetDef()->GetName(), builder->GetCircuitDef()->GetDef()->GetName(),
+					site.x, site.z);
+			CTerrainManager::TerrainPredicate base = makePredicate(dryOnly, selfClear);
+			CTerrainManager::TerrainPredicate pred([base, refused](const AIFloat3& p) {
+				for (const AIFloat3& r : refused) {
+					if (p.SqDistance2D(r) < SQUARE(SQUARE_SIZE)) {
+						return false;
+					}
+				}
+				return base(p);
+			});
+			site = terrainMgr->FindBuildSite(buildDef, pos, searchRadius, facing, pred);
+			if (!utils::is_valid(site)) {
+				circuit->NoteBuildBlocked(pos, buildDef);
+				break;
+			}
+		}
+	}
+	SetBuildPos(site);
 }
 
 void IBuilderTask::FindFacing(const springai::AIFloat3& pos)
@@ -937,204 +1760,6 @@ void IBuilderTask::ExecuteChain(SBuildChain* chain)
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	// build_chain.json hubs are dead for apex.
 	return;
-	CCircuitAI* circuit = manager->GetCircuit();
-
-	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
-	if (terrainMgr->IsZoneAlly(buildPos)) {  // ally mex upgrade or energy base collides with ally
-		return;
-	}
-
-	if (chain->energy > 0.f) {
-		float energyMake;
-		CCircuitDef* energyDef = circuit->GetEconomyManager()->GetLowEnergy(buildPos, energyMake);
-		if (energyDef != nullptr) {
-			bool isValid = (circuit->GetEconomyManager()->GetAvgEnergyIncome() < chain->energy);
-			if (isValid && chain->isMexEngy) {
-				int index = circuit->GetMetalManager()->FindNearestSpot(buildPos);
-				isValid = (index >= 0) && (circuit->GetMetalManager()->GetSpots()[index].income * buildDef->GetExtractsM() > energyMake * 0.8f);
-			}
-			if (isValid) {
-				circuit->GetBuilderManager()->Enqueue(TaskB::Common(IBuilderTask::BuildType::ENERGY,
-						IBuilderTask::Priority::NORMAL, energyDef, buildPos, SQUARE_SIZE * 8.0f, true));
-			}
-		}
-	}
-
-	if (chain->isPylon) {
-		bool foundPylon = false;
-		CEconomyManager* economyMgr = circuit->GetEconomyManager();
-		CCircuitDef* pylonDef = economyMgr->GetPylonDef();
-		if (pylonDef->IsAvailable(circuit->GetLastFrame())) {
-			float ourRange = economyMgr->GetEnergyGrid()->GetPylonRange(buildDef->GetId());
-			float pylonRange = economyMgr->GetPylonRange();
-			float radius = pylonRange + ourRange;
-			const int frame = circuit->GetLastFrame();
-			circuit->UpdateFriendlyUnits();
-			auto& units = circuit->GetCallback()->GetFriendlyUnitsIn(buildPos, radius);
-			for (Unit* u : units) {
-				CAllyUnit* p = circuit->GetFriendlyUnit(u);
-				if (p == nullptr) {
-					continue;
-				}
-				// NOTE: Is SqDistance2D necessary? Or must subtract model radius of pylon from "radius" variable
-				//        @see rts/Sim/Misc/QaudField.cpp
-				//        ...CQuadField::GetUnitsExact(const float3& pos, float radius, bool spherical)
-				//        const float totRad = radius + u->radius; -- suspicious
-				if ((*p->GetCircuitDef() == *pylonDef) && (buildPos.SqDistance2D(p->GetPos(frame)) < SQUARE(radius))) {
-					foundPylon = true;
-					break;
-				}
-			}
-			utils::free(units);
-			if (!foundPylon) {
-				AIFloat3 pos = buildPos;
-				CMetalManager* metalMgr = circuit->GetMetalManager();
-				int index = metalMgr->FindNearestCluster(pos);
-				if (index >= 0) {
-					const AIFloat3& clPos = metalMgr->GetClusters()[index].position;
-					AIFloat3 dir = clPos - pos;
-					float dist = ourRange /*+ pylonRange*/ + pylonRange * 1.8f;
-					if (dir.SqLength2D() < dist * dist) {
-						pos = (pos /*+ dir.Normalize2D() * (ourRange - pylonRange)*/ + clPos) * 0.5f;
-					} else {
-						pos += dir.Normalize2D() * (ourRange + pylonRange) * 0.9f;
-					}
-				}
-				circuit->GetBuilderManager()->Enqueue(TaskB::Pylon(IBuilderTask::Priority::HIGH, pylonDef, pos, nullptr, 1.0f));
-			}
-		}
-	}
-
-	if (chain->isPorc) {
-//		CEconomyManager* economyMgr = circuit->GetEconomyManager();
-//		const float metalIncome = std::min(economyMgr->GetAvgMetalIncome(), economyMgr->GetAvgEnergyIncome());
-//		if (metalIncome > 10) {
-			circuit->GetMilitaryManager()->MakeDefence(buildPos);
-//		} else {
-//			CMetalManager* metalMgr = circuit->GetMetalManager();
-//			int index = metalMgr->FindNearestCluster(buildPos);
-//			if ((index >= 0) && (/*metalMgr->IsClusterQueued(index) || */metalMgr->IsClusterFinished(index))) {
-//				circuit->GetMilitaryManager()->MakeDefence(index, buildPos);
-//			}
-//		}
-	}
-
-	if (chain->isTerra) {
-		if (circuit->GetEconomyManager()->GetAvgMetalIncome() > 10) {
-			circuit->GetBuilderManager()->Enqueue(TaskB::Terraform(IBuilderTask::Priority::HIGH, target));
-		}
-	}
-
-	if (!chain->hub.empty()) {
-		// TODO: Implement BuildWait action - semaphore for group of tasks / task's queue
-		// FIXME: Using builder's def because MaxSlope is not provided by engine's interface for buildings!
-		//        and CTerrainManager::CanBuildAt returns false in many cases
-		CCircuitDef* bdef = units.empty() ? circuit->GetSetupManager()->GetCommChoice() : (*this->units.begin())->GetCircuitDef();
-		CBuilderManager* builderMgr = circuit->GetBuilderManager();
-		CEnemyManager* enemyMgr = circuit->GetEnemyManager();
-
-		for (auto& queue : chain->hub) {
-			IBuilderTask* parent = nullptr;
-
-			for (const SBuildInfo& bi : queue) {
-				if (!bi.cdef->IsAvailable(circuit->GetLastFrame())
-					|| !terrainMgr->GetImmobileTypeById(bi.cdef->GetImmobileId())->typeUsable)
-				{
-					continue;
-				}
-				bool isValid = true;
-				switch (bi.condition) {
-					case SBuildInfo::Condition::AIR: {
-						isValid = bi.cdef->GetCostM() < enemyMgr->GetEnemyCost(ROLE_TYPE(AIR));
-						if (bi.value < 0.f) {  // -1.f == false
-							isValid = !isValid;
-						}
-					} break;
-					case SBuildInfo::Condition::ENERGY: {
-						CEconomyManager* ecoMgr = circuit->GetEconomyManager();
-						// isValid = !ecoMgr->IsEnergyStalling() && (ecoMgr->GetAvgEnergyIncome() > ecoMgr->GetEnergyPull() + bi.cdef->GetUpkeepE());
-						isValid = !ecoMgr->IsEnergyStalling() && ecoMgr->IsEnergyFull();
-						if (bi.value < 0.f) {  // -1.f == false
-							isValid = !isValid;
-						}
-					} break;
-					case SBuildInfo::Condition::WIND: {
-						CEconomyManager* ecoMgr = circuit->GetEconomyManager();
-						isValid = ecoMgr->IsEnergyStalling() || (ecoMgr->GetAvgEnergyIncome() < ecoMgr->GetEnergyPull() + bi.cdef->GetUpkeepE());
-						float avgWind = (circuit->GetMap()->GetMaxWind() + circuit->GetMap()->GetMinWind()) * 0.5f;
-						isValid = isValid && (avgWind >= bi.value);
-					} break;
-					case SBuildInfo::Condition::M_INC_GR: {
-						isValid = circuit->GetEconomyManager()->GetAvgMetalIncome() > bi.value;
-					} break;
-					case SBuildInfo::Condition::M_INC_LS: {
-						isValid = circuit->GetEconomyManager()->GetAvgMetalIncome() < bi.value;
-					} break;
-					case SBuildInfo::Condition::SENSOR: {
-						std::function<bool (CCircuitDef*)> isSensor;
-						if (bi.cdef->IsRadar()) {
-							isSensor = [](CCircuitDef* cdef) { return cdef->IsRadar(); };
-						} else if (bi.cdef->IsSonar()) {
-							isSensor = [](CCircuitDef* cdef) { return cdef->IsSonar(); };
-						} else {
-							isValid = false;
-							break;
-						}
-						COOAICallback* clb = circuit->GetCallback();
-						const auto& friendlies = clb->GetFriendlyUnitIdsIn(buildPos, bi.value);
-						for (int auId : friendlies) {
-							CCircuitDef::Id defId = clb->Unit_GetDefId(auId);
-							if (isSensor(circuit->GetCircuitDef(defId))) {
-								isValid = false;
-								break;
-							}
-						}
-					} break;
-					case SBuildInfo::Condition::CHANCE: {
-						isValid = rand() < bi.value * RAND_MAX;
-					} break;
-					case SBuildInfo::Condition::ALWAYS:
-					default: break;
-				}
-				if (!isValid) {
-					continue;
-				}
-
-				AIFloat3 offset = bi.offset;
-				if (bi.direction != SBuildInfo::Direction::NONE) {
-					switch (facing) {
-						default:
-						case UNIT_FACING_SOUTH:
-							break;
-						case UNIT_FACING_EAST:
-							offset = AIFloat3(offset.z, 0.f, -offset.x);
-							break;
-						case UNIT_FACING_NORTH:
-							offset = AIFloat3(-offset.x, 0.f, -offset.z);
-							break;
-						case UNIT_FACING_WEST:
-							offset = AIFloat3(-offset.z, 0.f, offset.x);
-							break;
-					}
-				}
-				AIFloat3 pos = buildPos + offset;
-				CTerrainManager::CorrectPosition(pos);
-				pos = terrainMgr->GetBuildPosition(bdef, pos);
-
-				IBuilderTask* task = builderMgr->Enqueue(TaskB::Common(bi.buildType, bi.priority, bi.cdef, pos, 0.f, parent == nullptr, 0));
-				if (parent == nullptr) {
-					parent = task;
-				} else {
-					parent->SetNextTask(task);
-					parent = parent->GetNextTask();
-				}
-
-				if (IBuilderTask::BuildType::DEFENCE == bi.buildType) {
-					circuit->GetMilitaryManager()->ProcessHubDefence(static_cast<CBDefenceTask*>(task));
-				}
-			}
-		}
-	}
 }
 
 #define SERIALIZE(stream, func)	\

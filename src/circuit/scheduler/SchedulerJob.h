@@ -26,6 +26,13 @@ public:
 	inline virtual ~IMainJob() = default;
 
 	virtual void Run() = 0;
+
+	// apex: a static literal naming this job, for the per-minute cost split.
+	// Unnamed jobs are billed together under "anon".
+	void SetJobName(const char* n) { jobName = n; }
+	const char* GetJobName() const { return jobName; }
+private:
+	const char* jobName = nullptr;
 };
 
 template<typename _Callable>

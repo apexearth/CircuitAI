@@ -6,11 +6,18 @@
  */
 
 #include "scheduler/Scheduler.h"
+#include "CircuitAI.h"
 #include "util/Utils.h"
 #include "util/Data.h"
 #include "util/Profiler.h"
 
+#include "Log.h"
+
 #include "angelscript/include/angelscript.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 
 namespace circuit {
 
@@ -135,7 +142,12 @@ void CScheduler::ProcessJobs(int frame)
 	std::list<OnceTask>::iterator ionce = onceTasks.begin();
 	while (ionce != onceTasks.end()) {
 		if (ionce->frame <= frame) {
-			ionce->task->Run();
+			const auto t0 = std::chrono::steady_clock::now();
+			IMainJob* job = ionce->task.get();
+			job->Run();
+			AccountJob((job->GetJobName() != nullptr) ? job->GetJobName() : "once",
+					std::chrono::duration_cast<std::chrono::microseconds>(
+							std::chrono::steady_clock::now() - t0).count());
 			ionce = onceTasks.erase(ionce);  // alternatively, onceTasks.erase(iter++);
 		} else {
 			++ionce;
@@ -145,16 +157,24 @@ void CScheduler::ProcessJobs(int frame)
 	// Process repeat tasks
 	for (auto& container : repeatTasks) {
 		if (frame - container.lastFrame >= container.frameInterval) {
-			container.task->Run();
+			const auto t0 = std::chrono::steady_clock::now();
+			IMainJob* job = container.task.get();
+			job->Run();
+			AccountJob((job->GetJobName() != nullptr) ? job->GetJobName() : "repeat",
+					std::chrono::duration_cast<std::chrono::microseconds>(
+							std::chrono::steady_clock::now() - t0).count());
 			container.lastFrame = frame;
 		}
 	}
 
 	// Process onComplete from parallel tasks
+	const auto tFin0 = std::chrono::steady_clock::now();
 	CMultiQueue<FinishTask>::ProcessFunction process = [](FinishTask& item) {
 		item.task->Run();
 	};
 	finishTasks.PopAndProcessAll(process);  // one heavy / lite ???
+	AccountJob("finish", std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - tFin0).count());
 
 	// Update task queues
 	if (!removeTasks.empty()) {
@@ -168,14 +188,92 @@ void CScheduler::ProcessJobs(int frame)
 	isProcessing = false;
 }
 
-void CScheduler::RunParallelJob(const std::shared_ptr<IThreadJob>& task)
+void CScheduler::AccountJob(const char* name, uint64_t us)
 {
-	gWorkTasks.PushBack({self, task});
+	for (SJobPerf& e : jobPerf) {
+		if (e.name == name) {  // static literals: pointer identity is enough
+			e.us += us;
+			++e.calls;
+			e.maxUs = std::max(e.maxUs, us);
+			return;
+		}
+	}
+	jobPerf.push_back({name, us, 1, us});
 }
 
-void CScheduler::RunPriorityJob(const std::shared_ptr<IThreadJob>& task)
+void CScheduler::LogJobPerf(CCircuitAI* circuit)
 {
-	gWorkTasks.PushFront({self, task});
+	std::sort(jobPerf.begin(), jobPerf.end(), [](const SJobPerf& a, const SJobPerf& b) {
+		return a.us > b.us;
+	});
+	std::string line;
+	char buf[160];
+	for (const SJobPerf& e : jobPerf) {
+		if (e.us < 1000) {  // under a millisecond a minute is not the problem
+			continue;
+		}
+		snprintf(buf, sizeof(buf), " %s=%.1f/%u/%.1f", e.name, e.us / 1000.f, e.calls,
+				e.maxUs / 1000.f);
+		line += buf;
+	}
+	circuit->LOG("apex: perf jobs (ms/calls/maxMs)%s", line.c_str());
+	jobPerf.clear();
+}
+
+void CScheduler::AccountWorkJob(const char* name, uint64_t us, uint64_t waitUs, size_t qDepth)
+{
+	std::lock_guard<spring::mutex> lock(workPerfMutex);
+	workQueueSum += qDepth;
+	workQueueMax = std::max(workQueueMax, (unsigned)qDepth);
+	for (SWorkPerf& e : workPerf) {
+		if (e.name == name) {  // static literals: pointer identity is enough
+			e.us += us;
+			e.waitUs += waitUs;
+			++e.calls;
+			e.maxUs = std::max(e.maxUs, us);
+			e.maxWaitUs = std::max(e.maxWaitUs, waitUs);
+			return;
+		}
+	}
+	workPerf.push_back({name, us, waitUs, 1, us, waitUs});
+}
+
+void CScheduler::LogWorkPerf(CCircuitAI* circuit)
+{
+	std::vector<SWorkPerf> snap;
+	uint64_t qSum;
+	unsigned qMax, qCalls = 0;
+	{
+		std::lock_guard<spring::mutex> lock(workPerfMutex);
+		snap.swap(workPerf);
+		qSum = workQueueSum;
+		qMax = workQueueMax;
+		workQueueSum = 0;
+		workQueueMax = 0;
+	}
+	std::sort(snap.begin(), snap.end(), [](const SWorkPerf& a, const SWorkPerf& b) {
+		return a.us > b.us;
+	});
+	std::string line;
+	char buf[192];
+	for (const SWorkPerf& e : snap) {
+		qCalls += e.calls;
+		snprintf(buf, sizeof(buf), " %s=%.1f/%u/%.1f/w%.1f/wmax%.1f", e.name, e.us / 1000.f,
+				e.calls, e.maxUs / 1000.f, e.waitUs / 1000.f, e.maxWaitUs / 1000.f);
+		line += buf;
+	}
+	circuit->LOG("apex: perf work (ms/calls/maxMs/waitMs/maxWaitMs) qavg=%.1f qmax=%u%s",
+			(qCalls > 0) ? float(qSum) / qCalls : 0.f, qMax, line.c_str());
+}
+
+void CScheduler::RunParallelJob(const std::shared_ptr<IThreadJob>& task, const char* name)
+{
+	gWorkTasks.PushBack({self, task, name});
+}
+
+void CScheduler::RunPriorityJob(const std::shared_ptr<IThreadJob>& task, const char* name)
+{
+	gWorkTasks.PushFront({self, task, name});
 }
 
 void CScheduler::RemoveJob(const std::shared_ptr<IMainJob>& task)
@@ -213,7 +311,8 @@ void CScheduler::WorkerThread(int num)
 			gProceedCV.wait(lock, [pauseId] { return pauseId != gWorkerPauseId; });
 		}
 
-		TracyPlot("AI Jobs", (int64_t)gWorkTasks.Size());
+		const size_t qDepth = gWorkTasks.Size();
+		TracyPlot("AI Jobs", (int64_t)qDepth);
 		WorkTask container = gWorkTasks.Pop();
 
 		std::shared_ptr<CScheduler> scheduler = container.scheduler.lock();
@@ -223,7 +322,13 @@ void CScheduler::WorkerThread(int num)
 
 		if (scheduler->isRunning.load()) {
 
+			const auto t0 = std::chrono::steady_clock::now();
 			std::shared_ptr<IMainJob> onComplete = container.task->Run(num);
+			const auto t1 = std::chrono::steady_clock::now();
+			scheduler->AccountWorkJob((container.name != nullptr) ? container.name : "anon",
+					std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+					std::chrono::duration_cast<std::chrono::microseconds>(t0 - container.pushed).count(),
+					qDepth);
 			if (onComplete != nullptr) {
 				scheduler->finishTasks.PushBack(onComplete);
 			}

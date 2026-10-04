@@ -24,10 +24,12 @@
 #include "task/PlayerTask.h"
 #include "task/fighter/FighterTask.h"
 #include "unit/CircuitUnit.h"
+#include "unit/ally/AllyUnit.h"
 #include "unit/enemy/EnemyUnit.h"
 #include "unit/enemy/EnemyManager.h"
 #include "util/GameAttribute.h"
 #include "util/Utils.h"
+#include "util/ProcessClock.h"
 #include "util/Profiler.h"
 #ifdef DEBUG_VIS
 #include "map/ThreatMap.h"
@@ -59,12 +61,18 @@
 //#include "Info.h"
 #include "Mod.h"
 #include "Cheats.h"
+#include "DataDirs.h"
+#include "Info.h"
+#include "File.h"
 //#include "WrappCurrentCommand.h"
 
 #include <fstream>
+#include <sstream>
+#include <cctype>
 #include <limits>
 #include <chrono>
 #include <algorithm>
+#include <cstring>
 
 namespace circuit {
 
@@ -145,12 +153,81 @@ CCircuitAI::CCircuitAI(OOAICallback* clb)
 	ownerTeamId = teamId = skirmishAI->GetTeamId();
 	team = std::unique_ptr<Team>(WrappTeam::GetInstance(skirmishAIId, teamId));
 	allyTeamId = game->GetMyAllyTeam();
+
+	logFile = nullptr;
+	{
+		std::unique_ptr<Info> info(skirmishAI->GetInfo());
+		const char* name = info->GetValueByKey("name");
+		const char* version = info->GetValueByKey("version");
+		logTag = std::string((name != nullptr) ? name : "?") + "-" + ((version != nullptr) ? version : "?");
+		std::unique_ptr<DataDirs> dirs(clb->GetDataDirs());
+		const char* dir = dirs->GetWriteableDir();
+		if (dir != nullptr) {
+			const std::string path = std::string(dir) + "apex-t" + std::to_string(teamId) + ".log";
+			// KEEP THE LAST GAME THAT RAN (apexearth 2026-09-29: a load that died
+			// in pregame truncated the whole previous game's log). A log whose
+			// tail has an in-game frame ("[f=0...", pregame reads "[f=-") moves
+			// to .prev.log; one that never started is simply overwritten.
+			if (FILE* old = fopen(path.c_str(), "rb")) {
+				char tail[4096];
+				fseek(old, 0, SEEK_END);
+				const long size = ftell(old);
+				const long want = std::min<long>(size, sizeof(tail) - 1);
+				fseek(old, size - want, SEEK_SET);
+				const size_t got = fread(tail, 1, want, old);
+				tail[got] = '\0';
+				fclose(old);
+				if (strstr(tail, "[f=0") != nullptr) {
+					const std::string prev = std::string(dir) + "apex-t" + std::to_string(teamId) + ".prev.log";
+					remove(prev.c_str());
+					rename(path.c_str(), prev.c_str());
+				}
+			}
+			logFile = fopen(path.c_str(), "w");
+			if (logFile != nullptr) {
+				setvbuf(logFile, nullptr, _IOFBF, 1 << 16);
+				logEpochNs = utils::ProcessAgeNs();
+				logSteady0 = std::chrono::steady_clock::now();
+				LOG_ENGINE("apex: log file %s", path.c_str());
+			}
+			recPath = std::string(dir) + "apex-record.txt";
+		}
+	}
+}
+
+void CCircuitAI::LogLine(const char* msg)
+{
+	if (logFile == nullptr) {
+		GetLog()->DoLog(msg);
+		return;
+	}
+	// the engine's own prefix, so every tool reads the merged file unchanged
+	int64_t ns = logEpochNs + std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - logSteady0).count();
+	const int hh = int(ns / 3600000000000LL); ns %= 3600000000000LL;
+	const int mm = int(ns / 60000000000LL); ns %= 60000000000LL;
+	const int ss = int(ns / 1000000000LL); ns %= 1000000000LL;
+	std::lock_guard<std::mutex> lock(logMutex);
+	fprintf(logFile, "[t=%02d:%02d:%02d.%06lld][f=%07d] Skirmish AI <%s>: %s\n",
+			hh, mm, ss, (long long)(ns / 1000), (lastFrame < 0) ? -1 : lastFrame, logTag.c_str(), msg);
+}
+
+void CCircuitAI::FlushLog()
+{
+	if (logFile != nullptr) {
+		std::lock_guard<std::mutex> lock(logMutex);
+		fflush(logFile);
+	}
 }
 
 CCircuitAI::~CCircuitAI()
 {
 	if (isInitialized) {
 		Release(0);
+	}
+	if (logFile != nullptr) {
+		fclose(logFile);
+		logFile = nullptr;
 	}
 }
 
@@ -218,6 +295,31 @@ void CCircuitAI::MobileSlave(int newTeamId)
 
 int CCircuitAI::HandleGameEvent(int topic, const void* data)
 {
+	// apex: every engine event that ISN'T EVENT_UPDATE runs outside AiFrame's
+	// clock, so UnitCreated/Damaged/Destroyed and EnemyEnterLOS were being
+	// counted as engine time by every frame budget we have taken. Nanoseconds,
+	// because a single handler rounds to zero microseconds; RAII, because
+	// EVENT_INIT returns from inside the switch.
+	struct SEvtClock {
+		CCircuitAI* self;
+		bool on;
+		int topic;
+		std::chrono::steady_clock::time_point t0;
+		~SEvtClock() {
+			if (!on) {
+				return;
+			}
+			const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - t0).count();
+			self->perfEvtNs += ns;
+			++self->perfEvtCalls;
+			if ((topic >= 0) && (topic < 64)) {
+				self->perfEvtTopicNs[topic] += ns;
+				++self->perfEvtTopicN[topic];
+			}
+		}
+	} evtClock{this, topic != EVENT_UPDATE, topic, std::chrono::steady_clock::now()};
+
 	int ret = ERROR_UNKNOWN;
 
 	switch (topic) {
@@ -229,16 +331,16 @@ int CCircuitAI::HandleGameEvent(int topic, const void* data)
 				ret = this->Init(evt->skirmishAIId, evt->callback);
 			} catch (const CException& e) {
 				Release(RELEASE_CORRUPTED);
-				LOG("Exception: %s", e.what());
+				LOG_ENGINE("Exception: %s", e.what());
 				NotifyGameEnd();
 				ret = 0;
 			} catch (const std::exception& e) {
 				Release(RELEASE_CORRUPTED);
-				LOG("Lib exception: %s", e.what());
+				LOG_ENGINE("Lib exception: %s", e.what());
 				ret = ERROR_INIT;  // non-zero value deletes AI
 			} catch (...) {
 				Release(RELEASE_CORRUPTED);  // DestroyGameAttribute
-				LOG("Unknown exception");
+				LOG_ENGINE("Unknown exception");
 				ret = ERROR_INIT;  // non-zero value deletes AI
 			}
 			return ret;
@@ -303,6 +405,9 @@ int CCircuitAI::HandleGameEvent(int topic, const void* data)
 			TRACY_TOPIC_UNIT("EVENT_UNIT_DAMAGED", UnitDamaged, evt->unit);
 
 			CCircuitUnit* unit = GetTeamUnit(evt->unit);
+			if ((unit != nullptr) && (evt->attacker >= 0)) {
+				RecordTaken(evt->unit, evt->attacker, evt->damage);
+			}
 			ret = (unit != nullptr)
 					? this->UnitDamaged(unit, evt->attacker, evt->weaponDefId, AIFloat3(evt->dir_posF3))
 					: ERROR_UNIT_DAMAGED;
@@ -380,6 +485,9 @@ int CCircuitAI::HandleGameEvent(int topic, const void* data)
 			TRACY_TOPIC("EVENT_ENEMY_DAMAGED", EnemyDamaged);
 
 			struct SEnemyDamagedEvent* evt = (struct SEnemyDamagedEvent*)data;
+			if (evt->attacker >= 0) {
+				RecordDealt(evt->attacker, evt->enemy, evt->damage);
+			}
 			CEnemyInfo* enemy = GetEnemyInfo(evt->enemy);
 			ret = (enemy != nullptr) ? this->EnemyDamaged(enemy) : ERROR_ENEMY_DAMAGED;
 		} break;
@@ -564,7 +672,7 @@ void CCircuitAI::CheatPreload()
 
 int CCircuitAI::Init(int skirmishAIId, const struct SSkirmishAICallback* sAICallback)
 {
-	LOG(version);
+	LOG_ENGINE(version);
 	this->skirmishAIId = skirmishAIId;
 	callback->Init(sAICallback);
 	engine = std::unique_ptr<CEngine>(new CEngine(sAICallback, skirmishAIId));
@@ -606,6 +714,15 @@ int CCircuitAI::Init(int skirmishAIId, const struct SSkirmishAICallback* sAICall
 	InitWeaponDefs();
 	float decloakRadius;
 	InitUnitDefs(armor, decloakRadius);  // Inits TerrainData
+	for (const auto& kv : setupManager->GetModOptions()) {
+		const std::string& k = kv.first;
+		if (((k.rfind("tweakunits", 0) == 0) || (k.rfind("tweakdefs", 0) == 0)) && !kv.second.empty()) {
+			recTweaked = true;
+			LOG_ENGINE("apex: record this game only -- %s is set (tweaked stats)", k.c_str());
+			break;
+		}
+	}
+	RecordLoad();
 
 	setupManager->DisabledUnits();
 	if (!setupManager->OpenConfig(profile, cfgParts)) {
@@ -727,7 +844,7 @@ int CCircuitAI::Init(int skirmishAIId, const struct SSkirmishAICallback* sAICall
 				}
 #endif
 			});
-			scheduler->RunJobEvery(mergeTask, FRAMES_PER_SEC, FRAMES_PER_SEC * 10);
+			scheduler->RunJobEvery(mergeTask, FRAMES_PER_SEC, FRAMES_PER_SEC * 10, "merge");
 #if 0
 		} else if (allyTeam->GetAliveSize() > 2) {
 			// FIXME: Follower AI shares all its mobile non-builder-role units to Leader AI.
@@ -741,7 +858,7 @@ int CCircuitAI::Init(int skirmishAIId, const struct SSkirmishAICallback* sAICall
 					scheduler->RemoveJob(mergeTask);
 				}
 			});
-			scheduler->RunJobEvery(mergeTask, FRAMES_PER_SEC, FRAMES_PER_SEC * 10);
+			scheduler->RunJobEvery(mergeTask, FRAMES_PER_SEC, FRAMES_PER_SEC * 10, "merge");
 #endif
 		}
 	}
@@ -764,6 +881,11 @@ int CCircuitAI::Release(int reason)
 	if (!isInitialized && (reason < RELEASE_SIDE)) {
 		return 0;
 	}
+
+	for (auto& kv : teamUnits) {
+		RecordFold(kv.second, false, nullptr);
+	}
+	RecordSave();
 
 	scheduler->ProcessRelease();
 	scheduler = nullptr;
@@ -803,6 +925,7 @@ int CCircuitAI::Release(int reason)
 	mapManager = nullptr;
 
 	DrainDeferredReleases();  // before the unit dtors below release into it again
+	tgtHeld.clear();  // pure observation; must not outlive what it points at
 	for (CCircuitUnit* unit : actionUnits) {
 		if (unit->IsDead()) {  // instance is not in teamUnits
 			delete unit;
@@ -813,6 +936,9 @@ int CCircuitAI::Release(int reason)
 		delete kv.second;
 	}
 	teamUnits.clear();
+	unitsByDef.clear();
+	teamStatics.clear();
+	teamMobiles.clear();
 	garbage.clear();
 	for (CCircuitUnit* unit : deadUnits) {
 		delete unit;
@@ -822,6 +948,7 @@ int CCircuitAI::Release(int reason)
 		delete kv.second;
 	}
 	enemyInfos.clear();
+	enemyById.clear();
 	if (allyTeam != nullptr && isAllyTeamInit) {
 		allyTeam->Release();
 		allyTeam = nullptr;
@@ -879,16 +1006,28 @@ int CCircuitAI::Update(int frame)
 		}
 	}
 
+	const auto tAlly0 = std::chrono::steady_clock::now();
 	allyTeam->Update(this);
+	const auto tJobs0 = std::chrono::steady_clock::now();
+	perfAllyUs += std::chrono::duration_cast<std::chrono::microseconds>(tJobs0 - tAlly0).count();
 
 	scheduler->ProcessJobs(frame);
+	perfJobsUs += std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - tJobs0).count();
+	// Timed separately: this is AngelScript, and outside every bucket it was
+	// landing in `other`, which reads as unattributed C++ and is not.
+	const auto tScr0 = std::chrono::steady_clock::now();
 	if (frame % TEAM_SLOWUPDATE_RATE == skirmishAIId) {
 		// NOTE: Probably should be last in ProcessJobs queue, after all income updates if it was in the same frame.
 		//       Hence it is not:
 		// scheduler->RunJobEvery(CScheduler::GameJob(&CInitScript::Update, script), TEAM_SLOWUPDATE_RATE, skirmishAIId);
 		script->Update();
 	}
+	const auto tAct0 = std::chrono::steady_clock::now();
+	perfScrUs += std::chrono::duration_cast<std::chrono::microseconds>(tAct0 - tScr0).count();
 	UpdateActions();
+	perfActUs += std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - tAct0).count();
 
 #ifdef DEBUG_VIS
 	if (frame % FRAMES_PER_SEC == 0) {
@@ -948,10 +1087,41 @@ int CCircuitAI::Update(int frame)
 				nE, (nE > 0) ? float(uE) / nE : 0.f, mE);
 	}
 
+	// apex: one holder probe per frame (see tgtCursor in the header). upper_bound
+	// rather than a kept iterator: teamUnits is mutated by death every frame.
+	if (!teamUnits.empty()) {
+		auto it = teamUnits.upper_bound(tgtCursor);
+		if (it == teamUnits.end()) {
+			it = teamUnits.begin();
+		}
+		tgtCursor = it->first;
+		CCircuitUnit* probe = it->second;
+		if ((probe != nullptr) && !probe->IsDead() && (probe->GetUnit() != nullptr)) {
+			const float tid = probe->GetUnit()->GetRulesParamFloat("targetID", -2.f);
+			// S7 done on a unit we KNOW we enrolled. The first version of this
+			// log fired at frame 0 on the commander, before any set-target had
+			// ever been sent, read the -2 default and was taken to mean the
+			// param is dead -- it is not, and every hold= it printed was real.
+			if (!tgtRawLogged && (tgtHeld.find(probe) != tgtHeld.end())) {
+				tgtRawLogged = true;
+				LOG("apex: tgthold t=%i raw targetID=%.1f on an enrolled unit"
+						" (-2 = param absent, -1 = released, >=0 = held)",
+						teamId, tid);
+			}
+			++tgtSamp;
+			if (tid >= 0.f) {
+				++tgtHold;
+			} else if (tid > -1.5f) {
+				++tgtRel;
+			}
+		}
+	}
+
 	const uint64_t perfUs = std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - perfT0).count();
 	perfFrameUs += perfUs;
 	perfFrameMaxUs = std::max(perfFrameMaxUs, perfUs);
+	FlushLog();
 	if (perfUs > 30000) {  // name any spike instantly: aligns (or not) with watched hitches
 		LOG("apex: perf SPIKE frame=%d ms=%.1f", frame, perfUs / 1000.f);
 	}
@@ -962,6 +1132,167 @@ int CCircuitAI::Update(int frame)
 				perfFrameCalls, perfFrameUs / 1000.f,
 				(perfFrameCalls > 0) ? float(perfFrameUs) / float(perfFrameCalls) : 0.f,
 				perfFrameMaxUs / 1000.f);
+		const uint64_t perfAccounted = perfAllyUs + perfJobsUs + perfActUs + perfScrUs;
+		LOG("apex: perf split allyMs=%.1f jobsMs=%.1f actMs=%.1f scrMs=%.1f otherMs=%.1f"
+				" evtMs=%.1f/%u",
+				perfAllyUs / 1000.f, perfJobsUs / 1000.f, perfActUs / 1000.f,
+				perfScrUs / 1000.f,
+				(perfFrameUs > perfAccounted) ? (perfFrameUs - perfAccounted) / 1000.f : 0.f,
+				perfEvtNs / 1000000.f, perfEvtCalls);
+		perfEvtNs = 0;
+		perfEvtCalls = 0;
+		{
+			std::string ev;
+			char buf[48];
+			for (int t = 0; t < 64; ++t) {
+				if (perfEvtTopicN[t] == 0) {
+					continue;
+				}
+				snprintf(buf, sizeof(buf), " %i=%.1f/%u", t, perfEvtTopicNs[t] / 1000000.f, perfEvtTopicN[t]);
+				ev += buf;
+				perfEvtTopicNs[t] = 0;
+				perfEvtTopicN[t] = 0;
+			}
+			LOG("apex: perf evt (topic=ms/calls)%s", ev.c_str());
+		}
+		// apex: how much WORK the O(n) helpers did, not how long they took --
+		// a visited count that grows faster than the unit count names the
+		// quadratic helper without a clock in the hot loop.
+		if (mapManager != nullptr) {
+			CWreckField& wf = mapManager->GetWreckField();
+			perfFeatSweep = wf.perfSweep; perfFeatCalls = wf.perfCalls;
+			LOG("apex: perf wreckfield scanned=%llu items=%i version=%i",
+					(unsigned long long)wf.perfScanned, wf.GetCount(), wf.GetVersion());
+			wf.perfSweep = 0; wf.perfCalls = 0; wf.perfScanned = 0;
+		}
+		LOG("apex: perf sweep feat=%llu/%u reach=%llu/%u own=%llu/%u ecost=%llu/%u",
+				(unsigned long long)perfFeatSweep, perfFeatCalls,
+				(unsigned long long)perfReachSweep, perfReachCalls,
+				(unsigned long long)perfOwnSweep, perfOwnCalls,
+				(unsigned long long)perfEcostSweep, perfEcostCalls);
+		// apex: the reach envelope itself, not its cost. worst is the deepest
+		// inside-an-enemy's-reach any caller was told it stood this minute, and
+		// maxReach the largest envelope in the cache: a strategic launcher
+		// leaking into it reads map-scale in both.
+		LOG("apex: perf reach worst=%.0f maxReach=%.0f def=%s n=%u rebuildMs=%.1f/%u",
+				(perfReachWorst < std::numeric_limits<float>::max()) ? perfReachWorst : 0.f,
+				perfReachMax,
+				(perfReachMaxDef != nullptr) ? perfReachMaxDef->GetDef()->GetName() : "-",
+				(unsigned)reachCache.size(), perfReachRebuildNs / 1e6, perfReachRebuilds);
+		perfReachRebuildNs = 0;
+		perfReachRebuilds = 0;
+		perfReachWorst = std::numeric_limits<float>::max();
+		perfReachMax = 0.f;
+		perfReachMaxDef = nullptr;
+		perfFeatSweep = 0; perfFeatCalls = 0;
+		perfReachSweep = 0; perfReachCalls = 0;
+		perfOwnSweep = 0; perfOwnCalls = 0;
+		perfEcostSweep = 0; perfEcostCalls = 0;
+		LOG("apex: perf sweep ownDef=%llu/%u ownStruct=%llu/%u ownDmg=%llu/%u",
+				(unsigned long long)perfOwnDefSweep, perfOwnDefCalls,
+				(unsigned long long)perfOwnStrSweep, perfOwnStrCalls,
+				(unsigned long long)perfOwnDmgSweep, perfOwnDmgCalls);
+		perfOwnDefSweep = 0; perfOwnDefCalls = 0;
+		perfOwnStrSweep = 0; perfOwnStrCalls = 0;
+		perfOwnDmgSweep = 0; perfOwnDmgCalls = 0;
+		// apex: what we cost the ENGINE, not ourselves -- every order it has to
+		// insert, run AllowCommand over, and (when the point moved at all)
+		// re-path. rep* is the same unit being told the same thing inside 3s.
+		// dupable = moves a re-send provably could not change; DROPPED only when
+		// apex_order_dedupe is on, counted either way, so the number is what
+		// turning it on would buy rather than what it bought.
+		LOG("apex: orders t=%i move=%u fight=%u patrol=%u attack=%u target=%u dupable=%u",
+				teamId, ordSent[0], ordSent[1], ordSent[2], ordSent[3], ordSent[4], ordSup[0]);
+		LOG("apex: order-rep t=%i move same=%u lt8=%u lt32=%u lt128=%u far=%u"
+				" | fight=%u attack=%u target=%u",
+				teamId, ordRep[0][0], ordRep[0][1], ordRep[0][2], ordRep[0][3], ordRep[0][4],
+				ordRep[1][0] + ordRep[1][1] + ordRep[1][2] + ordRep[1][3] + ordRep[1][4],
+				ordRep[3][0] + ordRep[3][1] + ordRep[3][2] + ordRep[3][3] + ordRep[3][4],
+				ordRep[4][0]);
+		// apex: WHICH LOOP SENT THEM. sent/repeat-within-3s/far-repeat per call
+		// site -- the attribution the kind census cannot give, and without which
+		// every rule aimed at order volume is a guess. Order matches
+		// CCircuitUnit::OrdSrc.
+		{
+			std::string line;
+			char buf[96];
+			for (int i = 0; i < ORD_SRC_N; ++i) {
+				if (ordSrc[i][0] == 0) {
+					continue;
+				}
+				snprintf(buf, sizeof(buf), " %s=%u/%u/%u",
+						CCircuitUnit::OrdSrcName(i),
+						ordSrc[i][0], ordSrc[i][1], ordSrc[i][2]);
+				line += buf;
+			}
+			LOG("apex: order-src t=%i (sent/rep/far) arcflip=%u/%u units=%u/%u%s",
+					teamId, arcFlip[0], arcFlip[1], arcFlipU[0], arcFlipU[1],
+					line.c_str());
+			std::string ref;
+			for (int i = 0; i < ORD_SRC_N; ++i) {
+				if (ordRefused[i] == 0) { continue; }
+				snprintf(buf, sizeof(buf), " %s=%u", CCircuitUnit::OrdSrcName(i), ordRefused[i]);
+				ref += buf;
+				ordRefused[i] = 0;
+			}
+			if (!ref.empty()) {
+				LOG("apex: order-refused t=%i (a lower-ranked centre tried to overwrite a live decision)%s", teamId, ref.c_str());
+			}
+		}
+		// apex: mirror the gadget's own un-enrolments before counting, or `own`
+		// only ever grows: it drops a dead target (n%5 checkTarget) and, for
+		// anything but a building, one gone from radar+los (n%15
+		// removeUnseenTarget, alwaysSeen = isBuilding). dead must stay 0.
+		unsigned ownStale = 0, ownDead = 0, ownGone = 0;
+		for (auto it = tgtHeld.begin(); it != tgtHeld.end(); ) {
+			CCircuitUnit* u = *it;
+			if (u->IsDead()) {
+				++ownDead;
+				it = tgtHeld.erase(it);
+				continue;
+			}
+			CEnemyInfo* e = GetEnemyInfo(u->GetTgtHeldId());
+			const CCircuitDef* edef = (e != nullptr) ? e->GetCircuitDef() : nullptr;
+			if ((e == nullptr)
+				|| ((edef != nullptr) && edef->IsMobile() && !e->IsInRadarOrLOS()))
+			{
+				++ownGone;
+				it = tgtHeld.erase(it);
+				continue;
+			}
+			if (u->GetTarget() == nullptr) {
+				++ownStale;
+			}
+			++it;
+		}
+		LOG("apex: tgthold t=%i own=%u stale=%u dead=%u gone=%u | samp=%u hold=%u rel=%u"
+				" est=%.1f units=%u",
+				teamId, (unsigned)tgtHeld.size(), ownStale, ownDead, ownGone,
+				tgtSamp, tgtHold, tgtRel,
+				(tgtSamp > 0) ? float(tgtHold) / tgtSamp * teamUnits.size() : 0.f,
+				(unsigned)teamUnits.size());
+		tgtSamp = 0;
+		tgtHold = 0;
+		tgtRel = 0;
+		for (int k = 0; k < 5; ++k) {
+			ordSent[k] = 0;
+			ordSup[k] = 0;
+			for (int b = 0; b < 5; ++b) {
+				ordRep[k][b] = 0;
+			}
+		}
+		for (int k = 0; k < ORD_SRC_N; ++k) {
+			ordSrc[k][0] = ordSrc[k][1] = ordSrc[k][2] = 0;
+		}
+		arcFlip[0] = arcFlip[1] = 0;
+		arcFlipU[0] = arcFlipU[1] = 0;
+		scheduler->LogJobPerf(this);
+		scheduler->LogWorkPerf(this);
+		GetAllyTeam()->LogMapPerf(this);
+		perfAllyUs = 0;
+		perfJobsUs = 0;
+		perfActUs = 0;
+		perfScrUs = 0;
 		perfFrameUs = 0;
 		perfFrameMaxUs = 0;
 		perfFrameCalls = 0;
@@ -1277,9 +1608,22 @@ int CCircuitAI::UnitMoveFailed(CCircuitUnit* unit)
 	}
 
 	if (unit->IsMoveFailed(lastFrame)) {
+		// The commander is never written off: a permanent stuck flag swallowed
+		// every idle and move-failed event after minute 6.7 while a Reclaim of
+		// himself sat in the queue. The script's pen test frees him.
+		if (unit->GetCircuitDef()->IsRoleComm()) {
+			unit->ClearStuck();
+			LOG("apex: move-failed commander #%d", unit->GetId());
+			return 0;  // signaling: OK
+		}
+		// ROAM unsticks a fighter; on a builder it was permanent, and a
+		// roaming commander is the one that chases "into the sunset".
+		const bool roam = !unit->GetCircuitDef()->IsBuilder();
 		TRY_UNIT(this, unit,
 			unit->CmdStop();
-			unit->CmdSetMoveState(CCircuitDef::MoveType::ROAM);
+			if (roam) {
+				unit->CmdSetMoveState(CCircuitDef::MoveType::ROAM);
+			}
 		)
 //		Garbage(unit, "stuck");
 		GetBuilderManager()->Enqueue(TaskB::Reclaim(IBuilderTask::Priority::NORMAL, unit));
@@ -1319,6 +1663,7 @@ int CCircuitAI::UnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker)
 	const bool firstDeath = destroyed.insert(unit->GetId()).second;
 	if (firstDeath) {
 		NoteTrade(false, unit->GetCircuitDef());
+		RecordFold(unit, true, (attacker != nullptr) ? attacker->GetCircuitDef() : nullptr);
 		// Feeds the attack hotspot: where we are losing things is the best
 		// evidence available of where the enemy actually is. (Repeated calls
 		// were also multiplying this and NoteTrade -- pre-existing.)
@@ -1377,6 +1722,13 @@ int CCircuitAI::UnitGiven(ICoreUnit::Id unitId, int oldTeamId, int newTeamId)
 		module->UnitGiven(unit, oldTeamId, newTeamId);
 	}
 
+	// The modules run their UnitFinished above; the script never heard of the
+	// unit, so a gifted constructor was missing from our own count and the
+	// giver kept sending more.
+	if (!IsLoadSave() && !unit->IsDead() && !unit->GetUnit()->IsBeingBuilt()) {
+		script->UnitGiven(unit);
+	}
+
 	return 0;  // signaling: OK
 }
 
@@ -1418,7 +1770,8 @@ int CCircuitAI::EnemyEnterLOS(CEnemyInfo* enemy)
 	for (int fId : friendlies) {
 		CCircuitUnit* unit = GetTeamUnit(fId);
 		if ((unit != nullptr) && (unit->GetTask()->GetType() != IUnitTask::Type::NIL)) {
-			unit->ForceUpdate(lastFrame + THREAT_UPDATE_RATE);
+			// A sudden threat appearing IS news about where to be.
+			unit->ForceUpdate(lastFrame + THREAT_UPDATE_RATE, CCircuitUnit::Wake::RECONSIDER);
 		}
 	}
 
@@ -1632,7 +1985,13 @@ CCircuitUnit* CCircuitAI::RegisterTeamUnit(ICoreUnit::Id unitId, Unit* u)
 	std::tie(area, isValid) = terrainManager->GetCurrentMapArea(cdef, unit->GetPos(lastFrame));
 	unit->SetArea(area);
 
-	teamUnits[unitId] = unit;
+	auto slot = teamUnits.emplace(unitId, unit);
+	if (!slot.second) {  // re-register: the old instance leaves the indices first
+		IndexTeamUnit(slot.first->second, false);
+		tgtHeld.erase(slot.first->second);
+		slot.first->second = unit;
+	}
+	IndexTeamUnit(unit, true);
 	cdef->Inc();
 
 	// FIXME: Sometimes area where factory is placed is not suitable for its units.
@@ -1645,7 +2004,9 @@ CCircuitUnit* CCircuitAI::RegisterTeamUnit(ICoreUnit::Id unitId, Unit* u)
 
 void CCircuitAI::UnregisterTeamUnit(CCircuitUnit* unit)
 {
+	IndexTeamUnit(unit, false);
 	teamUnits.erase(unit->GetId());
+	tgtHeld.erase(unit);  // the gadget's UnitDestroyed does the same on its side
 	unit->GetCircuitDef()->Dec();
 
 	/*(unit->GetTask() == nullptr) ? DeleteTeamUnit(unit) : */unit->SetIsDead();
@@ -1654,6 +2015,7 @@ void CCircuitAI::UnregisterTeamUnit(CCircuitUnit* unit)
 void CCircuitAI::DeleteTeamUnit(CCircuitUnit* unit)
 {
 	garbage.erase(unit);
+	tgtHeld.erase(unit);  // last chance before the instance is deleted
 	deadUnits.insert(unit);  // deferred to Release(); see deadUnits decl
 }
 
@@ -1713,13 +2075,41 @@ float CCircuitAI::GetTeamMetalIncome(int otherTeamId) const
 	return game->GetRulesParamFloat(key.c_str(), -1.f);
 }
 
-float CCircuitAI::GetTunable(const char* name, float defVal) const
+float CCircuitAI::GetTunable(const std::string& name, float defVal) const
 {
 	auto it = tunables.find(name);
 	if (it != tunables.end()) {
 		return it->second;
 	}
-	const float value = (game != nullptr) ? game->GetRulesParamFloat(name, defVal) : defVal;
+	// THIS BOT'S OWN OPTION OUTRANKS THE GAME-WIDE RULES PARAM. A rules param is
+	// set once for the match, so it can never say "this bot plays the eco seat
+	// and that one does not" -- which is what the lobby's per-AI options are for
+	// (apexearth 2026-09-22: "add one of these AI in multiplayer and check a box
+	// to say I want it to be an eco AI"). Read once, because GetOptionValues
+	// allocates.
+	if (!aiOptsRead) {
+		aiOptsRead = true;
+		springai::SkirmishAI* ai = GetSkirmishAI();
+		if (ai != nullptr) {
+			springai::OptionValues* opts = ai->GetOptionValues();
+			if (opts != nullptr) {
+				const int n = opts->GetSize();
+				for (int i = 0; i < n; ++i) {
+					aiOpts[opts->GetKey(i)] = opts->GetValue(i);
+				}
+				delete opts;
+			}
+		}
+	}
+	auto ov = aiOpts.find(name);
+	if (ov != aiOpts.end()) {
+		try {
+			const float value = std::stof(ov->second);
+			tunables[name] = value;
+			return value;
+		} catch (...) {}
+	}
+	const float value = (game != nullptr) ? game->GetRulesParamFloat(name.c_str(), defVal) : defVal;
 	tunables[name] = value;
 	return value;
 }
@@ -1736,9 +2126,12 @@ float CCircuitAI::GetDefBuildProgress(CCircuitDef* def) const
 		return -1.f;
 	}
 	float best = -1.f;
-	for (const auto& kv : teamUnits) {
-		CCircuitUnit* u = kv.second;
-		if ((u == nullptr) || (u->GetCircuitDef() != def)) {
+	auto bucket = unitsByDef.find(def->GetId());
+	if (bucket == unitsByDef.end()) {
+		return best;
+	}
+	for (CCircuitUnit* u : bucket->second) {
+		if (u->GetCircuitDef() != def) {
 			continue;
 		}
 		const float p = u->GetUnit()->GetBuildProgress();
@@ -1826,6 +2219,400 @@ void CCircuitAI::NoteTrade(bool isKill, CCircuitDef* cdef)
 	}
 }
 
+// THE EXCHANGE MATRIX. A hit is worth the victim's cost times the share of
+// its health it took, so the cell (A, B) is metal of B that our A destroyed
+// against metal of A that their B destroyed; 1 = an even trade. The prior
+// counts apex_record_prior A's worth of metal at 1 so one fight cannot
+// condemn a pair, and apex_record_window A's worth caps what the file
+// remembers, so it stays a moving average.
+bool CCircuitAI::RecordCounts(CCircuitDef* cdef)
+{
+	return (cdef != nullptr) && cdef->IsAttacker() && !cdef->IsRoleBuilder() && !cdef->IsRoleComm();
+}
+
+float CCircuitAI::MetalOf(CCircuitDef* cdef, float damage)
+{
+	const float hp = cdef->GetHealth();
+	if (hp <= .0f) {
+		return .0f;
+	}
+	const float share = damage / hp;
+	return ((share > 1.f) ? 1.f : share) * cdef->GetCostM();
+}
+
+int CCircuitAI::RecordTierOf(CCircuitDef::Id id) const
+{
+	auto it = recTier.find(id);
+	if (it == recTier.end()) {
+		return 0;
+	}
+	return std::max(0, std::min(3, it->second));
+}
+
+void CCircuitAI::RecordDealt(ICoreUnit::Id attacker, ICoreUnit::Id enemy, float damage)
+{
+	if (damage <= .0f) {
+		return;
+	}
+	CCircuitUnit* ours = GetTeamUnit(attacker);
+	if (ours == nullptr) {
+		return;
+	}
+	recDealt[attacker] += damage;
+	CEnemyInfo* e = GetEnemyInfo(enemy);
+	CCircuitDef* a = ours->GetCircuitDef();
+	CCircuitDef* b = (e != nullptr) ? e->GetCircuitDef() : nullptr;
+	// Both sides armed: a mex we shelled is raid value, not a matchup.
+	if (!RecordCounts(a) || !RecordCounts(b)) {
+		return;
+	}
+	const float m = MetalOf(b, damage);
+	recGame[RecordKey(a->GetId(), b->GetId())].dealt += m;
+	if (!recAggDirty) {
+		RecordAggAdd(a->GetId(), b->GetId(), m, .0f);
+	}
+}
+
+void CCircuitAI::RecordTaken(ICoreUnit::Id unit, ICoreUnit::Id attacker, float damage)
+{
+	if ((damage <= .0f) || (GetTeamUnit(attacker) != nullptr)) {
+		return;
+	}
+	CCircuitUnit* ours = GetTeamUnit(unit);
+	CEnemyInfo* e = GetEnemyInfo(attacker);
+	if ((ours == nullptr) || (e == nullptr)) {
+		return;
+	}
+	CCircuitDef* a = ours->GetCircuitDef();
+	CCircuitDef* b = e->GetCircuitDef();
+	if (!RecordCounts(a) || !RecordCounts(b)) {
+		return;
+	}
+	const float m = MetalOf(a, damage);
+	recGame[RecordKey(a->GetId(), b->GetId())].taken += m;
+	if (!recAggDirty) {
+		RecordAggAdd(a->GetId(), b->GetId(), .0f, m);
+	}
+}
+
+// The death line: what this unit dealt over its own health, and what killed
+// it -- the instrument tools/record.py reads for "what died to what". The
+// matrix itself is fed per hit above, so nothing is folded here.
+void CCircuitAI::RecordFold(CCircuitUnit* unit, bool died, CCircuitDef* killer)
+{
+	CCircuitDef* cdef = unit->GetCircuitDef();
+	auto it = recDealt.find(unit->GetId());
+	const float dealt = (it != recDealt.end()) ? it->second : .0f;
+	if (it != recDealt.end()) {
+		recDealt.erase(it);
+	}
+	if (!RecordCounts(cdef) || !unit->IsFinished() || !cdef->IsMobile()) {
+		return;
+	}
+	const float hp = cdef->GetHealth();
+	if (hp <= .0f) {
+		return;
+	}
+	const CCircuitDef::Id kid = (killer != nullptr) ? killer->GetId() : 0;
+	LOG("apex: record %s %s dealt=%.0f hp=%.0f r=%.2f avg=%.2f n=%d killed-by=%s t%d vs=%.2f nVs=%d",
+			cdef->GetDef()->GetName(), died ? "died" : "alive", dealt, hp, dealt / hp,
+			RecordRatio(cdef, -1), RecordCount(cdef, -1),
+			(killer != nullptr) ? killer->GetDef()->GetName() : "-", RecordTierOf(kid),
+			RecordRatioVs(cdef, killer), RecordCountVs(cdef, killer));
+}
+
+void CCircuitAI::RecordSum(CCircuitDef::Id a, CCircuitDef::Id b, float& dealt, float& taken) const
+{
+	const long long key = RecordKey(a, b);
+	for (const auto* m : {&recGame, &recStored}) {
+		auto f = m->find(key);
+		if (f != m->end()) {
+			dealt += f->second.dealt; taken += f->second.taken;
+		}
+	}
+}
+
+// One cell into both rows it belongs to: A's own, and B's inverted -- THEIR
+// copies of a type against ours count for that type, so being outnumbered
+// does not read as a bad unit (his 2026-09-28). A cell with no known opponent
+// counts at every tier.
+void CCircuitAI::RecordAggAdd(CCircuitDef::Id a, CCircuitDef::Id b, float dealt, float taken) const
+{
+	SXch* ra = recAgg[a].s;
+	ra[0].dealt += dealt; ra[0].taken += taken;
+	if (b == 0) {
+		for (int k = 1; k < 5; ++k) {
+			ra[k].dealt += dealt; ra[k].taken += taken;
+		}
+		return;
+	}
+	const int kb = RecordTierOf(b) + 1;
+	ra[kb].dealt += dealt; ra[kb].taken += taken;
+	SXch& col = recAgg[b].col;
+	col.dealt += taken; col.taken += dealt;
+	if (b != a) {
+		SXch* rb = recAgg[b].s;
+		const int ka = RecordTierOf(a) + 1;
+		rb[0].dealt += taken; rb[0].taken += dealt;
+		rb[ka].dealt += taken; rb[ka].taken += dealt;
+	}
+}
+
+const CCircuitAI::SXch& CCircuitAI::RecordAggOf(CCircuitDef::Id id, int tier) const
+{
+	if (recAggDirty) {
+		recAgg.clear();
+		for (const auto* m : {&recGame, &recStored}) {
+			for (const auto& kv : *m) {
+				RecordAggAdd(CCircuitDef::Id(kv.first / 65536), CCircuitDef::Id(kv.first % 65536),
+						kv.second.dealt, kv.second.taken);
+			}
+		}
+		recAggDirty = false;
+	}
+	static const SXch none;
+	auto it = recAgg.find(id);
+	if (it == recAgg.end()) {
+		return none;
+	}
+	return it->second.s[(tier < 0) ? 0 : (std::min(3, tier) + 1)];
+}
+
+float CCircuitAI::RecordRatio(CCircuitDef* cdef, int tier) const
+{
+	if (!RecordCounts(cdef)) {
+		return 1.f;
+	}
+	const float prior = GetTunable("apex_record_prior", 10.f) * cdef->GetCostM();
+	const SXch& g = RecordAggOf(cdef->GetId(), tier);
+	return (prior + g.dealt) / (prior + g.taken);
+}
+
+int CCircuitAI::RecordCount(CCircuitDef* cdef, int tier) const
+{
+	if ((cdef == nullptr) || (cdef->GetCostM() <= .0f)) {
+		return 0;
+	}
+	return int(RecordAggOf(cdef->GetId(), tier).taken / cdef->GetCostM() + 0.5f);
+}
+
+// The pair's own exchange, shrunk toward B's tier read: a matchup with no
+// history prices as its tier does, and earns its own number as the hits
+// come in.
+float CCircuitAI::RecordRatioVs(CCircuitDef* cdef, CCircuitDef* foe) const
+{
+	if (!RecordCounts(cdef)) {
+		return 1.f;
+	}
+	const CCircuitDef::Id bid = (foe != nullptr) ? foe->GetId() : 0;
+	const float base = RecordRatio(cdef, RecordTierOf(bid));
+	const float prior = GetTunable("apex_record_prior", 10.f) * cdef->GetCostM();
+	float dealt = prior * base, taken = prior;
+	RecordSum(cdef->GetId(), bid, dealt, taken);
+	if (bid != 0) {
+		float theirDealt = .0f, theirTaken = .0f;   // their A against our B
+		RecordSum(bid, cdef->GetId(), theirTaken, theirDealt);
+		dealt += theirDealt; taken += theirTaken;
+	}
+	return dealt / taken;
+}
+
+int CCircuitAI::RecordCountVs(CCircuitDef* cdef, CCircuitDef* foe) const
+{
+	if ((cdef == nullptr) || (cdef->GetCostM() <= .0f)) {
+		return 0;
+	}
+	float dealt = .0f, taken = .0f;
+	RecordSum(cdef->GetId(), (foe != nullptr) ? foe->GetId() : 0, dealt, taken);
+	return int(taken / cdef->GetCostM() + 0.5f);
+}
+
+// Their B against our A is the same cell inverted; ours == nullptr reads
+// B's whole column.
+float CCircuitAI::RecordFoeRatio(CCircuitDef* edef, CCircuitDef* ours) const
+{
+	if (edef == nullptr) {
+		return 1.f;
+	}
+	const float prior = GetTunable("apex_record_prior", 10.f) * edef->GetCostM();
+	float dealt = prior, taken = prior;   // from B's side: dealt = our taken
+	if (ours != nullptr) {
+		float ourDealt = .0f, ourTaken = .0f;
+		RecordSum(ours->GetId(), edef->GetId(), ourDealt, ourTaken);
+		dealt += ourTaken; taken += ourDealt;
+		return dealt / taken;
+	}
+	RecordAggOf(edef->GetId(), -1);   // builds the totals if stale
+	auto it = recAgg.find(edef->GetId());
+	if (it != recAgg.end()) {
+		dealt += it->second.col.dealt; taken += it->second.col.taken;
+	}
+	return dealt / taken;
+}
+
+// What the enemy fields, as this AI knows it: every live known enemy with a
+// def that shoots, by metal. Static defence counts -- towers were the top
+// killer in the first read.
+void CCircuitAI::RecordFoeRefresh()
+{
+	if ((recFoeFrame >= 0) && (lastFrame < recFoeFrame + FRAMES_PER_SEC * 10)) {
+		return;
+	}
+	recFoeFrame = lastFrame;
+	std::unordered_map<CCircuitDef*, float> byDef;
+	for (const auto& kv : enemyInfos) {
+		CEnemyInfo* e = kv.second;
+		if ((e == nullptr) || e->GetData()->IsDead() || e->GetData()->IsDying()) {
+			continue;
+		}
+		CCircuitDef* d = e->GetCircuitDef();
+		if ((d == nullptr) || !d->IsAttacker() || d->IsRoleBuilder()) {
+			continue;
+		}
+		byDef[d] += d->GetCostM();
+	}
+	recFoe.assign(byDef.begin(), byDef.end());
+	recFoeTotal = .0f;
+	for (const auto& kv : recFoe) {
+		recFoeTotal += kv.second;
+	}
+}
+
+// Surface power of ALLIED players' ground combat units near pos -- ours are
+// excluded, the script already counts them. The withdraw odds read only our
+// own army, so in a team game every AI saw itself outgunned beside its allies
+// (apexearth 2026-09-26: "maybe our teams just don't fight well together").
+float CCircuitAI::GetAllyPowerAt(const AIFloat3& pos, float radius)
+{
+	// The allied armed mobiles, listed once a frame: the withdraw pass asks per
+	// unit, and each ask walked every friendly unit and structure on the team.
+	const int frame = GetLastFrame();
+	if (allyPowerFrame != frame) {
+		allyPowerFrame = frame;
+		allyPowerList.clear();
+		for (auto& kv : GetFriendlyUnits()) {
+			CAllyUnit* u = kv.second;
+			if ((u == nullptr) || (GetTeamUnit(kv.first) != nullptr)) {
+				continue;
+			}
+			CCircuitDef* cdef = u->GetCircuitDef();
+			if ((cdef == nullptr) || !cdef->IsMobile() || !cdef->IsAttacker() || cdef->IsAbleToFly()) {
+				continue;
+			}
+			allyPowerList.emplace_back(u->GetLastPos(), cdef->GetSurfThreat());
+		}
+	}
+	const float sqR = radius * radius;
+	float sum = 0.f;
+	for (const auto& e : allyPowerList) {
+		if (e.first.SqDistance2D(pos) <= sqR) {
+			sum += e.second;
+		}
+	}
+	return sum;
+}
+
+float CCircuitAI::RecordRatioMix(CCircuitDef* cdef)
+{
+	if (!RecordCounts(cdef)) {
+		return 1.f;
+	}
+	RecordFoeRefresh();
+	if (recFoeTotal <= 1.f) {
+		return RecordRatio(cdef, -1);
+	}
+	float r = .0f;
+	for (const auto& kv : recFoe) {
+		r += (kv.second / recFoeTotal) * RecordRatioVs(cdef, kv.first);
+	}
+	return r;
+}
+
+// One line per cell: "ours theirs dealtM takenM". Older files (death
+// buckets, "name killer dealt health n") are not the same quantity and are
+// skipped, so the matrix starts clean.
+static void RecordRead(const std::string& path, std::map<std::pair<std::string, std::string>, CCircuitAI::SXch>& out)
+{
+	std::ifstream in(path);
+	std::string line;
+	while (std::getline(in, line)) {
+		std::istringstream ss(line);
+		std::vector<std::string> f;
+		std::string tok;
+		while (ss >> tok) {
+			f.push_back(tok);
+		}
+		if ((f.size() != 4) || (f[1] == "-") || std::isdigit((unsigned char)f[1][0])) {
+			continue;
+		}
+		try {
+			CCircuitAI::SXch x;
+			x.dealt = std::stof(f[2]);
+			x.taken = std::stof(f[3]);
+			out[std::make_pair(f[0], f[1])] = x;
+		} catch (const std::exception&) {
+			continue;
+		}
+	}
+}
+
+void CCircuitAI::RecordLoad()
+{
+	recStored.clear();
+	recAggDirty = true;
+	if (recPath.empty() || recTweaked) {
+		return;
+	}
+	std::map<std::pair<std::string, std::string>, SXch> byName;
+	RecordRead(recPath, byName);
+	for (auto& kv : byName) {
+		CCircuitDef* a = GetCircuitDef(kv.first.first.c_str());
+		CCircuitDef* b = GetCircuitDef(kv.first.second.c_str());
+		if ((a == nullptr) || (b == nullptr)) {
+			continue;
+		}
+		recStored[RecordKey(a->GetId(), b->GetId())] = kv.second;
+	}
+	LOG_ENGINE("apex: record loaded %d cells from %s", (int)recStored.size(), recPath.c_str());
+}
+
+// Re-read before writing: every AI in this process saves its own game onto
+// whatever the file holds by then, so eight teams do not overwrite each other.
+void CCircuitAI::RecordSave()
+{
+	if (recPath.empty() || recTweaked || recGame.empty()) {
+		return;
+	}
+	std::map<std::pair<std::string, std::string>, SXch> all;
+	RecordRead(recPath, all);
+	const float window = GetTunable("apex_record_window", 40.f);
+	for (auto& kv : recGame) {
+		CCircuitDef* a = GetCircuitDef(CCircuitDef::Id(kv.first / 65536));
+		CCircuitDef* b = GetCircuitDef(CCircuitDef::Id(kv.first % 65536));
+		if ((a == nullptr) || (b == nullptr)) {
+			continue;
+		}
+		SXch& x = all[std::make_pair(std::string(a->GetDef()->GetName()), std::string(b->GetDef()->GetName()))];
+		x.dealt += kv.second.dealt;
+		x.taken += kv.second.taken;
+		const float cap = window * a->GetCostM();
+		if ((cap > .0f) && (x.taken > cap)) {
+			const float k = cap / x.taken;
+			x.dealt *= k;
+			x.taken *= k;
+		}
+	}
+	std::ofstream out(recPath, std::ios::trunc);
+	if (!out.is_open()) {
+		LOG_ENGINE("apex: record NOT saved: %s", recPath.c_str());
+		return;
+	}
+	for (auto& kv : all) {
+		out << kv.first.first << ' ' << kv.first.second << ' ' << kv.second.dealt << ' ' << kv.second.taken << std::endl;
+	}
+	LOG_ENGINE("apex: record saved %d cells (%d this game) -> %s", (int)all.size(), (int)recGame.size(), recPath.c_str());
+}
+
 // Kills over losses, lately. 1.0 means even. Returns 1.0 until enough has
 // happened to mean anything -- an unproven ratio must not tighten the engage
 // test, or the opening (no fights yet, or one dead scout) reads as a collapse.
@@ -1896,75 +2683,239 @@ int CCircuitAI::GetBaseGridFacing(const AIFloat3& pos) const
 // the position is outside the base entirely. Everything that must sit on a
 // specific piece of ground (a metal spot, a geo vent, a tower on the front) is
 // excluded by the CALLER on build type; this only knows about geometry.
-bool CCircuitAI::SnapToBaseGrid(const AIFloat3& pos, AIFloat3& outPos,
-		CCircuitDef* def, int facing) const
+// Distance from an offset on either base axis to the nearest walkway centre.
+static inline float LaneGapAt(float u, float pitch)
 {
-	if ((gridCell <= .0f) || !utils::is_valid(gridAnchor) || !utils::is_valid(pos)) {
+	return std::fabs(u - std::round(u / pitch) * pitch);
+}
+
+// The first cell clear of the walkway, on the side the offset already sits.
+static inline float PushOutOfLane(float u, float cell, float pitch, float half)
+{
+	const float centre = std::round(u / pitch) * pitch;
+	const float gap = std::fabs(u - centre);
+	if (gap >= half) {
+		return u;
+	}
+	const float push = std::ceil((half - gap) / cell) * cell;
+	return u + ((u >= centre) ? push : -push);
+}
+
+bool CCircuitAI::IsInBaseLane(const AIFloat3& pos) const
+{
+	if ((gridLanePitch <= .0f) || (gridLaneHalf <= .0f)
+		|| !utils::is_valid(gridAnchor) || !utils::is_valid(pos))
+	{
 		return false;
 	}
 	const float dx = pos.x - gridAnchor.x;
 	const float dz = pos.z - gridAnchor.z;
 	if ((dx * dx + dz * dz) > (gridRange * gridRange)) {
-		return false;  // not in the base; leave it where the rule wanted it
+		return false;  // not in the base; the streets are a base layout, not a map one
 	}
-
-	// Into the base frame: `depth` runs backward from the anchor, `lat` across.
 	const float depth = -(dx * gridFwd.x + dz * gridFwd.z);
 	const float lat = dx * -gridFwd.z + dz * gridFwd.x;
-
-	// THE LATTICE IS PER DEF, NOT ONE CELL. gridCell is the engine build square,
-	// so rounding to it snaps nothing -- every legal position already satisfies
-	// it, and the "base grid" was a no-op. A def tiles on its own footprint (the
-	// only pitch on which two of them touch), widened by script where the death
-	// explosion makes a flush pack a single-bomb loss. Strides stay whole
-	// multiples of the footprint, so widened lattices interleave exactly.
-	float cellLat = gridCell;
-	float cellDepth = gridCell;
-	if (def != nullptr) {
-		// The frame is snapped to a cardinal, and an east/west facing swaps the
-		// footprint axes, so the across-axis stride is X or Z depending on facing.
-		const bool swap = ((facing != UNIT_NO_FACING) && ((facing & 1) == 1));
-		cellLat = swap ? def->GetLatticeStrideZ() : def->GetLatticeStrideX();
-		cellDepth = swap ? def->GetLatticeStrideX() : def->GetLatticeStrideZ();
-		if (cellLat < gridCell) cellLat = gridCell;
-		if (cellDepth < gridCell) cellDepth = gridCell;
+	if (depth > .0f) {
+		return false;  // behind the anchor is the economy: no streets (script LanesApply)
 	}
-	float sLat = std::round(lat / cellLat) * cellLat;
-	const float sDepth = std::round(depth / cellDepth) * cellDepth;
+	return (LaneGapAt(lat, gridLanePitch) < gridLaneHalf)
+		|| (LaneGapAt(depth, gridLanePitch) < gridLaneHalf);
+}
 
-	// Walkways are defined on the lateral axis, so a snapped column that lands in
-	// one is pushed sideways to the first cell clear of it. Without this the grid
-	// packs the corridors shut, which is the self-walling it exists to prevent.
-	if (gridLanePitch > .0f) {
-		const float laneCentre = std::round(sLat / gridLanePitch) * gridLanePitch;
-		const float gap = std::fabs(sLat - laneCentre);
-		if (gap < gridLaneHalf) {
-			const float push = std::ceil((gridLaneHalf - gap) / cellLat) * cellLat;
-			sLat += (sLat >= laneCentre) ? push : -push;
+// THE LATTICE IS PER DEF, IN WORLD AXES, PHASED FROM THE MAP'S CORNER.
+// A def tiles on its own footprint, and each cell centre already satisfies
+// the engine's parity mapping (Pos2BuildPos), so snapping is idempotent and
+// script, the ring walk and the commit agree on one set of points. Edges
+// fall on the build lines from (0,0), so defs whose pitches divide (6-cell
+// lab, 3-cell turret) pack flush, and nothing waits on the base frame --
+// which arrives after the opening solars. The frame serves only the lanes.
+void CCircuitAI::LatticeOf(CCircuitDef* def, int facing, float& px, float& pz,
+		float& ox, float& oz) const
+{
+	constexpr float BUILD_SQ = SQUARE_SIZE * 2;
+	px = BUILD_SQ;
+	pz = BUILD_SQ;
+	ox = .0f;
+	oz = .0f;
+	if (def == nullptr) {
+		return;
+	}
+	const bool swap = ((facing != UNIT_NO_FACING) && ((facing & 1) == 1));
+	px = swap ? def->GetLatticeStrideZ() : def->GetLatticeStrideX();
+	pz = swap ? def->GetLatticeStrideX() : def->GetLatticeStrideZ();
+	if (px < BUILD_SQ) px = BUILD_SQ;
+	if (pz < BUILD_SQ) pz = BUILD_SQ;
+	const int fx = swap ? def->GetFootZ() : def->GetFootX();
+	const int fz = swap ? def->GetFootX() : def->GetFootZ();
+	// Corner on (0,0): the centre is half a footprint in from it, and a
+	// stride that is a whole footprint keeps every further cell's edges on
+	// the build lines.
+	ox = float(fx) * SQUARE_SIZE;
+	oz = float(fz) * SQUARE_SIZE;
+}
+
+// Cell centre nearest `pos` on the def's lattice, in world axes; no lane push.
+void CCircuitAI::LatticeCell(const AIFloat3& pos, CCircuitDef* def, int facing, AIFloat3& outPos) const
+{
+	float px, pz, ox, oz;
+	LatticeOf(def, facing, px, pz, ox, oz);
+	const float kx = std::round((pos.x - ox) / px);
+	const float kz = std::round((pos.z - oz) / pz);
+	outPos = AIFloat3(ox + kx * px, pos.y, oz + kz * pz);
+}
+
+bool CCircuitAI::SnapToBaseGrid(const AIFloat3& pos, AIFloat3& outPos,
+		CCircuitDef* def, int facing) const
+{
+	if (!utils::is_valid(pos)) {
+		return false;
+	}
+	// EVERYWHERE, not only inside the base range, and from frame 0: a farm at
+	// an expansion is the same rows, and the range once left every placement
+	// past it to the square-by-square search, which is the "right and down
+	// by one" he sees.
+	AIFloat3 cell;
+	LatticeCell(pos, def, facing, cell);
+	LatticePoint(cell, def, facing, outPos);
+	return utils::is_valid(outPos);
+}
+
+// A cell pushed clear of the walkways. Walkways run on BOTH axes, so a cell
+// that lands in one is moved out by whole pitches, which keeps it on the
+// lattice. Without this the grid packs the corridors shut, which is the
+// self-walling it exists to prevent. Half the footprint is part of the gap:
+// the lane test is on the centre, and a building standing with its centre
+// exactly a half-lane out has half of itself in the street.
+void CCircuitAI::LatticePoint(const AIFloat3& cell, CCircuitDef* def, int facing, AIFloat3& outPos) const
+{
+	outPos = cell;
+	if ((gridLanePitch > .0f) && (gridLaneHalf > .0f) && utils::is_valid(gridAnchor)) {
+		float px, pz, ox, oz;
+		LatticeOf(def, facing, px, pz, ox, oz);
+		const float dx = cell.x - gridAnchor.x;
+		const float dz = cell.z - gridAnchor.z;
+		const float depth = -(dx * gridFwd.x + dz * gridFwd.z);
+		if (depth <= .0f) {  // no streets behind the anchor
+			// The base axes are world axes here (the frame is a cardinal):
+			// lat runs along z when the axis runs along x, and vice versa.
+			const bool latIsZ = std::fabs(gridFwd.x) >= std::fabs(gridFwd.z);
+			const float lat = dx * -gridFwd.z + dz * gridFwd.x;
+			const float cLat = latIsZ ? pz : px;
+			const float cDepth = latIsZ ? px : pz;
+			const float sLat = PushOutOfLane(lat, cLat, gridLanePitch, gridLaneHalf + cLat * .5f);
+			const float sDepth = PushOutOfLane(depth, cDepth, gridLanePitch, gridLaneHalf + cDepth * .5f);
+			outPos.x = gridAnchor.x - gridFwd.x * sDepth + -gridFwd.z * sLat;
+			outPos.z = gridAnchor.z - gridFwd.z * sDepth + gridFwd.x * sLat;
 		}
 	}
-
-	outPos = AIFloat3(gridAnchor.x - gridFwd.x * sDepth + -gridFwd.z * sLat,
-					  pos.y,
-					  gridAnchor.z - gridFwd.z * sDepth + gridFwd.x * sLat);
-	// Onto the engine's build lattice: Pos2BuildPos is the engine's own
-	// center-parity mapping (16k, +8 per odd half-footprint axis, facing swaps
-	// the sizes). Without it neighbouring footprints of mixed parity end up 8
-	// apart and rows never pack flush.
-	if ((def != nullptr) && (facing != UNIT_NO_FACING)) {
-		outPos = CTerrainManager::Pos2BuildPos(def, outPos, facing);
-	}
 	CTerrainManager::CorrectPosition(outPos);
-	return true;
+}
+
+bool CCircuitAI::LatticeNeighbour(const AIFloat3& snapped, CCircuitDef* def, int facing,
+		int i, int j, AIFloat3& outPos) const
+{
+	if (!utils::is_valid(snapped)) {
+		return false;
+	}
+	float px, pz, ox, oz;
+	LatticeOf(def, facing, px, pz, ox, oz);
+	// (i, j) in world axes -- the callers walk rings and floods, for which
+	// the axis names do not matter, only that the cells are the def's.
+	AIFloat3 cell(snapped.x + float(i) * px, snapped.y, snapped.z + float(j) * pz);
+	if ((cell.x < .0f) || (cell.z < .0f)
+		|| (cell.x > float(CTerrainManager::GetTerrainWidth()))
+		|| (cell.z > float(CTerrainManager::GetTerrainHeight())))
+	{
+		return false;  // off the map: open ground to the flood, nothing to the walk
+	}
+	LatticePoint(cell, def, facing, outPos);
+	return utils::is_valid(outPos);
 }
 
 // A large building found no site. Recorded rather than acted on: deciding what
 // is expendable is policy, and policy lives in AngelScript. apexearth: "when
 // theres no room to build a gantry we need to reclaim older t1 buildings."
-void CCircuitAI::NoteBuildBlocked(const springai::AIFloat3& pos)
+void CCircuitAI::NoteBuildBlocked(const springai::AIFloat3& pos, const CCircuitDef* def)
 {
 	blockedBuildPos = pos;
 	blockedBuildFrame = GetLastFrame();
+	blockedBuildDef = (def != nullptr) ? int(def->GetId()) : -1;
+	// The script polled the one slot at elections, so on a world map most marks
+	// were overwritten unread and the same walk was re-sent every few seconds.
+	if (blockedQueue.size() >= 256) {
+		blockedQueue.erase(blockedQueue.begin());
+	}
+	blockedQueue.push_back({pos, blockedBuildDef, blockedBuildFrame});
+}
+
+#define NO_PATH_TTL	(FRAMES_PER_SEC * 60)
+
+void CCircuitAI::NoteNoPath(const CCircuitDef* cdef, const springai::AIFloat3& pos)
+{
+	if ((cdef == nullptr) || (cdef->GetMobileId() < 0)) {
+		return;
+	}
+	const int si = terrainManager->GetSectorIndex(pos);
+	if (si < 0) {
+		return;
+	}
+	const int frame = GetLastFrame();
+	if (noPathMarks.size() > 4096) {
+		for (auto it = noPathMarks.begin(); it != noPathMarks.end(); ) {
+			it = (frame - it->second > NO_PATH_TTL) ? noPathMarks.erase(it) : std::next(it);
+		}
+	}
+	noPathMarks[((long long)cdef->GetMobileId() << 32) | (unsigned)si] = frame;
+}
+
+bool CCircuitAI::IsNoPath(const CCircuitDef* cdef, const springai::AIFloat3& pos) const
+{
+	if ((cdef == nullptr) || (cdef->GetMobileId() < 0) || noPathMarks.empty()) {
+		return false;
+	}
+	const int si = terrainManager->GetSectorIndex(pos);
+	if (si < 0) {
+		return false;
+	}
+	auto it = noPathMarks.find(((long long)cdef->GetMobileId() << 32) | (unsigned)si);
+	return (it != noPathMarks.end()) && (GetLastFrame() - it->second <= NO_PATH_TTL);
+}
+
+bool CCircuitAI::PopBlockedBuild(springai::AIFloat3& outPos, int& outDef)
+{
+	const int frame = GetLastFrame();
+	size_t i = 0;
+	while ((i < blockedQueue.size()) && (frame > blockedQueue[i].frame + BLOCKED_BUILD_TTL)) {
+		++i;
+	}
+	if (i >= blockedQueue.size()) {
+		blockedQueue.clear();
+		return false;
+	}
+	outPos = blockedQueue[i].pos;
+	outDef = blockedQueue[i].def;
+	blockedQueue.erase(blockedQueue.begin(), blockedQueue.begin() + i + 1);
+	return true;
+}
+
+void CCircuitAI::NoteUnsafeSite(const springai::AIFloat3& pos)
+{
+	const int frame = GetLastFrame();
+	// Ten minutes of memory, one entry per site: a refused site is refused
+	// again every election until something changes.
+	for (auto& e : unsafeSites) {
+		if (e.first.SqDistance2D(pos) < 100.f * 100.f) {
+			e.second = frame;
+			return;
+		}
+	}
+	unsafeSites.emplace_back(pos, frame);
+	while (!unsafeSites.empty() && (frame - unsafeSites.front().second > 30 * 60 * 10)) {
+		unsafeSites.erase(unsafeSites.begin());
+	}
+	if (unsafeSites.size() > 256) {
+		unsafeSites.erase(unsafeSites.begin());
+	}
 }
 
 bool CCircuitAI::GetBlockedBuildPos(springai::AIFloat3& outPos)
@@ -1977,6 +2928,36 @@ bool CCircuitAI::GetBlockedBuildPos(springai::AIFloat3& outPos)
 	}
 	outPos = blockedBuildPos;
 	return true;
+}
+
+// Keep the teamUnits indices in step. Sorted-by-id insert/erase, because a
+// std::map walk hands callers ascending ids and some of them stop at the first
+// hit -- a different order there is a different unit, not a faster answer.
+void CCircuitAI::IndexTeamUnit(CCircuitUnit* unit, bool isAdd)
+{
+	if (unit == nullptr) {
+		return;
+	}
+	CCircuitDef* cdef = unit->GetCircuitDef();
+	const ICoreUnit::Id id = unit->GetId();
+	auto byId = [](CCircuitUnit* a, ICoreUnit::Id b) { return a->GetId() < b; };
+	auto touch = [&](std::vector<CCircuitUnit*>& vec) {
+		auto it = std::lower_bound(vec.begin(), vec.end(), id, byId);
+		if (isAdd) {
+			if ((it == vec.end()) || ((*it)->GetId() != id)) {
+				vec.insert(it, unit);
+			}
+		} else if ((it != vec.end()) && (*it == unit)) {
+			// By pointer, not by id: a re-registered id owns a different
+			// instance, and dropping that one would leave the index short of
+			// a unit teamUnits still holds.
+			vec.erase(it);
+		}
+	};
+	if (cdef != nullptr) {
+		touch(unitsByDef[cdef->GetId()]);
+		touch(cdef->IsMobile() ? teamMobiles : teamStatics);
+	}
 }
 
 // Our own live units of one def near a position. Deliberately NOT filtered by
@@ -1992,15 +2973,30 @@ std::vector<CCircuitUnit*> CCircuitAI::GetOwnUnitsOfDef(CCircuitDef* def, const 
 	}
 	const float sqRadius = radius * radius;
 	const int frame = GetLastFrame();
-	for (auto& kv : teamUnits) {
-		CCircuitUnit* u = kv.second;
-		if ((u == nullptr) || (u->GetCircuitDef() != def)) {
+	auto bucket = unitsByDef.find(def->GetId());
+	if (bucket == unitsByDef.end()) {
+		++perfOwnCalls;
+		++perfOwnDefCalls;
+		return out;
+	}
+	// The def filter was the whole point of the walk, so index by it instead of
+	// re-deriving it: same units, same ascending-id order, without touching the
+	// other several hundred.
+	const std::vector<CCircuitUnit*>& mine = bucket->second;
+	perfOwnSweep += mine.size();
+	++perfOwnCalls;
+	perfOwnDefSweep += mine.size();
+	++perfOwnDefCalls;
+	for (CCircuitUnit* u : mine) {
+		if (u->GetCircuitDef() != def) {  // same id, foreign instance: the old test, kept
+			continue;
+		}
+		// Distance before IsBeingBuilt: the position is cached per frame, the
+		// engine's answer is not, and most of the team is out of radius.
+		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
 		if (u->GetUnit()->IsBeingBuilt()) {
-			continue;
-		}
-		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
 		out.push_back(u);
@@ -2011,25 +3007,48 @@ std::vector<CCircuitUnit*> CCircuitAI::GetOwnUnitsOfDef(CCircuitDef* def, const 
 std::vector<CCircuitUnit*> CCircuitAI::GetOwnStructsNear(const springai::AIFloat3& pos, float radius)
 {
 	std::vector<CCircuitUnit*> out;
+	GetOwnStructsNear(pos, radius, out);
+	return out;
+}
+
+void CCircuitAI::GetOwnStructsNear(const springai::AIFloat3& pos, float radius, std::vector<CCircuitUnit*>& out)
+{
+	out.clear();
 	const float sqRadius = radius * radius;
 	const int frame = GetLastFrame();
-	for (auto& kv : teamUnits) {
-		CCircuitUnit* u = kv.second;
-		if ((u == nullptr) || (u->GetCircuitDef() == nullptr)) {
-			continue;
-		}
-		if (u->GetCircuitDef()->IsMobile()) {
+	perfOwnSweep += teamStatics.size();
+	++perfOwnCalls;
+	perfOwnStrSweep += teamStatics.size();
+	++perfOwnStrCalls;
+	for (CCircuitUnit* u : teamStatics) {
+		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
 		if (u->GetUnit()->IsBeingBuilt()) {
 			continue;
 		}
+		out.push_back(u);
+	}
+}
+
+bool CCircuitAI::HasOwnStructNear(const springai::AIFloat3& pos, float radius)
+{
+	const float sqRadius = radius * radius;
+	const int frame = GetLastFrame();
+	++perfOwnCalls;
+	++perfOwnStrCalls;
+	for (CCircuitUnit* u : teamStatics) {
+		++perfOwnSweep;  // counts what was visited: this one stops early
+		++perfOwnStrSweep;
 		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
-		out.push_back(u);
+		if (u->GetUnit()->IsBeingBuilt()) {
+			continue;
+		}
+		return true;
 	}
-	return out;
+	return false;
 }
 
 std::vector<CCircuitUnit*> CCircuitAI::GetOwnDamagedNear(const springai::AIFloat3& pos, float radius)
@@ -2037,15 +3056,19 @@ std::vector<CCircuitUnit*> CCircuitAI::GetOwnDamagedNear(const springai::AIFloat
 	std::vector<CCircuitUnit*> out;
 	const float sqRadius = radius * radius;
 	const int frame = GetLastFrame();
-	for (auto& kv : teamUnits) {
-		CCircuitUnit* u = kv.second;
-		if ((u == nullptr) || (u->GetCircuitDef() == nullptr) || !u->GetCircuitDef()->IsMobile()) {
+	perfOwnSweep += teamMobiles.size();
+	++perfOwnCalls;
+	perfOwnDmgSweep += teamMobiles.size();
+	++perfOwnDmgCalls;
+	for (CCircuitUnit* u : teamMobiles) {
+		// Distance first: health percent is four engine round trips per unit
+		// (health, max health, capture progress) and this is called per medic
+		// and per repair election, so the team was being asked its condition
+		// thousands of times a second to answer a question about one radius.
+		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
 		if (u->GetUnit()->IsBeingBuilt() || (u->GetHealthPercent() >= 1.f)) {
-			continue;
-		}
-		if ((radius > 0.f) && (u->GetPos(frame).SqDistance2D(pos) > sqRadius)) {
 			continue;
 		}
 		out.push_back(u);
@@ -2100,6 +3123,26 @@ springai::AIFloat3 CCircuitAI::FindBuildSiteNear(CCircuitDef* def, const springa
 		return -RgtVector;
 	}
 	return tm->FindBuildSite(def, pos, radius, UNIT_NO_FACING);
+}
+
+bool CCircuitAI::CanPlaceCell(CCircuitDef* def, const springai::AIFloat3& pos, springai::AIFloat3& outCell)
+{
+	outCell = -RgtVector;
+	if ((def == nullptr) || !utils::is_valid(pos)) {
+		return false;
+	}
+	const int facing = GetBaseGridFacing(pos);
+	AIFloat3 cell;
+	if (!SnapToBaseGrid(pos, cell, def, facing)) {
+		return false;
+	}
+	outCell = cell;
+	if (!GetMap()->IsPossibleToBuildAt(def->GetDef(), cell, facing)) {
+		return false;
+	}
+	CTerrainManager* tm = GetTerrainManager();
+	const AIFloat3 p = tm->FindBuildSite(def, cell, SQUARE_SIZE * 2, facing);
+	return utils::is_valid(p) && (p.SqDistance2D(cell) <= SQUARE(SQUARE_SIZE));
 }
 
 // --- BWEM chokepoints, exposed to script -------------------------------------
@@ -2185,9 +3228,115 @@ bool CCircuitAI::IsPosOnMap(const AIFloat3& pos) const
 			&& (pos.z < terrainMgr->GetTerrainHeight());
 }
 
+// SAreaData::GetElevationAt indexes heightMap straight from the position with
+// no check of its own, and this build has asserts compiled out -- so the guards
+// are the code. The area data is double-buffered for threading and can be
+// swapped underneath a reader, hence the null test as well as the bounds one.
+// READ A FILE OUT OF THE VFS -- the game archive and the map archive both.
+//
+// File_getContent routes to CFileHandler with none of the alliance gating that
+// makes Game_getTeamResourceIncome useless (see GetTeamMetalIncome), so an AI
+// can read the same configs the gadgets read. This is how the lava tide's own
+// schedule becomes knowable at frame 0 instead of being learned a crest at a
+// time: manager/lava.as parses it.
+//
+// Empty string on any failure, including a file that is not there -- callers
+// must treat that as "no answer", never as "empty config".
+std::string CCircuitAI::ReadVfsFile(const std::string& name) const
+{
+	springai::File* file = callback->GetFile();
+	if (file == nullptr) {
+		return std::string();
+	}
+	const int size = file->GetSize(name.c_str());
+	if ((size <= 0) || (size > MAX_VFS_READ)) {
+		return std::string();
+	}
+	std::string buf(size_t(size), ' ');
+	if (!file->GetContent(name.c_str(), &buf[0], size)) {
+		return std::string();
+	}
+	return buf;
+}
+
+float CCircuitAI::GetElevationAt(const AIFloat3& pos) const
+{
+	if (!IsPosOnMap(pos)) {
+		return .0f;
+	}
+	CTerrainManager* terrainMgr = GetTerrainManager();
+	if (terrainMgr == nullptr) {
+		return .0f;
+	}
+	SAreaData* area = terrainMgr->GetAreaData();
+	if ((area == nullptr) || area->heightMap.empty()) {
+		return .0f;
+	}
+	const int ix = int(pos.x) / SQUARE_SIZE;
+	const int iz = int(pos.z) / SQUARE_SIZE;
+	const int idx = iz * area->heightMapXSize + ix;
+	if ((idx < 0) || (idx >= int(area->heightMap.size()))) {
+		return .0f;
+	}
+	return area->heightMap[idx];
+}
+
+float CCircuitAI::GetLavaLevel() const
+{
+	if (lavaFrame == lastFrame) {
+		return lavaLevel;
+	}
+	lavaFrame = lastFrame;
+	lavaLevel = (game != nullptr)
+			? game->GetRulesParamFloat("lavaLevel", NO_LAVA - 1.f)
+			: (NO_LAVA - 1.f);
+	return lavaLevel;
+}
+
+// Is this ground under the lava surface right now?
+//
+// The gadget damages whatever's BASE position sits below the level, so a
+// floating structure is judged at the waterline and a grounded one at the
+// terrain under it. Fixed sites (a mex on its spot) never ask: refusing the
+// spot loses the extractor rather than moving it, and that call belongs to the
+// script's pricing, not to a veto here.
+bool CCircuitAI::IsUnderLava(const AIFloat3& pos, CCircuitDef* def) const
+{
+	const float level = GetLavaLevel();
+	if (level <= NO_LAVA) {
+		return false;
+	}
+	float rest = GetElevationAt(pos);
+	if ((def != nullptr) && def->IsFloater() && (rest < .0f)) {
+		rest = .0f;
+	}
+	return rest <= level;
+}
+
+int CCircuitAI::GetTerritoryAt(const AIFloat3& pos) const
+{
+	return IsPosOnMap(pos) ? GetInflMap()->GetTerritoryAt(pos) : 0;
+}
+
+int CCircuitAI::GetTerritoryVersion() const
+{
+	return (mapManager == nullptr) ? 0 : GetInflMap()->GetTerritoryVersion();
+}
+
+int CCircuitAI::GetWreckFieldVersion() const
+{
+	return (mapManager == nullptr) ? 0 : mapManager->GetWreckField().GetVersion();
+}
+
 float CCircuitAI::GetAllyInflAt(const AIFloat3& pos) const
 {
 	return IsPosOnMap(pos) ? GetInflMap()->GetAllyInflAt(pos) : .0f;
+}
+
+// Armed units and turrets only: where our guns reach, not where a builder stands.
+float CCircuitAI::GetAllyDefendInflAt(const AIFloat3& pos) const
+{
+	return IsPosOnMap(pos) ? GetInflMap()->GetAllyDefendInflAt(pos) : .0f;
 }
 
 float CCircuitAI::GetEnemyInflAt(const AIFloat3& pos) const
@@ -2303,57 +3452,85 @@ bool CCircuitAI::GetAttackHotspot(springai::AIFloat3& outPos, float& outWeight)
 	return true;
 }
 
-bool CCircuitAI::IsCommanderWreck(springai::Feature* f)
+// apex: what a feature def is worth, resolved once per FEATURE DEF and kept.
+// Contained metal and the "<unit>_dead" -> unit cost lookup are properties of
+// the def, not of the corpse, but the sweeps below used to re-ask the engine
+// (and re-parse the name, and re-hash the def map) for every corpse on every
+// pass. Wrecks are what grows in a long game, so this was the cost that grew
+// fastest.
+const CCircuitAI::SFeatDefInfo& CCircuitAI::GetFeatDefInfo(int featureDefId)
 {
-	if (f == nullptr) {
+	static const SFeatDefInfo empty = {0.f, -1.f};
+	if (featureDefId < 0) {
+		return empty;
+	}
+	if ((size_t)featureDefId >= featDefInfo.size()) {
+		featDefInfo.resize(featureDefId + 64, {-1.f, -1.f});
+	}
+	SFeatDefInfo& info = featDefInfo[featureDefId];
+	if (info.metal < 0.f) {
+		info.metal = callback->FeatureDef_GetContainedResource(featureDefId, metalResId);
+		info.rezCostM = -1.f;
+		const char* raw = callback->FeatureDef_GetName(featureDefId);
+		if (raw != nullptr) {
+			const std::string name(raw);
+			const size_t at = name.rfind("_dead");
+			if (at != std::string::npos) {
+				CCircuitDef* ud = GetCircuitDef(name.substr(0, at).c_str());
+				if (ud != nullptr) {
+					info.rezCostM = ud->GetCostM();
+				}
+			}
+		}
+	}
+	return info;
+}
+
+// A commander corpse is identified by what it resurrects into. Kept per
+// FEATURE (not per def): the resurrect def is a property of the corpse.
+bool CCircuitAI::IsCommanderWreckId(int rezDefId)
+{
+	if (rezDefId < 0) {
 		return false;
 	}
-	springai::UnitDef* rezDef = f->GetResurrectDef();
-	if (rezDef == nullptr) {
-		return false;
-	}
-	const int id = rezDef->GetUnitDefId();
-	delete rezDef;
-	CCircuitDef* cdef = GetCircuitDefSafe(id);
+	CCircuitDef* cdef = GetCircuitDefSafe(rezDefId);
 	return (cdef != nullptr) && cdef->IsRoleComm();
+}
+
+// AN AREA RECLAIM TAKES WHATEVER IS IN THE CIRCLE, so the only way to keep a
+// commander corpse out of one is to know where it is (apexearth: "make sure
+// nano turrets don't reclaim dead commanders"). The per-feature filter in
+// CBReclaimTask only guards the targeted search.
+springai::AIFloat3 CCircuitAI::GetCommanderWreckPos(const springai::AIFloat3& pos, float radius)
+{
+	if ((mapManager == nullptr) || (radius <= 0.f)) {
+		return springai::AIFloat3(-RgtVector);
+	}
+	return mapManager->GetWreckField().CommanderWreck(pos, radius);
 }
 
 springai::AIFloat3 CCircuitAI::GetBestWreckPos(const springai::AIFloat3& pos, float radius, float minMetal)
 {
-	springai::AIFloat3 best(-RgtVector);
-	if ((callback == nullptr) || (radius <= 0.f)) {
-		return best;
+	if ((mapManager == nullptr) || (radius <= 0.f)) {
+		return springai::AIFloat3(-RgtVector);
 	}
-	springai::Resource* metal = callback->GetResourceByName(RES_NAME_METAL);
-	if (metal == nullptr) {
-		return best;
-	}
+	return mapManager->GetWreckField().BestWreck(pos, radius, minMetal);
+}
 
-	float bestMetal = minMetal;
-	const std::vector<springai::Feature*> feats = callback->GetFeaturesIn(pos, radius, false);
-	for (springai::Feature* f : feats) {
-		if (f == nullptr) {
-			continue;
-		}
-		if (IsCommanderWreck(f)) {
-			delete f;
-			continue;
-		}
-		springai::FeatureDef* fd = f->GetDef();
-		if (fd != nullptr) {
-			// Reclaim left is a fraction of the def's contained metal; a wreck
-			// someone else is already half way through is worth less to us.
-			const float value = fd->GetContainedResource(metal) * f->GetReclaimLeft();
-			if (value > bestMetal) {
-				bestMetal = value;
-				best = f->GetPosition();
-			}
-			delete fd;
-		}
-		delete f;
+springai::AIFloat3 CCircuitAI::GetBestRezPos(const springai::AIFloat3& pos, float radius, float minCost)
+{
+	if ((mapManager == nullptr) || (radius <= 0.f)) {
+		return springai::AIFloat3(-RgtVector);
 	}
-	delete metal;
-	return best;
+	return mapManager->GetWreckField().BestRez(pos, radius, minCost);
+}
+
+float CCircuitAI::GetFieldWorkAt(const springai::AIFloat3& pos, float radius)
+{
+	if ((mapManager == nullptr) || (radius <= 0.f)) {
+		return .0f;
+	}
+	return mapManager->GetWreckField().WorkAt(pos, radius);
 }
 
 // TOTAL reclaimable metal within radius, not the richest single body.
@@ -2362,42 +3539,16 @@ springai::AIFloat3 CCircuitAI::GetBestWreckPos(const springai::AIFloat3& pos, fl
 // question after a repelled push: a dozen dead T1s is several hundred metal and
 // not one of them is individually large. apexearth: "often its a dozen t1 that
 // just died... still its a lot of metal we should be eating".
-// Same Feature::GetDef ownership rule as above -- that def IS ours to delete,
-// unlike Unit::GetDef. See GetBestWreckPos's comment for why this resolves the
-// metal resource locally instead of using the CCircuitAI::metalRes member,
-// and its comment on IsCommanderWreck for why a commander corpse is excluded
-// here too -- this feeds the "how rich is this field" total that gates
-// whether a constructor gets sent at all, so a commander corpse skewing that
-// total high would still walk a con onto it even if GetBestWreckPos itself
-// never targets it directly.
+// A commander corpse is excluded here too -- this feeds the "how rich is this
+// field" total that gates whether a constructor gets sent at all, so a
+// commander corpse skewing that total high would still walk a con onto it even
+// if GetBestWreckPos itself never targets it directly.
 float CCircuitAI::GetWreckValueAt(const springai::AIFloat3& pos, float radius)
 {
-	if ((callback == nullptr) || (radius <= 0.f)) {
+	if ((mapManager == nullptr) || (radius <= 0.f)) {
 		return .0f;
 	}
-	springai::Resource* metal = callback->GetResourceByName(RES_NAME_METAL);
-	if (metal == nullptr) {
-		return .0f;
-	}
-	float total = .0f;
-	const std::vector<springai::Feature*> feats = callback->GetFeaturesIn(pos, radius, false);
-	for (springai::Feature* f : feats) {
-		if (f == nullptr) {
-			continue;
-		}
-		if (IsCommanderWreck(f)) {
-			delete f;
-			continue;
-		}
-		springai::FeatureDef* fd = f->GetDef();
-		if (fd != nullptr) {
-			total += fd->GetContainedResource(metal) * f->GetReclaimLeft();
-			delete fd;
-		}
-		delete f;
-	}
-	delete metal;
-	return total;
+	return mapManager->GetWreckField().ValueAt(pos, radius);
 }
 
 // Count of visible enemy units within radius of a position.
@@ -2413,12 +3564,242 @@ float CCircuitAI::GetEnemyCostAt(const springai::AIFloat3& pos, float radius) co
 	if ((callback == nullptr) || (radius <= 0.f)) {
 		return 0.f;
 	}
-	const std::vector<springai::Unit*> foes = callback->GetEnemyUnitsIn(pos, radius, false);
-	const float count = float(foes.size());
-	for (springai::Unit* u : foes) {
-		delete u;
+	// apex: the count is what the engine returns when handed no output buffer,
+	// so the wrapper Unit that used to be newed and deleted per enemy here --
+	// on a call the commander makes every time it re-reads its own danger --
+	// bought nothing.
+	const int count = callback->CountEnemyUnitsIn(pos, radius, false);
+	perfEcostSweep += count;
+	++perfEcostCalls;
+	return float(count);
+}
+
+// HOW CLOSE THE NEAREST ENEMY IS TO BEING ABLE TO SHOOT THIS SPOT.
+// apexearth 2026-09-06, on rez bots: "they should back away when enemy units
+// are close to being within range of the rezbots". The margin is his own
+// latency bar turned into distance -- whatever ground the enemy covers while we
+// notice and start walking is ground we have to be clear of already, so the
+// envelope is its weapon reach plus `reactS` seconds of its own speed.
+//
+// Unarmed and flying enemies are skipped: a scout is not a reason to abandon a
+// corpse, and no ground bot outruns a gunship, so treating either as pressure
+// only costs work.
+int CCircuitAI::GetMetalResId()
+{
+	if ((metalResId < 0) && (callback != nullptr)) {
+		springai::Resource* r = callback->GetResourceByName(RES_NAME_METAL);
+		if (r != nullptr) {
+			metalResId = r->GetResourceId();
+			delete r;
+		}
 	}
-	return count;
+	return metalResId;
+}
+
+// apex: the enemy set flattened once per frame. Every caller used to walk the
+// enemyInfos hash map and chase four pointers per enemy (node -> CEnemyInfo ->
+// SEnemyData -> CCircuitDef) to read two floats, and the rez guard alone runs
+// this once per rez bot six times a second while site safety runs it per
+// candidate site. Approximate, not exact: an enemy registered part way through
+// a frame is seen by the callers after it rather than before.
+static constexpr size_t REACH_LEAF = 8;  // below this the tree costs more than the scan
+
+// A shell still in the air past the react window is one the bot walks out
+// from under (apexearth 2026-09-20: an enemy Basilisk is not a reason to
+// spend the game at home). Its reach against a mover is what it flies in
+// that window; instant and tracking weapons keep their range. Never above
+// the node bound, so the tree prunes exactly as before.
+float CCircuitAI::ReachIn(const SReachEnemy& e, float reactS)
+{
+	return std::min(e.reach, e.shell * reactS);
+}
+
+void CCircuitAI::RebuildReachCache()
+{
+	if (reachCacheFrame == lastFrame) {
+		return;
+	}
+	reachCacheFrame = lastFrame;
+	const auto tRb0 = std::chrono::steady_clock::now();
+	// An ally built it this frame: the same enemies, so take its copy.
+	if ((allyTeam != nullptr) && (allyTeam->reachFrame == lastFrame)) {
+		reachCache = allyTeam->reachCache;
+		reachNodes = allyTeam->reachNodes;
+		perfReachRebuildNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tRb0).count();
+		++perfReachRebuilds;
+		return;
+	}
+	reachCache.clear();
+	reachCache.reserve(enemyInfos.size());
+	for (const auto& kv : enemyInfos) {
+		CEnemyInfo* e = kv.second;
+		if ((e == nullptr) || e->IsHidden()) {
+			continue;
+		}
+		CCircuitDef* edef = e->GetCircuitDef();
+		if ((edef == nullptr) || edef->IsAbleToFly()) {
+			continue;
+		}
+		// Not GetMaxRange: that is the max over EVERY weapon, so a nuke silo
+		// enters the cache with 72000 of "reach" and vetoes the whole map.
+		// Surface weapons only: an AA tower's 765 was in here too.
+		CCircuitDef::RangeType rt = CCircuitDef::RangeType::LAND;
+		if (edef->GetAutoRange(CCircuitDef::RangeType::WATER) > edef->GetAutoRange(rt)) {
+			rt = CCircuitDef::RangeType::WATER;
+		}
+		const float reach = edef->GetAutoRange(rt);
+		if (reach <= 0.f) {
+			continue;
+		}
+		if (reach > perfReachMax) {
+			perfReachMax = reach;
+			perfReachMaxDef = edef;
+		}
+		const springai::AIFloat3& p = e->GetPos();
+		reachCache.push_back({p.x, p.z, reach, edef->GetSpeed(), edef->GetAutoShellSpeed(rt),
+				(uint32_t)reachCache.size()});
+	}
+	reachNodes.clear();
+	if (reachCache.size() > REACH_LEAF) {
+		reachNodes.reserve(reachCache.size() / 2 + 2);  // leaves hold >= 4, so <= n/2 nodes
+		BuildReachTree(0, (int32_t)reachCache.size());
+	}
+	if (allyTeam != nullptr) {
+		allyTeam->reachFrame = lastFrame;
+		allyTeam->reachCache = reachCache;
+		allyTeam->reachNodes = reachNodes;
+	}
+	perfReachRebuildNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tRb0).count();
+	++perfReachRebuilds;
+}
+
+// apex: median-split BVH over the cache, rebuilt with it, because the flattened
+// cache still cost a pass over EVERY enemy per call and `perf sweep reach` was
+// the largest counter in the log.
+//
+// A node carries its box plus the largest reach and speed below it, so
+// `boxMinDist - (maxReach + maxSpeed * reactS)` is a lower bound on every slack
+// inside and a subtree that cannot beat the running best is skipped whole.
+// Answers stay IDENTICAL, not approximate: the bound prunes only what it proves
+// cannot win, and each enemy keeps its unsorted index so an exact tie returns
+// the same enemy the linear scan did.
+int32_t CCircuitAI::BuildReachTree(int32_t first, int32_t count)
+{
+	const int32_t self = (int32_t)reachNodes.size();
+	reachNodes.emplace_back();
+	float minx = std::numeric_limits<float>::max();
+	float minz = minx;
+	float maxx = -minx;
+	float maxz = -minx;
+	float maxReach = 0.f;
+	float maxSpeed = 0.f;
+	for (int32_t i = first; i < first + count; ++i) {
+		const SReachEnemy& e = reachCache[i];
+		minx = std::min(minx, e.x);  maxx = std::max(maxx, e.x);
+		minz = std::min(minz, e.z);  maxz = std::max(maxz, e.z);
+		maxReach = std::max(maxReach, e.reach);
+		maxSpeed = std::max(maxSpeed, e.speed);
+	}
+	{
+		SReachNode& nd = reachNodes[self];
+		nd.minx = minx;  nd.minz = minz;  nd.maxx = maxx;  nd.maxz = maxz;
+		nd.maxReach = maxReach;  nd.maxSpeed = maxSpeed;
+		nd.first = first;  nd.count = count;  nd.right = -1;
+	}
+	if (count <= (int32_t)REACH_LEAF) {
+		return self;
+	}
+	const int32_t half = count / 2;
+	const auto mid = reachCache.begin() + first + half;
+	if ((maxx - minx) >= (maxz - minz)) {
+		std::nth_element(reachCache.begin() + first, mid, reachCache.begin() + first + count,
+				[](const SReachEnemy& a, const SReachEnemy& b) { return a.x < b.x; });
+	} else {
+		std::nth_element(reachCache.begin() + first, mid, reachCache.begin() + first + count,
+				[](const SReachEnemy& a, const SReachEnemy& b) { return a.z < b.z; });
+	}
+	BuildReachTree(first, half);  // lands at self + 1
+	const int32_t r = BuildReachTree(first + half, count - half);
+	reachNodes[self].count = 0;
+	reachNodes[self].right = r;
+	return self;
+}
+
+float CCircuitAI::ReachNodeMinDist(int32_t ni, float px, float pz) const
+{
+	const SReachNode& nd = reachNodes[ni];
+	const float dx = std::max(0.f, std::max(nd.minx - px, px - nd.maxx));
+	const float dz = std::max(0.f, std::max(nd.minz - pz, pz - nd.maxz));
+	return sqrtf(dx * dx + dz * dz);
+}
+
+void CCircuitAI::ReachQuery(int32_t ni, float px, float pz, float reactS, float minDist,
+		float& worst, uint32_t& bestIdx, const SReachEnemy*& best)
+{
+	const SReachNode& nd = reachNodes[ni];
+	// Strict: an equal bound may still hide a tie with a lower index, and the
+	// tie-break is what keeps the answer bit-identical to the old scan.
+	if (minDist - (nd.maxReach + nd.maxSpeed * reactS) > worst) {
+		return;
+	}
+	if (nd.count > 0) {
+		perfReachSweep += nd.count;
+		for (int32_t i = nd.first; i < nd.first + nd.count; ++i) {
+			const SReachEnemy& e = reachCache[i];
+			const float dx = px - e.x;
+			const float dz = pz - e.z;
+			const float slack = sqrtf(dx * dx + dz * dz) - (ReachIn(e, reactS) + e.speed * reactS);
+			if ((slack < worst) || ((slack == worst) && (e.idx < bestIdx))) {
+				worst = slack;
+				bestIdx = e.idx;
+				best = &e;
+			}
+		}
+		return;
+	}
+	const int32_t l = ni + 1;
+	const int32_t r = nd.right;
+	const float dl = ReachNodeMinDist(l, px, pz);
+	const float dr = ReachNodeMinDist(r, px, pz);
+	if (dl <= dr) {
+		ReachQuery(l, px, pz, reactS, dl, worst, bestIdx, best);
+		ReachQuery(r, px, pz, reactS, dr, worst, bestIdx, best);
+	} else {
+		ReachQuery(r, px, pz, reactS, dr, worst, bestIdx, best);
+		ReachQuery(l, px, pz, reactS, dl, worst, bestIdx, best);
+	}
+}
+
+float CCircuitAI::GetEnemyReachSlack(const springai::AIFloat3& pos, float reactS,
+		springai::AIFloat3* foeOut)
+{
+	RebuildReachCache();
+	++perfReachCalls;
+	float worst = std::numeric_limits<float>::max();
+	uint32_t bestIdx = std::numeric_limits<uint32_t>::max();
+	const SReachEnemy* best = nullptr;
+	if (reachNodes.empty()) {  // too few to pay for the tree
+		perfReachSweep += reachCache.size();
+		for (const SReachEnemy& e : reachCache) {
+			const float dx = pos.x - e.x;
+			const float dz = pos.z - e.z;
+			const float slack = sqrtf(dx * dx + dz * dz) - (ReachIn(e, reactS) + e.speed * reactS);
+			if (slack < worst) {
+				worst = slack;
+				best = &e;
+			}
+		}
+	} else {
+		ReachQuery(0, pos.x, pos.z, reactS, ReachNodeMinDist(0, pos.x, pos.z),
+				worst, bestIdx, best);
+	}
+	if ((foeOut != nullptr) && (best != nullptr)) {
+		*foeOut = springai::AIFloat3(best->x, 0.f, best->z);
+	}
+	if (best != nullptr) {
+		perfReachWorst = std::min(perfReachWorst, worst);
+	}
+	return worst;
 }
 
 // Threat at a position, from the engine-maintained threat map.
@@ -2549,6 +3930,7 @@ std::pair<CEnemyInfo*, bool> CCircuitAI::RegisterEnemyInfo(ICoreUnit::Id unitId,
 
 	unit = new CEnemyInfo(data);
 	enemyInfos[unitId] = unit;
+	SetEnemyById(unitId, unit);
 
 	return std::make_pair(unit, true);
 }
@@ -2562,6 +3944,7 @@ CEnemyInfo* CCircuitAI::RegisterEnemyInfo(Unit* e)
 
 	CEnemyInfo* unit = new CEnemyInfo(data);
 	enemyInfos[unit->GetId()] = unit;
+	SetEnemyById(unit->GetId(), unit);
 
 	return unit;
 }
@@ -2570,6 +3953,9 @@ void CCircuitAI::UnregisterEnemyInfo(CEnemyInfo* enemy)
 {
 	allyTeam->UnregisterEnemyUnit(enemy->GetData(), this);
 	enemyInfos.erase(enemy->GetId());
+	if ((enemy->GetId() >= 0) && ((size_t)enemy->GetId() < enemyById.size())) {
+		enemyById[enemy->GetId()] = nullptr;
+	}
 	delete enemy;
 }
 
@@ -2613,8 +3999,7 @@ void CCircuitAI::CheckDecoy(CEnemyInfo* enemy, int weaponId)
 
 CEnemyInfo* CCircuitAI::GetEnemyInfo(ICoreUnit::Id unitId) const
 {
-	auto it = enemyInfos.find(unitId);
-	return (it != enemyInfos.end()) ? it->second : nullptr;
+	return ((unitId >= 0) && ((size_t)unitId < enemyById.size())) ? enemyById[unitId] : nullptr;
 }
 
 bool CCircuitAI::UnitControl(CCircuitUnit* unit, bool isEnable)
@@ -2632,6 +4017,54 @@ bool CCircuitAI::UnitControl(CCircuitUnit* unit, bool isEnable)
 		mgr->AssignTask(unit, new CPlayerTask(mgr));
 	}
 	return true;
+}
+
+void CCircuitAI::NoteSniperOrder(CCircuitDef::SniperOrder kind)
+{
+	++sniperOrders[static_cast<int>(kind)];
+	if (lastFrame < sniperOrderNextLog) {
+		return;
+	}
+	sniperOrderNextLog = lastFrame + FRAMES_PER_SEC * 30;
+	LOG("apex: sniper-orders t=%i f=%i move=%i settarget=%i fight=%i attack=%i",
+			teamId, lastFrame, sniperOrders[0], sniperOrders[1], sniperOrders[2], sniperOrders[3]);
+	for (int& n : sniperOrders) {
+		n = 0;
+	}
+}
+
+void CCircuitAI::NoteOrder(int kind, int bucket, bool suppressed, int src)
+{
+	if (suppressed) {
+		++ordSup[kind];
+	} else {
+		++ordSent[kind];
+	}
+	if (bucket >= 0) {
+		++ordRep[kind][bucket];
+	}
+	if ((src >= 0) && (src < ORD_SRC_N)) {
+		++ordSrc[src][0];
+		if (bucket >= 0) {
+			++ordSrc[src][1];
+			if (bucket == 4) {
+				++ordSrc[src][2];
+			}
+		}
+	}
+}
+
+void CCircuitAI::NoteOrderRefused(int src, int byPrio)
+{
+	if ((src >= 0) && (src < ORD_SRC_N)) {
+		++ordRefused[src];
+	}
+}
+
+void CCircuitAI::NoteArcFlip(bool held, unsigned units)
+{
+	++arcFlip[held ? 1 : 0];
+	arcFlipU[held ? 1 : 0] += units;
 }
 
 void CCircuitAI::UpdateActions()
@@ -2741,6 +4174,29 @@ void CCircuitAI::InitUnitDefs(const CCircuitDef::SArmorInfo& armor, float& outDc
 	for (CCircuitDef& cdef : GetCircuitDefs()) {
 		cdef.Init(this);
 	}
+	// Only now does every drone's own def exist to read threat from.
+	for (CCircuitDef& cdef : GetCircuitDefs()) {
+		if (cdef.GetDroneCount() <= 0) {
+			continue;
+		}
+		auto dit = defsByName.find(cdef.GetDroneName().c_str());
+		if (dit == defsByName.end()) {
+			continue;
+		}
+		const float s0 = cdef.GetSurfThreat();
+		const float a0 = cdef.GetAirThreat();
+		cdef.AddDroneThreat(dit->second);
+		LOG("apex: drone-carrier t=%i %s carries %i x %s -- surf %.0f -> %.0f, air %.0f -> %.0f",
+			teamId, std::string(cdef.GetDef()->GetName()).c_str(), cdef.GetDroneCount(),
+			cdef.GetDroneName().c_str(), s0, cdef.GetSurfThreat(), a0, cdef.GetAirThreat());
+	}
+	std::string snipers;
+	for (const CCircuitDef& cdef : GetCircuitDefs()) {
+		if (cdef.IsSniper()) {
+			snipers += " " + std::string(cdef.GetDef()->GetName());
+		}
+	}
+	LOG("apex: sniper-class t=%i:%s", teamId, snipers.c_str());
 }
 
 void CCircuitAI::BindUnitToWeaponDefs(CCircuitDef::Id unitDefId, const std::set<CWeaponDef::Id>& weaponDefs, bool isMobile)

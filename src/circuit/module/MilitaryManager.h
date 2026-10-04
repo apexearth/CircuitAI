@@ -175,6 +175,20 @@ public:
 	void DiceBigGun();
 	float ClampMobileCostRatio() const;
 	void UpdateDefenceTasks();
+	// apex: how often a defend pool is re-aimed at a DIFFERENT hotspot, and how
+	// many of those switches were won by a margin too small to be a decision.
+	float GuardSpotScore(const springai::AIFloat3& from, int idx) const;
+	unsigned guardFlips = 0;
+	unsigned guardPicks = 0;   // the DENOMINATOR: a zero flip count means nothing without it
+	unsigned guardFlipsMarginal = 0;
+	float guardFlipDist = 0.f;
+	int guardFlipLogAt = 0;
+	int mergeLogAt = 0;
+	std::vector<std::pair<springai::AIFloat3, float>> supportSpots;
+	// 0 = off-cadence, 1 = IsMergeSafe refused, 2 = dispatched pool
+	unsigned mergeSkip[3] = {0, 0, 0};
+	unsigned mergeRan = 0;
+	int guardSumLogAt = 0;
 	void UpdateDefence();
 	void MakeBaseDefence(const springai::AIFloat3& pos);
 
@@ -190,9 +204,24 @@ public:
 
 	void SetBaseDefRange(float range) { defence->SetBaseRange(range); }
 	float GetBaseDefRange() const { return defence->GetBaseRange(); }
+	// Mex spots our builders asked the army to clear, with the metal each is worth.
+	void ClearSupportSpots() { supportSpots.clear(); }
+	void AddSupportSpot(const springai::AIFloat3& pos, float worth) { supportSpots.emplace_back(pos, worth); }
+	const std::vector<std::pair<springai::AIFloat3, float>>& GetSupportSpots() const { return supportSpots; }
+	// Shared cadence and counters for ISquadTask's merge census. They live on
+	// the manager because the tasks they measure are created and destroyed
+	// constantly, and the question is about the fleet, not one squad.
+	int GetMergeLogAt() const { return mergeLogAt; }
+	void SetMergeLogAt(int f) { mergeLogAt = f; }
+	void NoteMergeSkip(int which) { ++mergeSkip[which]; }
+	void NoteMergeRan() { ++mergeRan; }
+	unsigned GetMergeSkip(int which) const { return mergeSkip[which]; }
+	unsigned GetMergeRan() const { return mergeRan; }
 	float GetCommDefRadBegin() const { return defence->GetCommRadBegin(); }
 	float GetCommDefRad(float baseDist) const { return defence->GetCommRad(baseDist); }
 	unsigned int GetGuardTaskNum() const { return defence->GetGuardTaskNum(); }
+	unsigned int ReleaseHoldPools();
+	unsigned int HoldPools();
 	unsigned int GetGuardsNum() const { return defence->GetGuardsNum(); }
 	int GetGuardFrame() const { return defence->GetGuardFrame(); }
 
@@ -215,6 +244,7 @@ public:
 	// Kept here rather than on the task because it must be shared BETWEEN tasks.
 	void NoteSuperTarget(const springai::AIFloat3& pos, int frame);
 	bool IsRecentSuperTarget(const springai::AIFloat3& pos, float sqRadius, int frame) const;
+	bool HasRecentShot(const springai::AIFloat3& pos, float sqRadius, int frame) const;
 
 	// The one place that decides whether a commander should be cloaked.
 	bool IsCommCloakWanted(CCircuitUnit* unit) const;
@@ -256,6 +286,19 @@ private:
 	CDefenceData* defence;
 	unsigned int defenceIdx;
 	int splitFrame = 0;                  // cooldown for the breach split; see UpdateDefenceTasks
+	int dispatchLogFrame = 0;            // see DispatchRaids
+	// Last seen position per enemy, for a velocity the engine does not give
+	// on radar-only contacts (GetVel reads zero there). See DispatchRaids.
+	struct STrack {
+		springai::AIFloat3 pos;
+		int frame;
+	};
+	std::map<int, STrack> raidTrack;   // key: ICoreUnit::Id
+	struct SGuardPost {
+		springai::AIFloat3 pos;
+		float reach;
+	};
+	std::map<int, SGuardPost> guardPosts;   // key: ICoreUnit::Id, see SetGuardPost
 	std::map<CCircuitUnit*, int> porcToPoint;  // unit: defPointId
 
 	// Every FINISHED static defence we own, whoever placed it: the FENCE

@@ -15,6 +15,7 @@
 
 #include <unordered_set>
 #include <array>
+#include <algorithm>
 
 namespace springai {
 	class WeaponMount;
@@ -171,6 +172,22 @@ public:
 	// none of them and every charge path was dead.
 	bool IsCharger()      const { return (role & (RoleMask::HEAVY | RoleMask::SUPER))
 			&& (attr & AttrMask::MELEE); }
+	// apex: THE SNIPER CLASS, from the def's own shape rather than a name
+	// list: a land mobile whose surface gun reaches far and whose body is
+	// thin both in absolute HP and in HP per metal. CCircuitUnit turns every
+	// fight/attack order for such a unit into move + set-target, since a
+	// fight or attack order halts it under fire (CMobileCAI::ExecuteFight /
+	// ExecuteObjectAttack StopMove on bearing).
+	static constexpr float SNIPER_MIN_RANGE = 800.f;
+	static constexpr float SNIPER_MAX_HP = 800.f;
+	static constexpr float SNIPER_MAX_HP_PER_METAL = 1.2f;
+	bool IsSniper()       const { return IsMobile() && !IsAbleToFly() && !IsFloater()
+			&& !IsSubmarine() && IsAttacker() && !IsRoleBuilder()
+			&& (GetMaxRange(RangeType::LAND) >= SNIPER_MIN_RANGE)
+			&& (health <= SNIPER_MAX_HP)
+			&& (health <= costM * SNIPER_MAX_HP_PER_METAL); }
+	// The engine order kinds CCircuitAI's sniper census counts.
+	enum class SniperOrder: char {MOVE = 0, SET_TARGET, FIGHT, ATTACK, _SIZE_};
 
 	bool IsAttrMelee()    const { return attr & AttrMask::MELEE; }
 	bool IsAttrBoost()    const { return attr & AttrMask::BOOST; }
@@ -258,6 +275,19 @@ public:
 	float GetMinRange() const { return minRange; }
 	float GetMaxRange(RangeType type) const { return maxRange[static_cast<RangeT>(type)]; }
 	float GetMaxRange() const { return maxRange[static_cast<RangeT>(maxRangeType)]; }
+	// apex: "can this shoot a unit standing there", which GetMaxRange does not
+	// answer -- it is the max over EVERY weapon, so a nuke silo reads 72000 and
+	// an antinuke (a projectile-only interceptor) reads the same.
+	float GetAutoRange() const {
+		return std::max(std::max(autoRange[static_cast<RangeT>(RangeType::AIR)],
+								 autoRange[static_cast<RangeT>(RangeType::LAND)]),
+						autoRange[static_cast<RangeT>(RangeType::WATER)]);
+	}
+	float GetAutoRange(RangeType type) const { return autoRange[static_cast<RangeT>(type)]; }
+	// apex: elmo/s of the shell behind that auto range (instant-hit and
+	// tracking read as infinite). What it flies in a react window is its reach
+	// against a unit that is walking: a Basilisk's 4950 is 1150 to a rez bot.
+	float GetAutoShellSpeed(RangeType type) const { return autoShellS[static_cast<RangeT>(type)]; }
 	int GetThreatRange(ThreatType type) const { return threatRange[static_cast<ThreatT>(type)]; }
 	float GetShieldRadius() const { return shieldRadius; }
 	float GetMaxShield() const { return maxShield; }
@@ -276,6 +306,20 @@ public:
 	void ModAirThreat(float mod) { airThrMod *= mod; airThrDmg *= mod; }
 	void ModSurfThreat(float mod) { surfThrMod *= mod; surfThrDmg *= mod; }
 	void ModWaterThreat(float mod) { waterThrMod *= mod; waterThrDmg *= mod; }
+
+	// A DRONE CARRIER FIGHTS WITH ITS DRONES. The spawner weapon names the
+	// carried unit and how many it keeps up (weapon customparams carried_unit /
+	// maxunits); the carrier's own guns are nothing, so without this it read as
+	// unarmed and was bought as a radar for its 1,500 radar range.
+	const std::string& GetDroneName() const { return droneName; }
+	int GetDroneCount() const { return droneCount; }
+	void AddDroneThreat(const CCircuitDef* drone) {
+		const float n = float(droneCount);
+		airThrDmg   += n * drone->airThrDmg;
+		surfThrDmg  += n * drone->surfThrDmg;
+		waterThrDmg += n * drone->waterThrDmg;
+		defThrDmg   += n * drone->defThrDmg;
+	}
 	void SetThreatRange(ThreatType type, int range) { threatRange[static_cast<ThreatT>(type)] = range; }
 	void SetFireState(FireT ft) { fireState = ft; }
 	void SetMoveState(MoveT mt) { moveState = mt; }
@@ -302,6 +346,12 @@ public:
 	bool HasSurfToLandDGun()  const { return hasSurfToLandDGun; }
 	bool HasSurfToWaterDGun() const { return hasSurfToWaterDGun; }
 	bool HasSubToAirDGun()    const { return hasSubToAirDGun; }
+	// A ground unit is sent after aircraft only when anti-air is its job: a
+	// raider's gun that reaches a plane still fires at one in range, but the
+	// squad does not leave its fight to chase fighters (apexearth 2026-09-29).
+	bool IsAirHunter(bool inWater) const {
+		return (inWater ? hasSubToAir : hasSurfToAir) && (isAbleToFly || IsRoleAA());
+	}
 	bool HasSubToLandDGun()   const { return hasSubToLandDGun; }
 	bool HasSubToWaterDGun()  const { return hasSubToWaterDGun; }
 
@@ -466,6 +516,8 @@ private:
 	springai::WeaponMount* shieldMount;
 	springai::WeaponMount* weaponMount;
 	float pwrDmg, pwrMod;  // ally damage
+	std::string droneName;  // carried_unit of a drone-spawner weapon, if any
+	int droneCount = 0;     // its maxunits
 	float defThrDmg, defThrMod;  // enemy damage, for influence
 	float airThrDmg, airThrMod;  // air enemy damage
 	float surfThrDmg, surfThrMod;  // surface, even on water
@@ -479,6 +531,9 @@ private:
 	float minRange;
 	RangeType maxRangeType;
 	std::array<float, static_cast<RangeT>(RangeType::_SIZE_)> maxRange;
+	// apex: maxRange counting only weapons that fire at a unit on their own.
+	std::array<float, static_cast<RangeT>(RangeType::_SIZE_)> autoRange;
+	std::array<float, static_cast<RangeT>(RangeType::_SIZE_)> autoShellS;
 	std::array<int, static_cast<ThreatT>(ThreatType::_SIZE_)> threatRange;
 	float shieldRadius;
 	float maxShield;

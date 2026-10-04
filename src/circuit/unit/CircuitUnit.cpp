@@ -41,6 +41,7 @@ CCircuitUnit::CCircuitUnit(CCircuitAI* circuit, Id unitId, Unit* unit, CCircuitD
 		, moveFails(0)
 		, failFrame(-1)
 		, damagedFrame(-1)
+		, electFrame(-1)
 		, damagedDir(ZeroVector)
 		, dodgeFrame(-1)
 		, execFrame(-1)
@@ -183,26 +184,52 @@ bool CCircuitUnit::IsMoveFailed(int frame)
 	return isStuck;
 }
 
-void CCircuitUnit::ForceUpdate(int frame)
+static unsigned sWakeArm = 0, sWakeReact = 0, sWakeRecon = 0;
+static unsigned sWakeAsks = 0, sWakeRefused = 0;
+static int sWakeLogAt = 0;
+
+void CCircuitUnit::ForceUpdate(int frame, Wake w)
 {
+	++sWakeArm;
+	if (w == Wake::RECONSIDER) { ++sWakeRecon; } else { ++sWakeReact; }
 	if (execFrame < 0) {
 		execFrame = frame;
+		execWake = w;
+	} else if (int(w) > int(execWake)) {
+		execWake = w;  // a pending wake only ever gets more urgent
 	}
 }
 
-bool CCircuitUnit::IsForceUpdate(int frame)
+bool CCircuitUnit::IsForceUpdate(int frame, Wake want)
 {
-	if (execFrame > 0) {
-		if (execFrame <= frame) {
-			execFrame = -1;
-			return true;
+	if ((execFrame > 0) && (execFrame <= frame)) {
+		const Wake w = execWake;
+		execFrame = -1;  // consumed either way; an unaccepted wake must not linger
+		++sWakeAsks;
+		const bool accept = (int(w) >= int(want))
+				|| (manager->GetCircuit()->GetTunable("apex_wake_split", 1.f) <= 0.f);
+		if (!accept) {
+			++sWakeRefused;
 		}
+		// Unconditional census: "refused=0" only means something next to the
+		// number of times anyone asked.
+		if (frame >= sWakeLogAt) {
+			sWakeLogAt = frame + FRAMES_PER_SEC * 60;
+			manager->GetCircuit()->LOG("apex: wake armed=%u react=%u recon=%u asks=%u refused=%u",
+					sWakeArm, sWakeReact, sWakeRecon, sWakeAsks, sWakeRefused);
+		}
+		return accept;
 	}
 	return false;
 }
 
 void CCircuitUnit::ManualFire(CEnemyInfo* target, int timeout)
 {
+	if (circuitDef->HasDGun() && (dgun != nullptr)) {
+		dgunHoldUntil = timeout;
+		dgunHoldReload = dgun->GetReloadFrame();
+	}
+	NoteAct("dgn", (manager != nullptr) ? manager->GetCircuit()->GetLastFrame() : timeout);
 	TRY_UNIT(manager->GetCircuit(), this,
 		if (circuitDef->HasDGun()) {
 			if (target->GetUnit()->IsCloaked()) {  // los-cheat related
@@ -216,7 +243,7 @@ void CCircuitUnit::ManualFire(CEnemyInfo* target, int timeout)
 			} else {
 				AIFloat3 leadPos = target->GetPos() + target->GetVel() * FRAMES_PER_SEC * 2;
 				CTerrainManager::CorrectPosition(leadPos);
-				CmdMoveTo(leadPos, UNIT_COMMAND_OPTION_ALT_KEY, timeout);
+				CmdMoveTo(leadPos, UNIT_COMMAND_OPTION_ALT_KEY, timeout, OrdSrc::MANUAL);
 				CmdManualFire(UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);  // Krow
 			}
 		}
@@ -250,9 +277,38 @@ bool CCircuitUnit::IsWeaponReady(int frame)
 	return isWeaponReady;
 }
 
+bool CCircuitUnit::IsDGunHeld(int frame)
+{
+	if ((frame >= dgunHoldUntil) || (dgun == nullptr)) {
+		return false;
+	}
+	// The shot went off: the reload frame moved on.
+	if (dgun->GetReloadFrame() > dgunHoldReload) {
+		return false;
+	}
+	// apex: every Cmd* consults this as an early-return guard, so a true here
+	// is an order the engine never got and nothing ever retries. One mark a
+	// second -- the ring holds ten, and a flood erases the trace it is for.
+	if (frame - dgunHoldNoteAt >= FRAMES_PER_SEC) {
+		dgunHoldNoteAt = frame;
+		NoteAct("hld", frame);
+	}
+	return true;
+}
+
+float CCircuitUnit::GetDGunCostE() const
+{
+	return (dgunDef != nullptr) ? dgunDef->GetCostE() : 0.f;
+}
+
+int CCircuitUnit::GetDGunReloadFrame() const
+{
+	return (dgun != nullptr) ? dgun->GetReloadFrame() : 0;
+}
+
 bool CCircuitUnit::IsDGunReady(int frame, float energy)
 {
-	return (dgun->GetReloadFrame() <= frame) && (dgunDef->GetCostE() < energy)
+	return (dgun->GetReloadFrame() <= frame) && (dgunDef->GetCostE() <= energy)
 		&& (!dgunDef->IsStockpile() || (unit->GetStockpile() > 0));
 }
 
@@ -340,10 +396,206 @@ void CCircuitUnit::CmdRemove(std::vector<float>&& params, short options)
 	unit->ExecuteCustomCommand(CMD_REMOVE, params, options);
 }
 
-void CCircuitUnit::CmdMoveTo(const AIFloat3& pos, short options, int timeout)
+// Records the order, and marks it a suppression candidate when re-sending it
+// provably changes nothing: bit-identical to the last order of its kind, sent
+// with nothing else in between, and not shortening or letting the command's
+// window lapse (the refresh point is half the command's OWN timeout).
+// Bit-identical is the bar because CGroundMoveType::IsMovingTowards -- the
+// guard CMobileCAI::ExecuteMove puts in front of SetGoal -- is exact float
+// equality on goalPos; a destination off by a fraction of an elmo re-paths.
+// Candidates are counted either way and dropped only under apex_order_dedupe.
+// apex: names for CCircuitUnit::OrdSrc, in enum order. Kept beside the enum
+// rather than at the log site so the census and the per-unit trace cannot
+// disagree about which call site an index means.
+// retreat > dodge > standoff > guard is apexearth's standing ruling; the rest
+// follow the same principle and his max-range rule. The derivation and what
+// it is for are in docs/24-how-units-fight.md.
+//
+// TRAVEL and FWALK are deliberately UNRANKED (-1): the unit-action layer
+// executes whatever was decided, so blocking it would freeze the very
+// retreat it is carrying out. SETTGT moves nothing.
+int CCircuitUnit::OrdSrcPrio(int src)
 {
+	switch (static_cast<OrdSrc>(src)) {
+		case OrdSrc::MANUAL:                        return 100;
+		case OrdSrc::RETREAT:                       return 90;
+		case OrdSrc::DODGE:                         return 80;
+		case OrdSrc::STANDOFF: case OrdSrc::RING:
+		case OrdSrc::SNIPER:                        return 70;
+		case OrdSrc::ENGAGE:   case OrdSrc::ATTACK:
+		case OrdSrc::COMBAT:                        return 60;
+		case OrdSrc::REGROUP:  case OrdSrc::RALLY:
+		case OrdSrc::ESCORT:                        return 50;
+		case OrdSrc::POST:     case OrdSrc::GUARD:  return 40;
+		case OrdSrc::PATROL:   case OrdSrc::SCOUT:
+		case OrdSrc::BUILD:                         return 30;
+		case OrdSrc::SCRIPT:                        return 20;
+		case OrdSrc::SETTGT:                        return -1;  // sets a target, moves nothing
+		case OrdSrc::TRAVEL:   case OrdSrc::FWALK:  return -1;  // executes, does not decide
+		default:                                    return 10;
+	}
+}
+
+const char* CCircuitUnit::OrdSrcName(int src)
+{
+	static const char* names[] = {"other", "ring", "travel", "dodge",
+			"standoff", "post", "retreat", "build", "scout", "settgt",
+			"attack", "patrol", "engage", "regroup", "escort", "sniper",
+			"manual", "script", "fightwalk", "combat", "guard", "rally"};
+	static_assert(sizeof(names) / sizeof(names[0])
+			== static_cast<size_t>(CCircuitUnit::OrdSrc::_SIZE),
+			"OrdSrcName is out of step with OrdSrc");
+	return ((src >= 0) && (src < static_cast<int>(OrdSrc::_SIZE))) ? names[src] : "?";
+}
+
+bool CCircuitUnit::NoteOrder(OrdKind kind, short options, const AIFloat3& pos, int id, int timeout,
+		OrdSrc src)
+{
+	if (manager == nullptr) {
+		return false;
+	}
+	CCircuitAI* circuit = manager->GetCircuit();
+	const int frame = circuit->GetLastFrame();
+	SOrdShadow& s = ordLast[static_cast<int>(kind)];
+	const int gap = frame - s.frame;
+
+	int bucket = -1;
+	bool suppress = false;
+	// Only while the previous one is plausibly still running: every re-issue
+	// loop in this AI ticks at 1s, so 3s covers them and excludes a new journey.
+	if ((gap >= 0) && (gap <= FRAMES_PER_SEC * 3) && (s.opts == options) && (s.id == id)) {
+		const float dx = pos.x - s.x;
+		const float dz = pos.z - s.z;
+		const float sq = dx * dx + dz * dz;
+		bucket = (sq <= 0.f) ? 0
+				: (sq < SQUARE(float(SQUARE_SIZE))) ? 1
+				: (sq < SQUARE(float(SQUARE_SIZE * 4))) ? 2
+				: (sq < SQUARE(float(SQUARE_SIZE * 16))) ? 3 : 4;
+		suppress = (bucket == 0) && (s.seq == ordSeq) && (timeout >= s.timeout)
+				&& ((s.timeout == INT_MAX) || (gap * 2 < s.timeout - s.frame));
+	}
+	circuit->NoteOrder(static_cast<int>(kind), bucket, suppress, static_cast<int>(src));
+	// apex: PER-UNIT ORDER TRACE. The census says how much churn there is and
+	// which call site made it, then throws away who it happened to. `jump` is
+	// the distance from this unit's last order OF THE SAME KIND and `gap` the
+	// frames since, so a contradiction reads as a large jump at a small gap.
+	// Off by default: one line per order.
+	if (circuit->GetTunable("apex_order_trace", 0.f) > 0.f) {
+		static const char* kindName[static_cast<int>(OrdKind::_SIZE)] = {
+				"move", "fight", "patrol", "attack", "target"};
+		const IUnitTask* task = GetTask();
+		float jump = -1.f;
+		if (s.frame > 0) {
+			const float dx = pos.x - s.x;
+			const float dz = pos.z - s.z;
+			jump = sqrtf(dx * dx + dz * dz);
+		}
+		// q=1 is a SHIFT order: APPENDED to the unit's queue, not a
+		// replacement. Without it a queued path waypoint is indistinguishable
+		// from a centre overriding the order, and MoveAction deliberately
+		// queues a lookahead waypoint every step -- 1,528 of them in one 20
+		// minute game, which read as contradictions until this was logged.
+		circuit->LOG("apex: ord t=%i u=%i %s f=%i src=%s kind=%s to=%.0f,%.0f"
+				" tgt=%i jump=%.0f gap=%i task=%i/%i dup=%i q=%i",
+				circuit->GetTeamId(), (int)GetId(),
+				(circuitDef != nullptr) ? circuitDef->GetDef()->GetName() : "?",
+				frame, OrdSrcName(static_cast<int>(src)),
+				kindName[static_cast<int>(kind)], pos.x, pos.z, id, jump,
+				(s.frame > 0) ? (frame - s.frame) : -1,
+				(task != nullptr) ? static_cast<int>(task->GetType()) : -1,
+				GetTaskFrame(), suppress ? 1 : 0,
+				((options & UNIT_COMMAND_OPTION_SHIFT_KEY) != 0) ? 1 : 0);
+	}
+	// Counted whether or not it is dropped, so one run with the switch OFF says
+	// exactly what turning it on would buy. Default off: the engine's own move
+	// state is provably unchanged (above), but the dropped order also skips the
+	// extra UnitIdle the engine raises when it finishes a move the unit has
+	// already arrived at, and that event stream is not proven identical.
+
+	// THE ARBITER. OFF by default: it refuses ~450 orders a game and no
+	// measurement showed that helping. A centre ranked below the one whose
+	// decision the unit is
+	// still carrying out does not get to overwrite it. Without this the last
+	// writer won, which is why a corrected standoff ring measured perfect and
+	// changed nothing visible: the unit was re-ordered before it ever arrived.
+	// The window is the same 3s the census uses to call a re-send a repeat --
+	// bounded, so a unit can never be held longer than one decision's life.
+	const int prio = OrdSrcPrio(static_cast<int>(src));
+	if ((prio >= 0) && (circuit->GetTunable("apex_order_arbiter", 0.f) > 0.f)) {
+		const int hold = int(circuit->GetTunable("apex_intent_hold", 3.f) * FRAMES_PER_SEC);
+		const int age = frame - intentFrame;
+		if ((intentPrio > prio) && (age >= 0) && (age < hold)) {
+			circuit->NoteOrderRefused(static_cast<int>(src), intentPrio);
+			return true;   // refused: the standing higher-ranked order keeps running
+		}
+		intentPrio = prio;
+		intentFrame = frame;
+	}
+	if (suppress) {
+		suppress = circuit->GetTunable("apex_order_dedupe", 0.f) > 0.f;
+	}
+
+	if (!suppress) {  // a suppressed order leaves the standing one in place
+		s.x = pos.x;
+		s.z = pos.z;
+		s.id = id;
+		s.opts = options;
+		s.frame = frame;
+		s.timeout = timeout;
+		++ordSeq;
+		s.seq = ordSeq;
+	}
+	return suppress;
+}
+
+static unsigned sFormAsks = 0, sFormApplied = 0;
+
+// Only the orders that move a squad AS a squad get a slot. A build site, a
+// retreat point, the standoff ring and an attack position all carry their own
+// geometry and must land exactly where they were aimed.
+AIFloat3 CCircuitUnit::InFormation(const AIFloat3& p, OrdSrc src) const
+{
+	switch (src) {
+		case OrdSrc::TRAVEL: case OrdSrc::FWALK:
+		case OrdSrc::REGROUP: case OrdSrc::RALLY:
+			break;
+		default:
+			return p;
+	}
+	++sFormAsks;
+	if (formLateral == 0.f) {
+		return p;
+	}
+	AIFloat3 dir = formDir;
+	if (!utils::is_valid(dir) || (dir.SqLength2D() < 1.f)) {
+		// No squad heading yet (a gather with nobody having travelled): face the
+		// way we are about to walk, so the slots still open into a line abreast
+		// rather than a column.
+		dir = p - GetLastPos();
+		dir.y = 0.f;
+		if (dir.SqLength2D() < 1.f) {
+			return p;
+		}
+	}
+	dir.Normalize2D();
+	AIFloat3 out(p.x - dir.z * formLateral, p.y, p.z + dir.x * formLateral);
+	CTerrainManager::CorrectPosition(out);
+	++sFormApplied;
+	return out;
+}
+
+void CCircuitUnit::CmdMoveTo(const AIFloat3& p0, short options, int timeout, OrdSrc src)
+{
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
+	const AIFloat3 pos = InFormation(p0, src);
+	if (NoteOrder(OrdKind::MOVE, options, pos, 0, timeout, src)) {
+		return;
+	}
 	NoteAct("mov", timeout);
 	assert(utils::is_in_map(pos));
+	NoteSniperOrder(CCircuitDef::SniperOrder::MOVE);
 	unit->MoveTo(pos, options, timeout);
 //	unit->ExecuteCustomCommand(CMD_RAW_MOVE, {pos.x, pos.y, pos.z}, options, timeout);
 }
@@ -357,27 +609,103 @@ void CCircuitUnit::CmdRepeat(bool repeat, short options, int timeout)
 
 void CCircuitUnit::CmdJumpTo(const AIFloat3& pos, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 //	assert(utils::is_in_map(pos));
 //	unit->ExecuteCustomCommand(CMD_JUMP, {pos.x, pos.y, pos.z}, options, timeout);
 }
 
-void CCircuitUnit::CmdFightTo(const AIFloat3& pos, short options, int timeout)
+void CCircuitUnit::CmdFightTo(const AIFloat3& p0, short options, int timeout, OrdSrc src)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
+	// A sniper never fight-walks: CMobileCAI::ExecuteFight stops it on the
+	// first thing a weapon bears on. Every travel/regroup/fallback path funnels
+	// through here, so the swap covers all of them.
+	if (circuitDef->IsSniper()) {
+		CmdMoveTo(p0, options, timeout, src);  // InFormation applies there
+		return;
+	}
+	const AIFloat3 pos = InFormation(p0, src);
 	NoteAct("fgt", timeout);
 	assert(utils::is_in_map(pos));
+	NoteSniperOrder(CCircuitDef::SniperOrder::FIGHT);
+	if (NoteOrder(OrdKind::FIGHT, options, pos, 0, timeout, src)) {
+		return;
+	}
 	unit->Fight(pos, options, timeout);
 }
 
 void CCircuitUnit::CmdPatrolTo(const AIFloat3& pos, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	assert(utils::is_in_map(pos));
+	if (NoteOrder(OrdKind::PATROL, options, pos, 0, timeout, OrdSrc::PATROL)) {
+		return;
+	}
 	unit->PatrolTo(pos, options, timeout);
 }
 
 void CCircuitUnit::CmdAttackGround(const AIFloat3& pos, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
+	if (circuitDef->IsSniper()) {
+		CmdMoveTo(SniperHoldPos(pos), options, timeout, OrdSrc::SNIPER);
+		return;
+	}
 	assert(utils::is_in_map(pos));
+	if (NoteOrder(OrdKind::ATTACK, options, pos, -1, timeout, OrdSrc::ATTACK)) {
+		return;
+	}
 	unit->ExecuteCustomCommand(CMD_ATTACK_GROUND, {pos.x, pos.y, pos.z}, options, timeout);
+}
+
+AIFloat3 CCircuitUnit::SniperHoldPos(const AIFloat3& tPos)
+{
+	const int frame = (manager != nullptr) ? manager->GetCircuit()->GetLastFrame() : 0;
+	const AIFloat3& cur = GetPos(frame);
+	AIFloat3 dir = cur - tPos;
+	if (dir.SqLength2D() < 1.f) {
+		dir = AIFloat3(1.f, 0.f, 0.f);
+	}
+	dir.SafeNormalize2D();
+	AIFloat3 hold = tPos + dir * (circuitDef->GetMaxRange(CCircuitDef::RangeType::LAND) * 0.9f);
+	CTerrainManager::CorrectPosition(hold);
+	return hold;
+}
+
+void CCircuitUnit::NoteSniperOrder(CCircuitDef::SniperOrder kind) const
+{
+	if ((manager != nullptr) && circuitDef->IsSniper()) {
+		manager->GetCircuit()->NoteSniperOrder(kind);
+	}
+}
+
+void CCircuitUnit::CmdAttack(CEnemyInfo* enemy, short options, int timeout)
+{
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
+	// An attack order walks a sniper in and StopMoves it under fire
+	// (CMobileCAI::ExecuteObjectAttack); it holds at its own range instead.
+	if (circuitDef->IsSniper()) {
+		CmdMoveTo(SniperHoldPos(enemy->GetPos()), options, timeout, OrdSrc::SNIPER);
+		return;
+	}
+	NoteSniperOrder(CCircuitDef::SniperOrder::ATTACK);
+	// Zero position on purpose: an attack order names a UNIT, so the enemy id
+	// alone decides whether this repeats the last one. The ground variant above
+	// names a point, and there the distance buckets are the measurement.
+	if (NoteOrder(OrdKind::ATTACK, options, ZeroVector, enemy->GetId(), timeout, OrdSrc::ATTACK)) {
+		return;
+	}
+	unit->Attack(enemy->GetUnit(), options, timeout);
 }
 
 void CCircuitUnit::CmdWantedSpeed(float speed)
@@ -389,7 +717,15 @@ void CCircuitUnit::CmdWantedSpeed(float speed)
 
 void CCircuitUnit::CmdStop(short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->Stop(options, timeout);
+	// CMD_STOP is one of unit_target_on_the_move's own removal paths (we never
+	// pass ctrl, so ignoreStop is false and it drops the holder outright).
+	if (manager != nullptr) {
+		manager->GetCircuit()->TgtHoldDel(this);
+	}
 }
 
 void CCircuitUnit::CmdSetTarget(CEnemyInfo* enemy)
@@ -408,7 +744,30 @@ void CCircuitUnit::CmdSetTarget(CEnemyInfo* enemy)
 	if (enemy == nullptr) {
 		return;
 	}
+	// OUT OF REACH IS NOT A TARGET (apexearth: "set target commands against
+	// enemy units which are far out of range"). 5,622 of these went out in one
+	// 38-minute game; unit_target_on_the_move.lua discards any it cannot reach,
+	// so most were already inert -- but they showed on his screen and they lie
+	// to every consumer of tgtHeldId. ISquadTask::Attack re-issues each
+	// apex_standoff_s, so the target reapplies the moment we are in reach. The
+	// bar is this unit's OWN max weapon range, not the squad leader's.
+	if ((circuitDef != nullptr) && (circuitDef->GetMaxRange() > 0.f)) {
+		const AIFloat3& ePos = enemy->GetPos();
+		const AIFloat3& mPos = GetPos(manager != nullptr ? manager->GetCircuit()->GetLastFrame() : 0);
+		if (ePos.SqDistance2D(mPos) > SQUARE(circuitDef->GetMaxRange())) {
+			return;
+		}
+	}
+	NoteSniperOrder(CCircuitDef::SniperOrder::SET_TARGET);
+	NoteOrder(OrdKind::TARGET, 0, ZeroVector, enemy->GetId(), INT_MAX, OrdSrc::SETTGT);
 	unit->ExecuteCustomCommand(CMD_UNIT_SET_TARGET, {(float)enemy->GetId()});
+	// The gadget enrols only what its own validUnits table admits
+	// (canAttack and maxWeaponRange > 0); counting the rest would inflate the
+	// census with units it never sweeps.
+	if ((manager != nullptr) && (circuitDef != nullptr) && (circuitDef->GetMaxRange() > 0.f)) {
+		tgtHeldId = enemy->GetId();
+		manager->GetCircuit()->TgtHoldAdd(this);
+	}
 }
 
 void CCircuitUnit::CmdCloak(bool state)
@@ -495,34 +854,52 @@ bool CCircuitUnit::IsWaiting() const
 
 void CCircuitUnit::CmdRepair(CAllyUnit* target, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->Repair(target->GetUnit(), options, timeout);
 	taskState = ETaskState::EXECUTE;
 }
 
 void CCircuitUnit::CmdBuild(CCircuitDef* buildDef, const AIFloat3& buildPos, int facing, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->Build(buildDef->GetDef(), buildPos, facing, options, timeout);
 	taskState = ETaskState::EXECUTE;
 }
 
 void CCircuitUnit::CmdReclaimEnemy(CEnemyInfo* enemy, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->ReclaimUnit(enemy->GetUnit(), options, timeout);
 }
 
 void CCircuitUnit::CmdReclaimUnit(CAllyUnit* toReclaim, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->ReclaimUnit(toReclaim->GetUnit(), options, timeout);
 	taskState = ETaskState::EXECUTE;
 }
 
 void CCircuitUnit::CmdReclaimInArea(const AIFloat3& pos, float radius, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->ReclaimInArea(pos, radius, options, timeout);
 }
 
 void CCircuitUnit::CmdResurrectInArea(const AIFloat3& pos, float radius, short options, int timeout)
 {
+	if ((manager != nullptr) && IsDGunHeld(manager->GetCircuit()->GetLastFrame())) {
+		return;
+	}
 	unit->ResurrectInArea(pos, radius, options, timeout);
 }
 
@@ -556,6 +933,15 @@ void CCircuitUnit::Attack(CEnemyInfo* enemy, bool isGround, int timeout)
 {
 	NoteAct("atk", timeout);
 	target = enemy;
+	// A sniper takes only the hold move and the target: the queued fight
+	// order below would walk it in.
+	if (circuitDef->IsSniper()) {
+		TRY_UNIT(manager->GetCircuit(), this,
+			CmdAttack(enemy, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
+			CmdSetTarget(target);
+		)
+		return;
+	}
 	TRY_UNIT(manager->GetCircuit(), this,
 		const AIFloat3& pos = enemy->GetPos();
 		if (circuitDef->IsAttrMelee()) {
@@ -564,24 +950,24 @@ void CCircuitUnit::Attack(CEnemyInfo* enemy, bool isGround, int timeout)
 				if (isGround) {  // los-cheat related
 					CmdAttackGround(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 				} else {
-					unit->Attack(enemy->GetUnit(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
+					CmdAttack(enemy, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 				}
 			} else {
-				CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
+				CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout, OrdSrc::RING);
 				if (isGround) {  // los-cheat related
 					CmdAttackGround(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 				} else {
-					unit->Attack(enemy->GetUnit(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
+					CmdAttack(enemy, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 				}
 			}
 		} else {
 			if (isGround) {  // los-cheat related
 				CmdAttackGround(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
 			} else {
-				unit->Attack(enemy->GetUnit(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
+				CmdAttack(enemy, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
 			}
 		}
-		CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);  // los-cheat related
+		CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout, OrdSrc::RING);  // los-cheat related
 		CmdWantedSpeed(NO_SPEED_LIMIT);
 		CmdSetTarget(target);
 	)
@@ -617,20 +1003,23 @@ void CCircuitUnit::Attack(const AIFloat3& pos, CEnemyInfo* enemy, bool isGround,
 	// own los without standing inside enemy fire, so it holds the ring at the
 	// last known position and waits for allied vision instead of chasing.
 	const bool longGun = circuitDef->GetMaxRange() > circuitDef->GetLosRadius();
-	const bool prefer = (manager->GetCircuit()->GetTunable("apex_prefer_target", 1.f) > 0.f)
+	// A sniper takes move + set-target unconditionally, cloaked target included:
+	// the attack-ground fallback is an order that halts it under fire.
+	const bool prefer = circuitDef->IsSniper()
+			|| ((manager->GetCircuit()->GetTunable("apex_prefer_target", 1.f) > 0.f)
 			&& !isGround && !circuitDef->IsAttrMelee()
-			&& (isStatic || enemy->IsInRadarOrLOS() || longGun);
+			&& (isStatic || enemy->IsInRadarOrLOS() || longGun));
 	TRY_UNIT(manager->GetCircuit(), this,
 		if (circuitDef->IsAttrMelee() && IsJumpReady()) {
 			CmdJumpTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
-			CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
+			CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout, OrdSrc::RING);
 		} else {
-			CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
+			CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout, OrdSrc::RING);
 		}
 		if (!prefer) {
 			if (isGround) {  // los-cheat related
 				CmdAttackGround(enemy->GetPos(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
-				CmdFightTo(enemy->GetPos(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);  // los-cheat related
+				CmdFightTo(enemy->GetPos(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout, OrdSrc::RING);  // los-cheat related
 			} else {
 				// NO queued CmdFightTo here: a fight order re-acquires the
 				// closest enemy and stops all movement the moment a weapon
@@ -643,7 +1032,7 @@ void CCircuitUnit::Attack(const AIFloat3& pos, CEnemyInfo* enemy, bool isGround,
 				// uses a fight command"). The queued ATTACK already closes
 				// distance if the blip is genuinely out of reach, which was
 				// the fight order's whole job.
-				unit->Attack(enemy->GetUnit(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
+				CmdAttack(enemy, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 			}
 		}
 		CmdWantedSpeed(NO_SPEED_LIMIT);
@@ -674,7 +1063,7 @@ void CCircuitUnit::Gather(const AIFloat3& groupPos, int timeout)
 {
 //	const AIFloat3& pos = utils::get_radial_pos(groupPos, SQUARE_SIZE * 8);
 	TRY_UNIT(manager->GetCircuit(), this,
-		CmdMoveTo(groupPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout);
+		CmdMoveTo(groupPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout, OrdSrc::REGROUP);
 		CmdWantedSpeed(NO_SPEED_LIMIT);
 //		CmdPatrolTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY, timeout);
 	)

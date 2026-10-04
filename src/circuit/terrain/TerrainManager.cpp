@@ -816,6 +816,13 @@ void CTerrainManager::MarkAllyBuildings()
 	markFrame = circuit->GetLastFrame();
 
 	circuit->UpdateFriendlyUnits();
+	// apex: the list only changes on a refresh pass; re-merging it every frame
+	// walked every allied unit with an engine call per structure.
+	const int ver = circuit->GetAllyTeam()->GetFriendlyVersion();
+	if (ver == markVersion) {
+		return;
+	}
+	markVersion = ver;
 	const CAllyTeam::AllyUnits& friendlies = circuit->GetFriendlyUnits();
 	const int teamId = circuit->GetTeamId();
 	const int frame = circuit->GetLastFrame();
@@ -1959,6 +1966,10 @@ bool CTerrainManager::CanBeBuiltAtSafe(CCircuitDef* cdef, const AIFloat3& positi
 
 bool CTerrainManager::CanReachAt(CCircuitUnit* unit, const AIFloat3& destination, const float range)
 {
+	// Off the map the sector index is outside the grid GetClosestSector indexes.
+	if (!circuit->IsPosOnMap(destination)) {
+		return false;
+	}
 	if (unit->GetCircuitDef()->GetImmobileId() != -1) {  // A hub or factory
 		return unit->GetPos(circuit->GetLastFrame()).SqDistance2D(destination) < SQUARE(range);
 	}
@@ -1975,6 +1986,9 @@ bool CTerrainManager::CanReachAt(CCircuitUnit* unit, const AIFloat3& destination
 
 bool CTerrainManager::CanReachAtSafe(CCircuitUnit* unit, const AIFloat3& destination, const float range, const float threat)
 {
+	if (!circuit->IsPosOnMap(destination)) {
+		return false;
+	}
 	if (circuit->GetThreatMap()->GetThreatAt(destination) > threat) {
 		return false;
 	}

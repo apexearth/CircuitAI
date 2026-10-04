@@ -12,6 +12,8 @@
 
 namespace circuit {
 
+class CEnemyInfo;
+
 class CDefendTask: public ISquadTask {
 public:
 	CDefendTask(ITaskModule* mgr, const springai::AIFloat3& position,
@@ -30,13 +32,9 @@ public:
 //	void SetWantedTarget(CEnemyInfo* enemy) { SetTarget(enemy); }
 
 	FightType GetPromote() const { return promote; }
-
-public:
-	// A pool split off the attack blob to answer a breach must not promote
-	// straight back into ATTACK on its first update -- attackPower starts at
-	// maxPower by construction, so without the hold the split would dissolve
-	// before it arrived.
-	void HoldPromote(int untilFrame) { noPromoteUntil = untilFrame; }
+	// A hold pool (promote MELEE) is a state, not a capture: the script
+	// releases it to stock's exit when the hold no longer applies.
+	void SetPromote(FightType type) { check = type; promote = type; }
 
 protected:
 	float GetMaxPower() const { return maxPower; }
@@ -54,14 +52,9 @@ private:
 	FightType check;
 	FightType promote;
 	float maxPower;
-	// Why FindTarget came up empty this pass, for the intent ping: the walk
-	// back reads "back:hid"/"back:small"/... instead of an unexplained U-turn.
-	std::string noTgtWhy;
-	// How the current target got elected (atUs contact vs post election, and
-	// the threat it was priced at) -- the chase ping carries it, so an army
-	// dragged off by one scout shows which clause let it through.
-	std::string tgtWhy;
-	int noPromoteUntil = 0;              // see HoldPromote
+	int pettyLogAt = 0;
+	int detachUntil = 0;  // apex: a squad split off for one raider; no merge, no promote, no recruits
+	int Detach(CEnemyInfo* enemy, float threat);
 };
 
 } // namespace circuit

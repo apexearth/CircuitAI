@@ -6,6 +6,7 @@
  */
 
 #include "task/fighter/RallyTask.h"
+#include "task/fighter/SquadTask.h"
 #include "module/MilitaryManager.h"
 #include "setup/SetupManager.h"
 #include "terrain/TerrainManager.h"
@@ -40,6 +41,9 @@ bool CRallyTask::CanAssignTo(CCircuitUnit* unit) const
 		return false;
 	}
 	CCircuitDef* cdef = (*units.begin())->GetCircuitDef();
+	if (!ISquadTask::SameClimb(manager->GetCircuit(), cdef, unit->GetCircuitDef())) {
+		return false;
+	}
 	if ((cdef->IsAbleToFly() && unit->GetCircuitDef()->IsAbleToFly())
 		|| (cdef->IsAmphibious() && unit->GetCircuitDef()->IsAmphibious())
 		|| (cdef->IsSurfer() && unit->GetCircuitDef()->IsSurfer())
@@ -62,7 +66,7 @@ void CRallyTask::Start(CCircuitUnit* unit)
 		AIFloat3 pos = utils::is_valid(freePos) ? freePos : position;
 
 		TRY_UNIT(circuit, unit,
-			unit->CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, circuit->GetLastFrame() + FRAMES_PER_SEC * 60);
+			unit->CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, circuit->GetLastFrame() + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::RALLY);
 			unit->CmdWantedSpeed(NO_SPEED_LIMIT);
 		)
 		return;

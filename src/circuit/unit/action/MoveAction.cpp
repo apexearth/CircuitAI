@@ -48,36 +48,13 @@ void CMoveAction::Update(CCircuitAI* circuit)
 	switch (pathMaxIndex) {
 		case -2:  // arrived
 			TRY_UNIT(circuit, unit,
-				unit->CmdMoveTo(pPath->posPath.back(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
+				unit->CmdMoveTo(pPath->posPath.back(), UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::TRAVEL);
 			)
 			return;
 		case -1: return;  // continue with current waypoints
 		default: break;  // update waypoints
 	}
 	int step = pathIterator;
-
-	// apex: walk this unit's own line parallel to the shared path. The offset is
-	// perpendicular to the local direction of travel, recomputed per waypoint, so
-	// the formation stays square to the path around corners instead of shearing.
-	// Zero for every caller that does not opt in (builders, scouts, singles), and
-	// the lambda is then an identity function.
-	auto offsetPos = [this, circuit](const AIFloat3& p, int idx) -> AIFloat3 {
-		if (lateral == 0.f) {
-			return p;
-		}
-		const int last = int(pPath->posPath.size()) - 1;
-		const int a = std::max(0, std::min(idx, last));
-		const int b = std::max(0, std::min(idx + 1, last));
-		AIFloat3 dir = (a == b) ? AIFloat3(1.f, 0.f, 0.f) : (pPath->posPath[b] - pPath->posPath[a]);
-		dir.y = 0.f;
-		if (dir.SqLength2D() < 1.f) {
-			return p;
-		}
-		dir.Normalize2D();
-		AIFloat3 out(p.x - dir.z * lateral, p.y, p.z + dir.x * lateral);
-		CTerrainManager::CorrectPosition(out);
-		return out;
-	};
 
 	TRY_UNIT(circuit, unit,
 		constexpr short options = UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY | UNIT_COMMAND_OPTION_SHIFT_KEY;
@@ -97,19 +74,22 @@ void CMoveAction::Update(CCircuitAI* circuit)
 				unit->CmdJumpTo(jumpPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
 			}
 			if (isBadJump) {
-				const AIFloat3 pos = offsetPos(pPath->posPath[step], step);
-				unit->CmdMoveTo(pos, options, lastFrame + FRAMES_PER_SEC * 60);
+				FaceStep(step);
+				const AIFloat3& pos = pPath->posPath[step];
+				unit->CmdMoveTo(pos, options, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::TRAVEL);
 			}
 		} else {
-			const AIFloat3 pos = offsetPos(pPath->posPath[step], step);
-			unit->CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60);
+			FaceStep(step);
+			const AIFloat3& pos = pPath->posPath[step];
+			unit->CmdMoveTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, lastFrame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::TRAVEL);
 		}
 		unit->CmdWantedSpeed(stepSpeed);
 
 		for (int i = 2; (step < pathMaxIndex) && (i < 3); ++i) {
 			step = std::min(step + increment, pathMaxIndex);
-			const AIFloat3 pos = offsetPos(pPath->posPath[step], step);
-			unit->CmdMoveTo(pos, options, lastFrame + FRAMES_PER_SEC * 60 * i);
+			FaceStep(step);
+			const AIFloat3& pos = pPath->posPath[step];
+			unit->CmdMoveTo(pos, options, lastFrame + FRAMES_PER_SEC * 60 * i, CCircuitUnit::OrdSrc::TRAVEL);
 		}
 	)
 }

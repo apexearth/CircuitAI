@@ -12,6 +12,8 @@
 #include "unit/enemy/EnemyUnit.h"
 
 #include <map>
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 namespace circuit {
@@ -59,6 +61,19 @@ public:
 	float GetUnitPower(CCircuitUnit* unit) const;
 	int GetSquareSize() const { return squareSize; }
 	int GetMapSize() const { return mapSize; }
+
+	// apex: the rebuild runs on the shared worker pool, so none of it appears in
+	// aiMs. cells = inner-loop iterations of every paint (the bbox, which is
+	// what the loop actually walks); fills = mapSize resets. Relaxed atomics:
+	// 2*roles drawer jobs paint the same object concurrently, and these counters
+	// feed no decision, so no ordering is required and none is implied.
+	std::atomic<uint64_t> perfCells{0};
+	std::atomic<uint64_t> perfFills{0};
+	std::atomic<uint32_t> perfPaints{0};
+	std::atomic<uint32_t> perfAirDraws{0};
+	std::atomic<uint32_t> perfAmphDraws{0};
+	std::atomic<uint32_t> perfDecloak{0};
+	size_t GetRoleCount() const { return threatData0.roleThreats.size(); }
 
 private:
 	void ApplyRange(CCircuitDef* cdef);

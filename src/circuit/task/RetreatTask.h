@@ -52,6 +52,8 @@ private:
 	void ApplyCostMap(const CQueryCostMap* query, CCircuitUnit* newRep);
 
 	CCircuitUnit* repairer;
+	int comHoldLogAt = -999999;
+	int comEvadeAt = -999999;
 	std::shared_ptr<IPathQuery> costQuery;  // owner
 };
 

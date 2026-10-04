@@ -24,6 +24,7 @@ public:
 	virtual void RemoveAssignee(CCircuitUnit* unit) override;
 
 	virtual void Stop(bool done) override;
+	virtual void Update() override;
 
 protected:
 	virtual bool Execute(CCircuitUnit* unit) override;
@@ -39,6 +40,8 @@ private:
 
 	ICoreUnit::Id vipId;
 	bool isInterrupt;
+	bool isFrame;  // vip was a nanoframe when taken; the guard ends with it
+	IUnitTask* vipTask;  // a mobile vip's job when taken; the guard ends when it changes
 };
 
 } // namespace circuit

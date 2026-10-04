@@ -9,6 +9,8 @@
 #include "unit/FactoryData.h"
 #include "map/MapManager.h"
 #include "map/ThreatMap.h"
+#include "map/InfluenceMap.h"
+#include "unit/enemy/EnemyManager.h"
 #include "resource/MetalManager.h"
 #include "resource/EnergyManager.h"
 #include "resource/EnergyGrid.h"
@@ -28,6 +30,10 @@
 
 #include "AIFloat3.h"
 #include "Team.h"
+#include "Log.h"
+
+#include <algorithm>
+#include <chrono>
 
 namespace circuit {
 
@@ -140,9 +146,10 @@ void CAllyTeam::Release()
 	quadField.Kill();
 }
 
+// apex: the throttle below must not defeat the force -- jump clear of it.
 void CAllyTeam::ForceUpdateFriendlyUnits()
 {
-	--lastUpdate;
+	lastUpdate = -1000000;
 	UpdateFriendlyUnits();
 }
 
@@ -153,23 +160,74 @@ void CAllyTeam::UpdateFriendlyUnits()
 	// Options:
 	//   1) save CCircuitDef::Id instead of pointer. But u->GetCircuitDef() is too spread out to fix it now.
 	//   2) Move friendlyUnits from CAllyTeam level to CCircuitAI (and eat more memory and cpu on updates for each ai instance).
-	if (lastUpdate >= circuit->GetLastFrame()) {
+	// apex: half a second of tolerance, not one frame -- measured 630
+	// rebuilds a minute at 1,151 units (1.8s of every game-minute) because
+	// any task update may demand the list. Consumers already tolerate
+	// intra-frame staleness (a death after the frame's rebuild dangles
+	// until the next one); this is the same contract, wider.
+	// ForceUpdateFriendlyUnits stays the exact path.
+	constexpr int FRIENDLY_REFRESH_FRAMES = 15;
+	if (circuit->GetLastFrame() - lastUpdate < FRIENDLY_REFRESH_FRAMES) {
 		return;
 	}
 
-	for (auto& kv : friendlyUnits) {
-		delete kv.second;
-	}
-	friendlyUnits.clear();
+	const auto tFr0 = std::chrono::steady_clock::now();
 	COOAICallback* clb = circuit->GetCallback();
-	const std::vector<Unit*>& units = clb->GetFriendlyUnits();
-	for (Unit* u : units) {
-		int unitId = u->GetUnitId();
-		CCircuitDef::Id unitDefId = clb->Unit_GetDefId(unitId);
-		CAllyUnit* unit = new CAllyUnit(unitId, u, circuit->GetCircuitDef(unitDefId));
-		friendlyUnits[unitId] = unit;
+	// apex: diff the map by unit id instead of tearing it down. The rebuild
+	// cost three heap round trips per unit per pass (WrappUnit, CAllyUnit, map
+	// node) and the map was re-grown from empty every time, so it scaled with
+	// the whole army rather than with what changed.
+	friendlyIds = clb->GetFriendlyUnitIds();
+	std::sort(friendlyIds.begin(), friendlyIds.end());
+	friendlyIds.erase(std::unique(friendlyIds.begin(), friendlyIds.end()), friendlyIds.end());
+
+	auto it = friendlyUnits.begin();
+	size_t i = 0;
+	while ((it != friendlyUnits.end()) && (i < friendlyIds.size())) {
+		if (it->first < friendlyIds[i]) {  // gone since the last pass
+			delete it->second;
+			it = friendlyUnits.erase(it);
+			++perfFrDel;
+		} else if (it->first > friendlyIds[i]) {  // never seen
+			const ICoreUnit::Id unitId = friendlyIds[i++];
+			const CCircuitDef::Id unitDefId = clb->Unit_GetDefId(unitId);
+			friendlyUnits.emplace_hint(it, unitId,
+					new CAllyUnit(unitId, clb->WrapUnit(unitId), circuit->GetCircuitDef(unitDefId)));
+			++perfFrAdd;
+		} else {  // same unit: the def is still re-read, a morph changes it
+			const CCircuitDef::Id unitDefId = clb->Unit_GetDefId(it->first);
+			it->second->SetAllyCircuitDef(circuit->GetCircuitDef(unitDefId));
+			++it;
+			++i;
+		}
 	}
+	while (it != friendlyUnits.end()) {
+		delete it->second;
+		it = friendlyUnits.erase(it);
+		++perfFrDel;
+	}
+	for (; i < friendlyIds.size(); ++i) {
+		const ICoreUnit::Id unitId = friendlyIds[i];
+		const CCircuitDef::Id unitDefId = clb->Unit_GetDefId(unitId);
+		friendlyUnits.emplace_hint(friendlyUnits.end(), unitId,
+				new CAllyUnit(unitId, clb->WrapUnit(unitId), circuit->GetCircuitDef(unitDefId)));
+		++perfFrAdd;
+	}
+
 	lastUpdate = circuit->GetLastFrame();
+	++friendlyVersion;
+	perfFrUs += std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - tFr0).count();
+	++perfFrCalls;
+	if (lastUpdate >= perfFrNextLog) {
+		perfFrNextLog = lastUpdate + 1800;
+		circuit->LOG("apex: perf friendly calls=%u totalMs=%.1f units=%i add=%u del=%u",
+				perfFrCalls, perfFrUs / 1000.f, (int)friendlyUnits.size(), perfFrAdd, perfFrDel);
+		perfFrUs = 0;
+		perfFrCalls = 0;
+		perfFrAdd = 0;
+		perfFrDel = 0;
+	}
 }
 
 CAllyUnit* CAllyTeam::GetFriendlyUnit(ICoreUnit::Id unitId) const
@@ -300,6 +358,45 @@ void CAllyTeam::Update(CCircuitAI* ai)
 	} else {
 		enemyManager->UpdateEnemyDatas(quadField);
 	}
+	mapManager->GetWreckField().UpdateSlice(circuit, circuit->GetLastFrame());
+}
+
+void CAllyTeam::LogMapPerf(CCircuitAI* ai)
+{
+	if (circuit != ai) {  // one line per ally team, from the AI that enqueues
+		return;
+	}
+	CThreatMap* tm = mapManager->GetThreatMap();
+	CInfluenceMap* im = mapManager->GetInflMap();
+	const uint64_t thrCells = tm->perfCells.exchange(0, std::memory_order_relaxed);
+	const uint64_t thrFills = tm->perfFills.exchange(0, std::memory_order_relaxed);
+	const uint32_t thrPaints = tm->perfPaints.exchange(0, std::memory_order_relaxed);
+	const uint32_t thrAir = tm->perfAirDraws.exchange(0, std::memory_order_relaxed);
+	const uint32_t thrAmph = tm->perfAmphDraws.exchange(0, std::memory_order_relaxed);
+	const uint32_t thrCloak = tm->perfDecloak.exchange(0, std::memory_order_relaxed);
+	const uint64_t iEnemyCells = im->perfEnemyCells.exchange(0, std::memory_order_relaxed);
+	const uint64_t iAllyCells = im->perfAllyCells.exchange(0, std::memory_order_relaxed);
+	const uint64_t iFills = im->perfFills.exchange(0, std::memory_order_relaxed);
+	const uint64_t iApplyUs = im->perfApplyUs.exchange(0, std::memory_order_relaxed);
+	const uint32_t iEnemies = im->perfEnemies.exchange(0, std::memory_order_relaxed);
+	const uint32_t iFriendlies = im->perfFriendlies.exchange(0, std::memory_order_relaxed);
+	const uint32_t iApplies = im->perfApplies.exchange(0, std::memory_order_relaxed);
+	const uint64_t kOps = enemyManager->perfKmeansOps.exchange(0, std::memory_order_relaxed);
+	const uint32_t kEnemies = enemyManager->perfKmeansEnemies.exchange(0, std::memory_order_relaxed);
+	const uint32_t kK = enemyManager->perfKmeansK.load(std::memory_order_relaxed);
+
+	ai->LOG("apex: perf map t=%i roles=%u mapSize=%i | thr thrCells=%llu thrFills=%llu paints=%u"
+			" air=%u amph=%u cloak=%u",
+			ai->GetTeamId(), (unsigned)tm->GetRoleCount(), tm->GetMapSize(),
+			(unsigned long long)thrCells, (unsigned long long)thrFills, thrPaints,
+			thrAir, thrAmph, thrCloak);
+	ai->LOG("apex: perf map t=%i | infl enemyCells=%llu allyCells=%llu iFills=%llu"
+			" enemies=%u friendly=%u applyMs=%.1f/%u | kmeans ops=%llu n=%u k=%u",
+			ai->GetTeamId(),
+			(unsigned long long)iEnemyCells, (unsigned long long)iAllyCells,
+			(unsigned long long)iFills, iEnemies, iFriendlies,
+			iApplyUs / 1000.f, iApplies,
+			(unsigned long long)kOps, kEnemies, kK);
 }
 
 void CAllyTeam::EnqueueUpdate()

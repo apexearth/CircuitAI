@@ -119,6 +119,7 @@ public:
 	bool IsOpenGeoSpot(int spotId) const { return IsValidGeoSpot(spotId) && geoSpots[spotId].isOpen; }
 	void SetOpenGeoSpot(int spotId, bool value) { if (IsValidGeoSpot(spotId)) geoSpots[spotId].isOpen = value; }
 	bool IsUpgradingGeoSpot(int spotId) const { return IsValidGeoSpot(spotId) && geoSpots[spotId].isUp; }
+	int OpenGeoSpotCount() const { int n = 0; for (const SResSpot& g : geoSpots) { if (g.isOpen) ++n; } return n; }
 	void SetUpgradingGeoSpot(int spotId, bool value) { if (IsValidGeoSpot(spotId)) geoSpots[spotId].isUp = value; }
 
 	// apex: spot queries a script can call safely. FindOpenMexSpot applies the
@@ -314,6 +315,10 @@ private:
 		float storage;
 		float pull;
 		float income;
+		float usage;   // apex: what was actually consumed last frame (GetUsage); pull is what was ASKED
+		float excess;  // apex: what was thrown away last frame (GetExcess) -- the waste, straight from the engine
+		float share;   // apex: the bank fraction above which the engine sends the rest to allies (GetShare)
+		float sent;    // apex: what went to allies over the last team update (GetSent)
 	} metal, energy;
 	int metalPullCorFrame;
 	float metalPullCor;

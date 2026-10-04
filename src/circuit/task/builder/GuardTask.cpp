@@ -20,6 +20,8 @@ CBGuardTask::CBGuardTask(ITaskModule* mgr, Priority priority, CCircuitUnit* vip,
 					   Type::BUILDER, BuildType::GUARD, {0.f, 0.f}, 0.f, timeout)
 		, vipId(vip->GetId())
 		, isInterrupt(isInterrupt)
+		, isFrame(!vip->IsFinished())
+		, vipTask(vip->GetTask())
 {
 }
 
@@ -85,6 +87,34 @@ void CBGuardTask::Stop(bool done)
 	IBuilderTask::Stop(done);
 }
 
+// A guard taken on a nanoframe is a build, and it ends when the frame does.
+// Nothing else ends it: a Guard has no target, so the base class never sees
+// completion, and a hold sized for one pair of hands outlived a many-handed
+// afus by twenty minutes (apexearth 2026-09-08).
+void CBGuardTask::Update()
+{
+	CCircuitUnit* vip = manager->GetCircuit()->GetTeamUnit(vipId);
+	if (isFrame) {
+		if ((vip == nullptr) || vip->IsFinished()) {
+			manager->AbortTask(this);
+			return;
+		}
+	} else if ((vip == nullptr)
+		|| (vip->GetCircuitDef()->IsMobile() && (vip->GetTask() != vipTask)))
+	{
+		// A guard on a CONSTRUCTOR was priced for the job it was raising;
+		// when that con moves to its next job the assist follows it across
+		// the base for the rest of the stint (apexearth 2026-09-14: "once we
+		// start to guard a constructor, we rarely consider stopping that
+		// guard action"). The job ending ends the guard. A FACTORY's job is
+		// producing and its task rolls over with every unit it finishes, so
+		// the same test cut every plant assist to one unit's build time.
+		manager->AbortTask(this);
+		return;
+	}
+	IBuilderTask::Update();
+}
+
 bool CBGuardTask::Execute(CCircuitUnit* unit)
 {
 	executors.insert(unit);
@@ -106,7 +136,7 @@ bool CBGuardTask::Execute(CCircuitUnit* unit)
 			if ((unit->GetCircuitDef()->GetBuildDistance() > 80.f) && (vipPos.SqDistance2D(unitPos) < SQUARE(48.f))) {
 				AIFloat3 pos = vipPos + (unitPos - vipPos).Normalize2D() * 64.f;
 				CTerrainManager::CorrectPosition(pos);
-				unit->CmdMoveTo(pos, options | UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+				unit->CmdMoveTo(pos, options | UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60, CCircuitUnit::OrdSrc::GUARD);
 				options = UNIT_COMMAND_OPTION_SHIFT_KEY;
 			}
 			unit->GetUnit()->Guard(vip->GetUnit(), options);

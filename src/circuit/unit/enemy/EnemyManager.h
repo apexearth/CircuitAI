@@ -14,6 +14,8 @@
 #include "util/MaskHandler.h"
 
 #include <limits>
+#include <atomic>
+#include <cstdint>
 
 namespace terrain {
 	struct SArea;
@@ -32,7 +34,7 @@ public:
 	using EnemyFakes = std::set<CEnemyFake*>;
 	struct SEnemyGroup {
 		explicit SEnemyGroup(const springai::AIFloat3& p)
-			: pos(p), cost(0.f), influence(0.f), vagueMetric(1.f)
+			: pos(p), cost(0.f), influence(0.f), vagueMetric(1.f), vel(0.f), velVec(0.f, 0.f, 0.f)
 		{
 			roleCosts.fill(0.f);
 		}
@@ -42,6 +44,8 @@ public:
 		float cost;
 		float influence;  // thr_mod applied
 		float vagueMetric;
+		float vel;  // fastest member, elmos per second
+		springai::AIFloat3 velVec;  // that member's velocity, elmos per second
 	};
 
 	CEnemyManager(CCircuitAI* circuit);
@@ -62,6 +66,13 @@ public:
 	void EnqueueUpdate();
 	bool IsUpdating() const { return isUpdating; }
 
+	// apex: KMeansIteration is O(enemies * k) on a worker, k = min(32, 1+sqrt(n)),
+	// and nothing measured it. Relaxed atomics: a worker writes, the main thread
+	// clears; the counters feed no decision.
+	std::atomic<uint64_t> perfKmeansOps{0};
+	std::atomic<uint32_t> perfKmeansEnemies{0};
+	std::atomic<uint32_t> perfKmeansK{0};
+
 	bool UnitInLOS(CEnemyUnit* data);
 	bool UnitInLOS(CEnemyUnit* data, CCircuitDef::Id unitDefId);
 	std::pair<CEnemyUnit*, bool> RegisterEnemyUnit(ICoreUnit::Id unitId, bool isInLOS);
@@ -77,6 +88,8 @@ public:
 	float GetEnemyMaxMobileCostM() const;
 	// apex: longest weapon range in a group -- danger radius depends on it.
 	float GetEnemyGroupRange(int idx) const;
+	int GetEnemyGroupUnitCount(int i) const;
+	CCircuitDef::Id GetEnemyGroupUnitDef(int i, int k) const;  // 0 when unknown
 private:
 	void DyingEnemy(CEnemyUnit* enemy);
 	void DeleteEnemyUnit(CEnemyUnit* data);
@@ -102,6 +115,11 @@ public:
 
 	const std::vector<SEnemyGroup>& GetEnemyGroups() const { return enemyGroups; }
 	const springai::AIFloat3& GetEnemyPos() const { return enemyPos; }
+	// Cost-weighted centre of every known enemy STRUCTURE (a raid passing
+	// through is not where they live); (-1,-1,-1) when none is known.
+	springai::AIFloat3 GetEnemyStructPos() const;
+	float GetEnemyStructCost() const;
+	float GetEnemyStructCostAt(const springai::AIFloat3& pos, float radius) const;
 	float GetMinGroupThreat() const { return enemyGroups[minThreatGroupIdx].influence; }
 	float GetPreMaxGroupThreat() const { return enemyGroups[preMaxThreatGroupIdx].influence; }
 	float GetMaxGroupThreat() const { return enemyGroups[maxThreatGroupIdx].influence; }
@@ -150,6 +168,12 @@ private:
 	int dyingFrame;
 	std::set<CEnemyUnit*> enemyDying;
 
+	// apex: the whole-registry aggregates, read many times a frame from script
+	mutable int aggFrame = -1;
+	mutable springai::AIFloat3 aggStructPos;
+	mutable float aggStructCost = 0.f;
+	mutable float aggMaxMobileCostM = 0.f;
+	void FillAggregates() const;
 	std::vector<SEnemyData> hostileDatas;  // immutable during threaded processing
 	std::vector<SEnemyData> peaceDatas;  // immutable during threaded processing
 

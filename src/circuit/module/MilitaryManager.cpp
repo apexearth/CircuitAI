@@ -38,6 +38,7 @@
 #include "terrain/path/PathFinder.h"
 #include "terrain/path/QueryPathMulti.h"
 #include "unit/enemy/EnemyUnit.h"
+#include <algorithm>
 #include "CircuitAI.h"
 #include "util/GameAttribute.h"
 #include "util/Utils.h"
@@ -353,7 +354,9 @@ void CMilitaryManager::InitHandlers()
 		} else {
 //			damagedHandler[unitDefId] = structDamagedHandler;
 			if (cdef.IsRoleSuper()) {
-				if (cdef.IsAttacker()) {
+				// apex: the Juno's warhead does 1 damage, so it is no attacker, but it
+				// is a launcher all the same
+				if (cdef.IsAttacker() || cdef.IsAttrStock()) {
 					createdHandler[unitDefId] = superCreatedHandler;
 					finishedHandler[unitDefId] = superFinishedHandler;
 					destroyedHandler[unitDefId] = superDestroyedHandler;
@@ -593,13 +596,17 @@ void CMilitaryManager::Init()
 		CScheduler* scheduler = circuit->GetScheduler().get();
 		const int interval = 4;
 		const int offset = circuit->GetSkirmishAIId() % interval;
-		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateIdle, this), interval, offset + 0);
-		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::Update, this), 1/*interval / 2*/, offset + 1);
-		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateDefenceTasks, this), FRAMES_PER_SEC * 5, offset + 2);
+		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateIdle, this), 1, offset + 0, "milIdle");  // apex: per frame; CIdleTask slices for it
+		// apex: squads re-plan every second in contact, every two out of it
+		// (TaskModule lodQuiet); firing and damage retreats are engine reflexes.
+		updateRate = 30;
+		lodQuiet = true;
+		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::Update, this), 1/*interval / 2*/, offset + 1, "milUpd");
+		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateDefenceTasks, this), FRAMES_PER_SEC * 5, offset + 2, "milDef");
 
 		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::Watchdog, this),
 								FRAMES_PER_SEC * 60,
-								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 12);
+								circuit->GetSkirmishAIId() * WATCHDOG_COUNT + 12, "wdog");
 	};
 
 	circuit->GetSetupManager()->ExecOnFindStart(subinit);
@@ -762,10 +769,24 @@ void CMilitaryManager::NoteSuperTarget(const AIFloat3& pos, int frame)
 	superShots.push_back(SSuperShot{pos, frame});
 }
 
-bool CMilitaryManager::IsRecentSuperTarget(const AIFloat3& pos, float sqRadius, int frame) const
+bool CMilitaryManager::HasRecentShot(const AIFloat3& pos, float sqRadius, int frame) const
 {
 	for (const SSuperShot& shot : superShots) {
 		if ((shot.frame + SUPER_MEMORY > frame) && (shot.pos.SqDistance2D(pos) < sqRadius)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// apex: an ally's shot counts as ours (apexearth 2026-09-30: both seats' Junos
+// kept landing on one spot).
+bool CMilitaryManager::IsRecentSuperTarget(const AIFloat3& pos, float sqRadius, int frame) const
+{
+	for (CCircuitAI* ai : circuit->GetGameAttribute()->GetCircuits()) {
+		if (ai->IsInitialized() && (ai->GetAllyTeamId() == circuit->GetAllyTeamId())
+			&& ai->GetMilitaryManager()->HasRecentShot(pos, sqRadius, frame))
+		{
 			return true;
 		}
 	}
@@ -826,215 +847,6 @@ void CMilitaryManager::DefaultMakeDefence(int cluster, const AIFloat3& pos)
 {
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	return;
-	// TODO: Rework, depends on mex cluster
-	assert(cluster >= 0);
-
-	const int frame = circuit->GetLastFrame();
-	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
-	CBuilderManager* builderMgr = circuit->GetBuilderManager();
-
-	if (terrainMgr->IsZoneAlly(pos)) {
-		return;
-	}
-
-	// FIXME: New choke defences
-//	const CArea* area = terrainMgr->GetTAArea(pos);
-//	if (area == nullptr) {
-//		return;
-//	}
-//	const std::vector<const CChokePoint*>& chokes = area->GetChokePoints();
-//	constexpr float TEST_SIZE = 64;
-//	for (const CChokePoint* ch : chokes) {
-//		const CArea* opArea = (ch->GetAreas().first == area) ? ch->GetAreas().second : ch->GetAreas().first;
-//		if (((int)opArea->GetChokePoints().size() == opArea->GetNumSmallChokes()) || (opArea->GetAccessibleNeighbours().size() < 2)) {
-//			continue;
-//		}
-//		const AIFloat3& middle = ch->GetCenter();
-//		bool isDefIn = false;
-//		for (auto task : builderMgr->GetTasks(IBuilderTask::BuildType::DEFENCE)) {
-//			if (static_cast<CBDefenceTask*>(task)->GetPosition().SqDistance2D(middle) < SQUARE(TEST_SIZE)) {
-//				isDefIn = true;
-//				break;
-//			}
-//		}
-//		if (!isDefIn
-//			&& !circuit->GetCallback()->IsFriendlyUnitsIn(middle, TEST_SIZE, false)
-//			&& !circuit->GetCallback()->IsNeutralUnitsIn(middle, TEST_SIZE, false))
-//		{
-//			auto selectDef = [terrainMgr, frame, &middle](const std::vector<CCircuitDef*>& defs) -> CCircuitDef* {
-//				for (CCircuitDef* cdef : defs) {
-//					if (cdef->IsAvailable(frame) && terrainMgr->CanBeBuiltAt(cdef, middle)) {
-//						return cdef;
-//					}
-//				}
-//				return nullptr;
-//			};
-//			if (ch->IsSmall()) {
-//				CCircuitDef* bd = selectDef(GetSideInfo().wallDefs);
-//				if (bd != nullptr) {
-//					terrainMgr->DoLineOfDef(ch->GetEnd1(), ch->GetEnd2(), bd, [builderMgr](const AIFloat3& pos, CCircuitDef* buildDef) {
-//						builderMgr->EnqueueTask(IBuilderTask::Priority::NORMAL, buildDef, pos,
-//								IBuilderTask::BuildType::DEFENCE, buildDef->GetCostM(), 0.f, true);
-//					});
-//				}
-//			} else {
-//				CCircuitDef* bd = selectDef(GetSideInfo().chokeDefs);
-//				if (bd != nullptr) {
-//					builderMgr->EnqueueTask(IBuilderTask::Priority::NORMAL, bd, middle,
-//							IBuilderTask::BuildType::DEFENCE, bd->GetCostM(), 0.f, true);
-//				}
-//			}
-//		}
-//	}
-
-	CEconomyManager* em = circuit->GetEconomyManager();
-	const float metalIncome = std::min(em->GetAvgMetalIncome(), em->GetAvgEnergyIncome()) * em->GetEcoFactor();
-	float maxCost = amountFactor * metalIncome;
-	CDefenceData::SDefPoint* closestPoint = FindClosestDefPoint(cluster, pos, [maxCost](const CDefenceData::SDefPoint& pnt) {
-		return pnt.cost < maxCost;
-	});
-	if (closestPoint == nullptr) {
-		return;
-	}
-	float totalCost = .0f;
-	IBuilderTask* parentTask = nullptr;
-
-	// Front-line porc
-	CMetalManager* mm = circuit->GetMetalManager();
-	const CMetalData::Clusters& clusters = mm->GetClusters();
-	bool isPorc = mm->GetClusterStdDeviation() > 0.3f * mm->GetClusterAvgIncome();
-	if (isPorc) {
-		const float income = (mm->GetClusterAvgIncome() + mm->GetClusterMaxIncome()) * 0.5f;
-		isPorc = (clusters[cluster].position.SqDistance2D(circuit->GetSetupManager()->GetBasePos()) > SQUARE(1000.f))
-			&& clusters[cluster].income > income;
-	}
-	if (!isPorc) {
-		unsigned threatCount = 0;
-		CThreatMap* threatMap = circuit->GetThreatMap();
-		const CMetalData::Metals& spots = mm->GetSpots();
-		const CMetalData::ClusterGraph& clusterGraph = mm->GetClusterGraph();
-		CMetalData::ClusterGraph::Node node = clusterGraph.nodeFromId(cluster);
-		CMetalData::ClusterGraph::IncEdgeIt edgeIt(clusterGraph, node);
-		for (; edgeIt != lemon::INVALID; ++edgeIt) {
-			int idx0 = clusterGraph.id(clusterGraph.oppositeNode(node, edgeIt));
-			if (mm->IsClusterFinished(idx0)) {
-				continue;
-			}
-			// check if there is enemy neighbor
-			for (int idx : clusters[idx0].idxSpots) {
-				if (threatMap->GetBuilderThreatAt(spots[idx].position) > THREAT_MIN * 4) {
-					threatCount++;
-					break;
-				}
-			}
-			if (threatCount >= 2) {  // if 2 nearby clusters are a threat
-				isPorc = true;
-				break;
-			}
-		}
-	}
-	isPorc |= circuit->GetInflMap()->GetInfluenceAt(pos) < INFL_EPS;
-	if (!isPorc) {
-		const float sqPtRange = SQUARE(defence->GetPointRange());
-		for (IBuilderTask* t : builderMgr->GetTasks(IBuilderTask::BuildType::DEFENCE)) {
-			if ((t->GetTarget() == nullptr) && (t->GetNextTask() != nullptr) &&
-				(closestPoint->position.SqDistance2D(t->GetTaskPos()) < sqPtRange))
-			{
-				builderMgr->AbortTask(t);
-				break;
-			}
-		}
-	}
-	// NOTE: circuit->GetTerrainManager()->IsWaterSector(pos) checks whole sector
-	//       but water recognized as height < 0
-	bool isWater = !terrainMgr->IsWaterAVoid() && (circuit->GetMap()->GetElevationAt(pos.x, pos.z) < -SQUARE_SIZE * 2);
-	const std::vector<CCircuitDef*>& defenders = isWater ? GetSideInfo().waterDefenders : GetSideInfo().landDefenders;
-	unsigned num = std::min<unsigned>(isPorc ? defenders.size() : preventCount, defenders.size());
-	std::function<bool (CCircuitDef*)> skip;
-//	if (isPorc) {
-//		skip = [&totalCost, closestPoint, maxCost](CCircuitDef* cdef) -> bool {
-//			return (totalCost <= closestPoint->cost) || (!cdef->IsRoleAA() && (totalCost + cdef->GetCostM() < maxCost));
-//		};
-//	} else {
-		skip = [&totalCost, closestPoint](CCircuitDef* cdef) -> bool {
-			return (totalCost <= closestPoint->cost);
-		};
-//	}
-
-//	CSetupManager* setupMgr = circuit->GetSetupManager();
-	// TODO: use footprint size instead of const (SQUARE_SIZE * 16)
-//	AIFloat3 frontDir = (setupMgr->GetLanePos() - setupMgr->GetBasePos()).Normalize2D() * (SQUARE_SIZE * 16);
-	AIFloat3 frontDir = (circuit->GetEnemyManager()->GetEnemyPos() - pos).Normalize2D() * (SQUARE_SIZE * 10);
-	AIFloat3 sideDir(-frontDir.z, 0.f, frontDir.x);  // counter-clockwise
-	AIFloat3 backPos = closestPoint->position - frontDir;
-	AIFloat3 frontPoses[2] = {closestPoint->position + frontDir, closestPoint->position + frontDir - sideDir};
-	AIFloat3 middlePoses[2] = {closestPoint->position, closestPoint->position - sideDir};
-	AIFloat3 backPoses[2] = {backPos, backPos - sideDir};
-	for (AIFloat3* pos : {&backPos, &frontPoses[0], &frontPoses[1], &middlePoses[0], &middlePoses[1], &backPoses[0], &backPoses[1]}) {
-		CTerrainManager::CorrectPosition(*pos);
-	}
-	std::pair<AIFloat3*, int> poses[3] = {std::make_pair(frontPoses, 0), std::make_pair(middlePoses, 0), std::make_pair(backPoses, 0)};
-
-	CEnemyManager* enemyMgr = circuit->GetEnemyManager();
-	// apex: RETIRE THE BOTTOM OF THE LADDER WHEN THE TOP IS POCKET CHANGE.
-	// Every defence point starts at defenders[0] and climbs, so a fresh point
-	// bought a Sentry, a Beamer and a Dragon's Claw at any income -- maxCost
-	// bounds the TOP of the ladder and never the bottom (apexearth, at 700
-	// metal/s: "they are a waste of space... OBSOLETE at this point").
-	// Obsolete is his own definition, both halves: the best rung is trivially
-	// affordable, AND this rung is far cheaper than it. Neither a clock nor a
-	// tech test -- at low income the top rung is not affordable and the whole
-	// ladder still gets built.
-	CCircuitDef* topDef = nullptr;
-	for (unsigned i = 0; i < num; ++i) {
-		if (defenders[i]->IsAvailable(frame) && !defenders[i]->IsRoleAA()) {
-			if ((topDef == nullptr) || (defenders[i]->GetCostM() > topDef->GetCostM())) {
-				topDef = defenders[i];
-			}
-		}
-	}
-	const float obsSecs = circuit->GetTunable("apex_porc_obsolete_secs", 20.f);
-	const float obsRatio = circuit->GetTunable("apex_porc_obsolete_ratio", 7.f);
-	// Armada's ladder is 85/190/340/440/680/3500: at ratio 7 the Pulsar retires
-	// everything up to Overwatch and keeps the Pit Bull, which is the set
-	// apexearth named as obsolete against the T2+ guns he wants instead.
-	const bool retireCheap = (topDef != nullptr)
-			&& (topDef->GetCostM() < metalIncome * obsSecs);
-	for (unsigned i = 0; i < num; ++i) {
-		CCircuitDef* defDef = defenders[i];
-		if (!defDef->IsAvailable(frame) || (defDef->IsRoleAA() && (enemyMgr->GetEnemyCost(ROLE_TYPE(AIR)) < 1.f))) {
-			continue;
-		}
-		if (retireCheap && !defDef->IsRoleAA()
-			&& (defDef->GetCostM() * obsRatio < topDef->GetCostM()))
-		{
-			continue;
-		}
-		totalCost += defDef->GetCostM();
-		if (skip(defDef)) {
-			continue;
-		}
-		if (totalCost < maxCost) {
-			closestPoint->cost += defDef->GetCostM();
-			bool isFirst = (parentTask == nullptr);
-			std::pair<AIFloat3*, int>& pose = poses[defDef->IsAttacker() ? ((defDef->GetMaxRange() < 500.f) ? 0 : 1) : 2];
-			const int ind = pose.second++ % 2;
-			IBuilderTask* task = builderMgr->Enqueue(TaskB::Common(IBuilderTask::BuildType::DEFENCE,
-					IBuilderTask::Priority::NORMAL, defDef, pose.first[ind], SQUARE_SIZE * 2, isFirst));
-			static_cast<CBDefenceTask*>(task)->SetDefPointId(closestPoint->id);
-			pose.first[ind] += (ind == 0) ? sideDir : -sideDir;
-			CTerrainManager::CorrectPosition(pose.first[ind]);
-			if (parentTask != nullptr) {
-				parentTask->SetNextTask(task);
-			}
-			parentTask = task;
-		} else {
-			// TODO: Auto-sort defenders by cost OR remove break?
-			break;
-		}
-	}
-
-	MakeSensors(backPos, maxCost, isPorc ? 1 / 4.f : 1 / SQRT_2, isWater);
 }
 
 void CMilitaryManager::MakeSensors(const AIFloat3& backPos, float maxCost, float radiusMod, bool isWater)
@@ -1086,27 +898,6 @@ void CMilitaryManager::DefaultMakeSensors(int cluster, const AIFloat3& pos)
 {
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	return;
-	assert(cluster >= 0);
-	if (!radarDefs.HasAvail() && !sonarDefs.HasAvail()) {
-		return;
-	}
-	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
-	if (terrainMgr->IsZoneAlly(pos)) {
-		return;
-	}
-
-	CEconomyManager* em = circuit->GetEconomyManager();
-	const float metalIncome = std::min(em->GetAvgMetalIncome(), em->GetAvgEnergyIncome()) * em->GetEcoFactor();
-	const float maxCost = amountFactor * metalIncome;
-
-	const CDefenceData::SDefPoint* pnt = FindClosestDefPoint(cluster, pos);
-	const AIFloat3& anchor = (pnt == nullptr) ? pos : pnt->position;
-	AIFloat3 backPos = anchor - (circuit->GetEnemyManager()->GetEnemyPos() - pos).Normalize2D() * (SQUARE_SIZE * 10);
-	CTerrainManager::CorrectPosition(backPos);
-
-	const bool isWater = !terrainMgr->IsWaterAVoid()
-			&& (circuit->GetMap()->GetElevationAt(pos.x, pos.z) < -SQUARE_SIZE * 2);
-	MakeSensors(backPos, maxCost, 1 / SQRT_2, isWater);
 }
 
 void CMilitaryManager::MarkPorc(CCircuitUnit* unit, int defPointId)
@@ -1334,6 +1125,30 @@ bool CMilitaryManager::GetGuardAnchor(AIFloat3& outPos) const
 		return true;
 	}
 	return false;
+}
+
+// apex: the same score for a NAMED spot, so a pool can be asked what the place
+// it is already walking to is worth right now. GetGuardAnchor answers only
+// 'which is best', which is why the re-pick had nothing to compare against.
+float CMilitaryManager::GuardSpotScore(const AIFloat3& from, int idx) const
+{
+	const std::vector<CCircuitAI::SHotSpot>& spots = circuit->GetHotSpots();
+	if ((idx < 0) || (idx >= int(spots.size())) || !utils::is_valid(from)) {
+		return .0f;
+	}
+	const CCircuitAI::SHotSpot& spot = spots[idx];
+	if ((spot.weight < HOT_MIN_WEIGHT) || !circuit->IsPosOnMap(spot.pos)) {
+		return .0f;
+	}
+	if (circuit->GetInflMap()->GetInfluenceAt(spot.pos) <= -INFL_EPS) {
+		return .0f;
+	}
+	CThreatMap* threatMap = circuit->GetThreatMap();
+	const float remaining = threatMap->GetThreatAt(spot.pos);
+	if (remaining <= .0f) {
+		return .0f;
+	}
+	return remaining / (from.distance2D(spot.pos) + float(threatMap->GetSquareSize()));
 }
 
 // The same question asked from ONE pool's position: which unanswered breach is
@@ -1701,6 +1516,42 @@ float CMilitaryManager::ClampMobileCostRatio() const
 	return (enemyMobileCost > armyCost) ? (armyCost / enemyMobileCost) : 1.f;
 }
 
+// UpdateDefenceTasks, SetGuardPost, GetGuardPost and DispatchRaids reverted to
+// stock 2026-09-08. apexearth ruled per-building guard posts cut entirely --
+// they were the largest single source of "go stand somewhere" orders, which
+// outnumbered fight orders 10:1 -- and the raid dispatcher was already inert
+// (apex_intercept defaulted to 0). The army-split block went with them: it
+// held a freshly split pool off promotion, which is fight logic.
+unsigned int CMilitaryManager::ReleaseHoldPools()
+{
+	unsigned int n = 0;
+	for (IFighterTask* task : GetTasks(IFighterTask::FightType::DEFEND)) {
+		CDefendTask* dt = static_cast<CDefendTask*>(task);
+		if (dt->GetPromote() != IFighterTask::FightType::MELEE) {
+			continue;
+		}
+		dt->SetPromote(IFighterTask::FightType::ATTACK);
+		++n;
+	}
+	return n;
+}
+
+// The inverse: while the script says home cannot answer what is standing on it,
+// a pool that would leave on its next promotion tick stays a defence instead.
+unsigned int CMilitaryManager::HoldPools()
+{
+	unsigned int n = 0;
+	for (IFighterTask* task : GetTasks(IFighterTask::FightType::DEFEND)) {
+		CDefendTask* dt = static_cast<CDefendTask*>(task);
+		if (dt->GetPromote() != IFighterTask::FightType::ATTACK) {
+			continue;
+		}
+		dt->SetPromote(IFighterTask::FightType::MELEE);
+		++n;
+	}
+	return n;
+}
+
 void CMilitaryManager::UpdateDefenceTasks()
 {
 	/*
@@ -1722,56 +1573,11 @@ void CMilitaryManager::UpdateDefenceTasks()
 //	const CMetalData::Metals& spots = mm->GetSpots();
 	const CMetalData::Clusters& clusters = mm->GetClusters();
 //	const std::vector<CEnemyManager::SEnemyGroup>& enemyGroups = circuit->GetEnemyManager()->GetEnemyGroups();
-	// A DEFEND task takes its stand position ONCE, in Enqueue, from
-	// GetDefenceStand() -- the tower cluster nearest our lane at the moment the
-	// task happened to be created. It was never revised afterwards, so a garrison
-	// formed in minute 5 was still holding minute 5's ground at minute 40, and
-	// every unit built into it was sent there by CDefendTask::Start. apexearth:
-	// "the enemy is attacking one of our frontline bases and our huge army isn't
-	// there to protect it."
-	//
-	// Re-anchored to the same thing a squad with no target walks to, so the two
-	// agree: where we are being hit, else the front. Only while the task has no
-	// target of its own -- an engaged task writes its target into position and
-	// must not be pulled off it.
-	//
-	// PER POOL, not one anchor for all of them. Every garrison used to be sent to
-	// the single heaviest point, so two breaches at once pulled the whole army to
-	// one of them (or, when it was a centroid, to a point between them that was
-	// neither). Heaviest pool picks first and its power is subtracted from that
-	// spot's demand, so the next pool prefers the next-worst breach. With one
-	// fight running there is one spot and this is the old behaviour exactly.
-	std::vector<CDefendTask*> defTasks;
-	defTasks.reserve(tasks.size());
 	for (IFighterTask* task : tasks) {
-		defTasks.push_back(static_cast<CDefendTask*>(task));
-	}
-	std::sort(defTasks.begin(), defTasks.end(), [](const CDefendTask* a, const CDefendTask* b) {
-		return a->GetAttackPower() > b->GetAttackPower();
-	});
-	std::vector<float> assigned(circuit->GetHotSpots().size(), .0f);
-	AIFloat3 fallback;
-	const bool hasFallback = GetGuardAnchor(fallback);
-	const int frame = circuit->GetLastFrame();
-	for (CDefendTask* dt : defTasks) {
-		if (dt->GetTarget() == nullptr) {
-			CCircuitUnit* leader = dt->GetLeader();
-			const AIFloat3& from = (leader != nullptr) ? dt->GetLeaderPos(frame) : dt->GetPosition();
-			if (leader != nullptr) {
-				// GetThreatAt reads whichever layer was selected last.
-				circuit->GetThreatMap()->SetThreatType(leader);
-			}
-			AIFloat3 anchor;
-			int spot = -1;
-			if (GetGuardAnchor(from, assigned, anchor, spot)) {
-				dt->SetPosition(anchor);
-				if (spot < int(assigned.size())) {
-					assigned[spot] += dt->GetAttackPower();
-				}
-			} else if (hasFallback) {
-				dt->SetPosition(fallback);
-			}
-		}
+		CDefendTask* dt = static_cast<CDefendTask*>(task);
+//		if (dt->GetTarget() != nullptr) {
+//			continue;
+//		}
 //		STerrainMapArea* area = dt->GetLeader()->GetArea();
 //		CMetalData::PointPredicate predicate = [em, tm, area, &spots, &clusters](const int index) {
 //			const CMetalData::MetalIndices& idcs = clusters[index].idxSpots;
@@ -1806,110 +1612,6 @@ void CMilitaryManager::UpdateDefenceTasks()
 //			dt->SetMaxPower(std::max(minAttackers, enemyGroups[groupIdx].threat));
 //		}
 		dt->SetMaxPower(std::max(minAttackers, circuit->GetEnemyManager()->GetPreMaxGroupThreat()));
-	}
-
-	/*
-	 * Split: a breach no defend pool can answer peels a matched slice out of
-	 * the biggest attack squad. apexearth 2026-08-22: "There'll be an army
-	 * killing our base and our army is off fighting some other army, winning
-	 * that fight, but our base is dead." Demand is measured on live enemy
-	 * GROUP influence (the threat map reads ~0 almost everywhere), answered
-	 * at a margin, taken fastest-first so the response can arrive in time;
-	 * the rest of the squad keeps its fight.
-	 */
-	if (circuit->GetTunable("apex_army_split", 1.f) > 0.f) {
-		const int frame = circuit->GetLastFrame();
-		if (frame >= splitFrame) {
-			const std::vector<CCircuitAI::SHotSpot>& spots = circuit->GetHotSpots();
-			CInfluenceMap* inflMap = circuit->GetInflMap();
-			const std::vector<CEnemyManager::SEnemyGroup>& groups =
-					circuit->GetEnemyManager()->GetEnemyGroups();
-			int bestSpot = -1;
-			float bestDemand = .0f;
-			for (unsigned i = 0; i < spots.size(); ++i) {
-				if ((spots[i].weight < HOT_MIN_WEIGHT) || !circuit->IsPosOnMap(spots[i].pos)) {
-					continue;
-				}
-				// A spot on ground we do not hold is a fight lost elsewhere,
-				// not a breach -- same gate as GetGuardAnchor.
-				if (inflMap->GetInfluenceAt(spots[i].pos) <= -INFL_EPS) {
-					continue;
-				}
-				float live = .0f;
-				for (const CEnemyManager::SEnemyGroup& g : groups) {
-					if (g.pos.SqDistance2D(spots[i].pos) < SQUARE(800.f)) {
-						live += g.influence;
-					}
-				}
-				// apexearth 2026-08-22: "If the base has enough defenses to
-				// handle what's attacking it then we don't need to send our
-				// army to it." The guns already standing at the breach count
-				// against the demand, same radius as the enemy measure.
-				float standing = .0f;
-				for (CCircuitUnit* s : circuit->GetOwnStructsNear(spots[i].pos, 800.f)) {
-					CCircuitDef* sdef = s->GetCircuitDef();
-					if (sdef->IsAttacker() && !sdef->IsRoleAA()) {
-						standing += sdef->GetPower();
-					}
-				}
-				const float already = (i < assigned.size()) ? assigned[i] : .0f;
-				const float demand = live - already - standing;
-				if (demand > bestDemand) {
-					bestDemand = demand;
-					bestSpot = (int)i;
-				}
-			}
-			CAttackTask* src = nullptr;
-			if (bestSpot >= 0) {
-				for (IFighterTask* t : GetTasks(IFighterTask::FightType::ATTACK)) {
-					CAttackTask* at = static_cast<CAttackTask*>(t);
-					if ((at->GetLeader() == nullptr) || at->GetAssignees().empty()) {
-						continue;
-					}
-					if ((src == nullptr) || (at->GetAttackPower() > src->GetAttackPower())) {
-						src = at;
-					}
-				}
-			}
-			const AIFloat3& spotPos = (bestSpot >= 0) ? spots[bestSpot].pos : ZeroVector;
-			// Only when the squad is too far to answer by itself -- nearby it
-			// already elects the breach as a target.
-			if ((src != nullptr)
-				&& (src->GetLeaderPos(frame).SqDistance2D(spotPos)
-					> SQUARE(circuit->GetTunable("apex_split_min_dist", 1600.f))))
-			{
-				const float want = bestDemand * circuit->GetTunable("apex_split_margin", 1.3f);
-				std::vector<CCircuitUnit*> order(src->GetAssignees().begin(), src->GetAssignees().end());
-				std::sort(order.begin(), order.end(), [](CCircuitUnit* a, CCircuitUnit* b) {
-					return a->GetCircuitDef()->GetSpeed() > b->GetCircuitDef()->GetSpeed();
-				});
-				float got = .0f;
-				unsigned take = 0;
-				while ((take < order.size()) && (got < want)) {
-					got += order[take]->GetCircuitDef()->GetPower();
-					++take;
-				}
-				if ((take > 0) && (got >= want * 0.5f)) {  // enough to matter, even if it is the whole squad
-					CDefendTask* dt2 = static_cast<CDefendTask*>(Enqueue(TaskF::Defend(
-							IFighterTask::FightType::ATTACK, IFighterTask::FightType::ATTACK, got)));
-					dt2->SetPosition(spotPos);
-					dt2->HoldPromote(frame + FRAMES_PER_SEC
-							* (int)circuit->GetTunable("apex_split_hold", 40.f));
-					for (unsigned i = 0; i < take; ++i) {
-						AssignTask(order[i], dt2);
-					}
-					splitFrame = frame + FRAMES_PER_SEC
-							* (int)circuit->GetTunable("apex_split_cd", 30.f);
-					circuit->LOG("apex: SPLIT %d units (%.0f power) answer breach (%.0f,%.0f) demand=%.0f (net of pools+guns), %d stay",
-							(int)take, got, spotPos.x, spotPos.z, bestDemand,
-							(int)(order.size() - take));
-					if (circuit->GetTunable("apex_ping", 0.f) > 0.f) {
-						circuit->GetDrawer()->AddPoint(spotPos, utils::string_format(
-								"SPLIT n=%d demand=%d", (int)take, (int)bestDemand).c_str());
-					}
-				}
-			}
-		}
 	}
 
 	/*
@@ -2002,18 +1704,6 @@ void CMilitaryManager::MakeBaseDefence(const AIFloat3& pos)
 	// Brain overhaul 2026-08-22: the DLL originates no economy/build decisions; the script Brain does.
 	// buildDefence stays empty, so UpdateDefence() enqueues nothing.
 	return;
-	if (circuit->IsLoadSave()) {
-		return;
-	}
-	const BuildVector& baseDefence = GetSideInfo().baseDefence;
-	if (baseDefence.empty()) {
-		return;
-	}
-	buildDefence.emplace_back(pos, baseDefence);
-	if (defend == nullptr) {
-		defend = CScheduler::GameJob(&CMilitaryManager::UpdateDefence, this);
-		circuit->GetScheduler()->RunJobEvery(defend, FRAMES_PER_SEC);
-	}
 }
 
 void CMilitaryManager::AddSensorDefs(const std::set<CCircuitDef*>& buildDefs)
@@ -2128,7 +1818,25 @@ CEnemyInfo* CMilitaryManager::FindBCombatTarget(CCircuitUnit* unit, const AIFloa
 			targetCat = edef->GetCategory();
 			if (((targetCat & canTargetCat) == 0)
 				|| circuit->GetCircuitDef(edef->GetId())->IsIgnore()
-				|| (edef->IsAbleToFly() && !(IsInWater ? cdef->HasSubToAir() : cdef->HasSurfToAir())))  // notAA
+				|| (edef->IsAbleToFly() && !cdef->IsAirHunter(IsInWater)))  // notAA
+			{
+				continue;
+			}
+			// apex: a builder never chases what outruns it. A scout outside
+			// our range that is faster than we are is not a target -- the
+			// commander walked after light scouts it could never catch
+			// (apexearth 2026-09-19: "he should just make a turret where he
+			// is"). Inside range the guns answer without a step.
+			if ((edef->GetSpeed() > cdef->GetSpeed())
+				&& (ePos.SqDistance2D(pos) > SQUARE(cdef->GetMaxRange())))
+			{
+				continue;
+			}
+			// apex: the commander fights what is nearly in his reach and walks
+			// to nothing (apexearth: "the commander is still being frontline
+			// rambo"; died 1,200 elmos out chasing Warriors at 6.8 min).
+			if (cdef->IsRoleComm()
+				&& (ePos.SqDistance2D(pos) > SQUARE(cdef->GetMaxRange() * 1.5f)))
 			{
 				continue;
 			}
@@ -2219,11 +1927,29 @@ IUnitTask* CMilitaryManager::DefaultMakeTask(CCircuitUnit* unit)
 		if (it != types.end()) {
 			switch (it->second) {
 				case IFighterTask::FightType::RAID: {
-					const std::set<IFighterTask*>& guards = GetTasks(IFighterTask::FightType::GUARD);
-					for (IFighterTask* t : guards) {
-						if (t->CanAssignTo(unit)) {
-							task = t;
-							break;
+					// apex: A RAIDER'S FIRST JOB IS TO RAID. This scanned GUARD
+					// tasks FIRST and joined any that would take the unit, so
+					// with guard duty available a raid pool never formed at
+					// all: measured 2026-09-01, guard peaked at 19 tasks while
+					// raid peaked at ONE task holding 260 metal, in a game
+					// apexearth watched us take none of the openings the enemy
+					// took every time ("We 100% have opportunities. The enemy
+					// takes the opportunities - we never do").
+					//
+					// The raid pool is offered the unit first; guard duty still
+					// gets it when no raid can be formed, which is the case the
+					// original order was protecting.
+					const bool raidFirst = circuit->GetTunable("apex_raid_first", 1.f) > 0.f;
+					if (raidFirst) {
+						task = Enqueue(TaskF::Defend(IFighterTask::FightType::RAID, raid.min));
+					}
+					if (task == nullptr) {
+						const std::set<IFighterTask*>& guards = GetTasks(IFighterTask::FightType::GUARD);
+						for (IFighterTask* t : guards) {
+							if (t->CanAssignTo(unit)) {
+								task = t;
+								break;
+							}
 						}
 					}
 					if (task == nullptr) {
@@ -2248,7 +1974,53 @@ IUnitTask* CMilitaryManager::DefaultMakeTask(CCircuitUnit* unit)
 						}
 					}
 					if (task == nullptr) {
-						const float power = std::max(minAttackers, enemyMgr->GetPreMaxGroupThreat());
+						// apex: A BAR WE CANNOT REACH IS NOT CAUTION, IT IS
+						// PARALYSIS. This was max(minAttackers,
+						// GetPreMaxGroupThreat()) -- the influence of the
+						// enemy's single LARGEST group -- so a defence pool
+						// could only ever promote to ATTACK by matching their
+						// biggest blob. Measured 2026-09-01 (4v4 vs BARb hard,
+						// Comet Catcher): their largest group reached 48 units
+						// and 39,257 army against our whole army of 1,786, and
+						// the AI created ZERO attack tasks in twenty minutes
+						// while building 60,547 metal of army. It is also
+						// self-locking: the mayReinforce escape in DefendTask
+						// needs an ATTACK task to already exist, and none can
+						// exist until someone clears the full bar.
+						//
+						// apexearth: "If we see a large enemy army at one
+						// place, then we know where their army is. we can
+						// defend against that army at home, and take 1/3rd of
+						// our army to kill the enemy base." That is the right
+						// question -- is there something we can beat -- and it
+						// is not answered by their largest concentration. So
+						// the bar is also capped by a share of OUR OWN army: a
+						// pool holding that share is a real force and goes,
+						// whatever they have massed elsewhere.
+						// IN THE SAME CURRENCY. The first version of this cap
+						// used GetArmyCost(), which is METAL, against
+						// GetPreMaxGroupThreat(), which is INFLUENCE -- so the
+						// cap never bit and attack stayed at 0 tasks on the
+						// re-run. attackPower on a fighter task is summed from
+						// GetPower(), the same quantity the enemy groups are
+						// measured in, so our own army's power is the sum over
+						// our fighter pools.
+						float ourPower = 0.f;
+						for (IFighterTask::FightType ft : {IFighterTask::FightType::ATTACK,
+						                                   IFighterTask::FightType::DEFEND,
+						                                   IFighterTask::FightType::RAID,
+						                                   IFighterTask::FightType::GUARD}) {
+							for (IFighterTask* t : GetTasks(ft)) {
+								ourPower += t->GetAttackPower();
+							}
+						}
+						const float ourShare = ourPower
+								* circuit->GetTunable("apex_attack_share", 0.34f);
+						float power = enemyMgr->GetPreMaxGroupThreat();
+						if ((ourShare > 0.f) && (ourShare < power)) {
+							power = ourShare;
+						}
+						power = std::max(minAttackers, power);
 						task = Enqueue(TaskF::Defend(IFighterTask::FightType::ATTACK, power));
 					}
 				} break;

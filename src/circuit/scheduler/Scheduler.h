@@ -14,8 +14,13 @@
 
 #include <memory>
 #include <list>
+#include <vector>
+#include <chrono>
+#include <cstdint>
 
 namespace circuit {
+
+class CCircuitAI;
 
 class CScheduler {
 public:
@@ -67,7 +72,11 @@ public:
 	/*
 	 * Add task at specified interval
 	 */
-	void RunJobEvery(const std::shared_ptr<IMainJob>& task, int frameInterval = FRAMES_PER_SEC, int frameOffset = 0) {
+	void RunJobEvery(const std::shared_ptr<IMainJob>& task, int frameInterval = FRAMES_PER_SEC, int frameOffset = 0,
+			const char* name = nullptr) {
+		if (name != nullptr) {
+			task->SetJobName(name);
+		}
 		repeatTasks.push_back({task, frameInterval, lastFrame - frameInterval + frameOffset});
 	}
 
@@ -79,12 +88,12 @@ public:
 	/*
 	 * Run concurrent task, finalize on success at main thread
 	 */
-	void RunParallelJob(const std::shared_ptr<IThreadJob>& task);
+	void RunParallelJob(const std::shared_ptr<IThreadJob>& task, const char* name = nullptr);
 
 	/*
 	 * Same as RunParallelTask but pushes task in front of the queue
 	 */
-	void RunPriorityJob(const std::shared_ptr<IThreadJob>& task);
+	void RunPriorityJob(const std::shared_ptr<IThreadJob>& task, const char* name = nullptr);
 
 	/*
 	 * Remove scheduled task from queue
@@ -111,6 +120,42 @@ public:
 	void RemoveReleaseJob(const std::shared_ptr<IMainJob>& task);
 
 	static int GetMaxWorkThreads()/* const*/ { return gMaxWorkThreads; }
+
+	// apex: one line per game-minute naming what the frame's job time was
+	// spent on. jobsMs was ~87% of the whole AI frame at hour scale and had no
+	// breakdown at all; without this the C++ half is one opaque bucket.
+	void LogJobPerf(CCircuitAI* circuit);
+
+	// apex: the worker pool is shared by every AI in the process and nothing
+	// measured it -- ThreatMap/InfluenceMap/EnemyManager rebuilds and every
+	// path query land there, so they were billed to "the engine" in aiMs.
+	// wait= is queue latency, which with 16 AIs on 2-8 threads is the number
+	// that says whether the pool is saturated.
+	void LogWorkPerf(CCircuitAI* circuit);
+
+private:
+	struct SJobPerf {
+		const char* name;
+		uint64_t us;
+		unsigned calls;
+		uint64_t maxUs;
+	};
+	std::vector<SJobPerf> jobPerf;
+	void AccountJob(const char* name, uint64_t us);
+
+	struct SWorkPerf {
+		const char* name;
+		uint64_t us;
+		uint64_t waitUs;
+		unsigned calls;
+		uint64_t maxUs;
+		uint64_t maxWaitUs;
+	};
+	std::vector<SWorkPerf> workPerf;
+	spring::mutex workPerfMutex;   // workers write, main thread reads and clears
+	uint64_t workQueueSum = 0;
+	unsigned workQueueMax = 0;
+	void AccountWorkJob(const char* name, uint64_t us, uint64_t waitUs, size_t qDepth);
 
 private:
 	std::weak_ptr<CScheduler> self;
@@ -144,10 +189,14 @@ private:
 	std::vector<std::shared_ptr<IMainJob>> removeTasks;
 
 	struct WorkTask {
-		WorkTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<IThreadJob>& task)
-			: scheduler(scheduler), task(task) {}
+		WorkTask(const std::weak_ptr<CScheduler>& scheduler, const std::shared_ptr<IThreadJob>& task,
+				const char* name = nullptr)
+			: scheduler(scheduler), task(task), name(name)
+			, pushed(std::chrono::steady_clock::now()) {}
 		std::weak_ptr<CScheduler> scheduler;
 		std::shared_ptr<IThreadJob> task;
+		const char* name;
+		std::chrono::steady_clock::time_point pushed;
 	};
 	static CMultiQueue<WorkTask> gWorkTasks;
 

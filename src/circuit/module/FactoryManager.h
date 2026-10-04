@@ -204,7 +204,11 @@ public:
 	float GetMinOffset() const { return minOffset; }
 	float GetLenOffset() const { return lenOffset; }
 
+	void UnitRelocated(CCircuitUnit* unit, const springai::AIFloat3& from);
+
 private:
+	void AttachAssist(CCircuitUnit* unit, const springai::AIFloat3& assPos, int frame);
+	void DetachAssist(CCircuitUnit* unit, const springai::AIFloat3& assPos);
 	CCircuitDef* DefaultGetFactoryToBuild(const springai::AIFloat3& position, bool isStart, bool isReset);
 	void EnableFactory(CCircuitUnit* unit);
 	void DisableFactory(CCircuitUnit* unit);
@@ -213,6 +217,15 @@ private:
 	IUnitTask* CreateAssistTask(CCircuitUnit* unit);
 
 	void Watchdog();
+
+	// Release one nano turret per tick from a building when a factory it can
+	// reach is producing (apexearth 2026-09-06); see the definitions.
+	void PullNanoOffBuilding();
+	bool HasFactoryOutputInRange(CCircuitUnit* nano);
+	// (round-robin index removed: the whole assist set is swept each pass)
+	int nanoPulled = 0;
+	int nanoPullLogAt = 0;
+	int nanoSeen = 0, nanoOnRepair = 0, nanoOnStatic = 0, nanoHasOut = 0;
 
 	Handlers2 createdHandler;
 	Handlers1 finishedHandler;
