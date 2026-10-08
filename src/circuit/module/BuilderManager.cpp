@@ -549,6 +549,15 @@ int CBuilderManager::UnitCreated(CCircuitUnit* unit, CCircuitUnit* builder)
 	return 0; //signaling: OK
 }
 
+bool CBuilderManager::IsReclaimUnit(CAllyUnit* unit) const
+{
+	if (reclaimUnits.find(unit) != reclaimUnits.end()) {
+		return true;
+	}
+	auto it = scriptReclaim.find(unit->GetId());
+	return (it != scriptReclaim.end()) && (it->second > circuit->GetLastFrame());
+}
+
 int CBuilderManager::UnitFinished(CCircuitUnit* unit)
 {
 	auto iter = unfinishedUnits.find(unit);
@@ -609,6 +618,7 @@ int CBuilderManager::UnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker)
 	if ((itcl != reclaimUnits.end()) && (itcl->second != nullptr)) {
 		DoneTask(itcl->second);
 	}
+	scriptReclaim.erase(unit->GetId());
 
 	auto search = destroyedHandler.find(unit->GetCircuitDef()->GetId());
 	if (search != destroyedHandler.end()) {
@@ -771,10 +781,15 @@ IUnitTask* CBuilderManager::Enqueue(const TaskB::SServBTask& ti)
 
 	switch (ti.type) {
 		case IBuilderTask::BuildType::PATROL: {
-			task = new CBPatrolTask(this, ti.priority, ti.position, ti.timeout);
+			CBPatrolTask* pt = new CBPatrolTask(this, ti.priority, ti.position, ti.timeout);
+			pt->SetMove(ti.isMove);
+			task = pt;
 		} break;
 		case IBuilderTask::BuildType::GUARD: {
-			task = new CBGuardTask(this, ti.priority, ti.target, ti.isInterrupt, ti.timeout);
+			// apex: no target = an ally's unit, its id carried in powerMod (TaskB::GuardAlly).
+			task = (ti.target != nullptr)
+				? new CBGuardTask(this, ti.priority, ti.target, ti.isInterrupt, ti.timeout)
+				: new CBGuardTask(this, ti.priority, ICoreUnit::Id(ti.powerMod), ti.position, ti.timeout);
 		} break;
 		case IBuilderTask::BuildType::COMBAT: {
 			task = new CCombatTask(this, ti.powerMod);

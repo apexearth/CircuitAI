@@ -6,6 +6,7 @@
  */
 
 #include "CircuitAI.h"
+#include <filesystem>
 #include "scheduler/Scheduler.h"
 #include "script/ScriptManager.h"
 #include "script/InitScript.h"
@@ -160,8 +161,29 @@ CCircuitAI::CCircuitAI(OOAICallback* clb)
 		const char* name = info->GetValueByKey("name");
 		const char* version = info->GetValueByKey("version");
 		logTag = std::string((name != nullptr) ? name : "?") + "-" + ((version != nullptr) ? version : "?");
+		aiVersion = (version != nullptr) ? version : "?";
 		std::unique_ptr<DataDirs> dirs(clb->GetDataDirs());
-		const char* dir = dirs->GetWriteableDir();
+		const char* dirRaw = dirs->GetWriteableDir();
+		// THE LOG LIVES UNDER THE VERSION THAT RUNS. A hosted game names no
+		// version, and the engine can hand a bot the folder of an older
+		// version still on disk; the loaded library's own AIInfo is the truth.
+		std::string dirFixed = (dirRaw != nullptr) ? std::string(dirRaw) : std::string();
+		if (!dirFixed.empty() && (version != nullptr)) {
+			std::string up = dirFixed;
+			while (!up.empty() && ((up.back() == '/') || (up.back() == '\\'))) {
+				up.pop_back();
+			}
+			const size_t cut = up.find_last_of("/\\");
+			if ((cut != std::string::npos) && (up.substr(cut + 1) != version)) {
+				const std::string mine = up.substr(0, cut + 1) + version + "/";
+				std::error_code ec;
+				std::filesystem::create_directories(mine, ec);
+				if (!ec) {
+					dirFixed = mine;
+				}
+			}
+		}
+		const char* dir = dirFixed.empty() ? nullptr : dirFixed.c_str();
 		if (dir != nullptr) {
 			const std::string path = std::string(dir) + "apex-t" + std::to_string(teamId) + ".log";
 			// KEEP THE LAST GAME THAT RAN (apexearth 2026-09-29: a load that died
@@ -1629,12 +1651,20 @@ int CCircuitAI::UnitMoveFailed(CCircuitUnit* unit)
 	}
 
 	if (unit->IsMoveFailed(lastFrame)) {
-		// The commander is never written off: a permanent stuck flag swallowed
-		// every idle and move-failed event after minute 6.7 while a Reclaim of
-		// himself sat in the queue. The script's pen test frees him.
+		// Never written off. The permanent flag swallowed every later idle, so a
+		// unit stopped here was never given another order, and the Reclaim of
+		// itself it enqueued was never taken: no builder falls through to
+		// DefaultMakeTask. Units stopped this way stood in their factory yards
+		// for the rest of the game. The script's yard watch and pen test free them.
+		unit->ClearStuck();
+		++stuckStops;
+		if (lastFrame >= stuckLogAt) {
+			stuckLogAt = lastFrame + FRAMES_PER_SEC * 60;
+			const AIFloat3& p = unit->GetPos(lastFrame);
+			LOG("apex: move-failed stops=%i last=%s #%d at=%.0f,%.0f",
+					stuckStops, unit->GetCircuitDef()->GetDef()->GetName(), unit->GetId(), p.x, p.z);
+		}
 		if (unit->GetCircuitDef()->IsRoleComm()) {
-			unit->ClearStuck();
-			LOG("apex: move-failed commander #%d", unit->GetId());
 			return 0;  // signaling: OK
 		}
 		// ROAM unsticks a fighter; on a builder it was permanent, and a
@@ -1646,8 +1676,6 @@ int CCircuitAI::UnitMoveFailed(CCircuitUnit* unit)
 				unit->CmdSetMoveState(CCircuitDef::MoveType::ROAM);
 			}
 		)
-//		Garbage(unit, "stuck");
-		GetBuilderManager()->Enqueue(TaskB::Reclaim(IBuilderTask::Priority::NORMAL, unit));
 	} else if (unit->GetTask()->GetType() != IUnitTask::Type::NIL) {
 		unit->GetTask()->OnUnitMoveFailed(unit);
 	}
@@ -1658,6 +1686,7 @@ int CCircuitAI::UnitMoveFailed(CCircuitUnit* unit)
 int CCircuitAI::UnitDamaged(CCircuitUnit* unit, ICoreUnit::Id attackerId, int weaponId, AIFloat3 dir)
 {
 	unit->SetDamagedFrame(lastFrame);
+	unit->SetDamagedWeapon(weaponId);
 	unit->SetDamagedDir(dir);  // points toward the shooter (see CreateFakeEnemy)
 	CEnemyInfo* attacker = GetEnemyInfo(attackerId);
 
@@ -1697,11 +1726,10 @@ int CCircuitAI::UnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker)
 		// The script only does bookkeeping; it needs the task the unit
 		// actually died holding.
 		script->UnitDestroyed(unit);
-		// Attribution rides a separate optional callback; only fired when the
-		// attacker's def is actually known (see CInitScript::UnitDestroyedBy).
-		if (attacker != nullptr) {
-			script->UnitDestroyedBy(unit, attacker->GetCircuitDef());
-		}
+		// Attribution rides a separate optional callback, fired for every death:
+		// with no visible attacker the def is null and the script reads the
+		// weapon that last hit the unit (see CInitScript::UnitDestroyedBy).
+		script->UnitDestroyedBy(unit, (attacker != nullptr) ? attacker->GetCircuitDef() : nullptr);
 	}
 
 	for (auto& module : modules) {
@@ -2704,6 +2732,36 @@ int CCircuitAI::GetBaseGridFacing(const AIFloat3& pos) const
 		return (fx >= 0.f) ? UNIT_FACING_EAST : UNIT_FACING_WEST;
 	}
 	return (fz >= 0.f) ? UNIT_FACING_SOUTH : UNIT_FACING_NORTH;
+}
+
+int CCircuitAI::DefaultFacingAt(const AIFloat3& pos) const
+{
+	const int gridFacing = GetBaseGridFacing(pos);
+	if (gridFacing != UNIT_NO_FACING) {
+		return gridFacing;
+	}
+	const float terWidth = terrainManager->GetTerrainWidth();
+	const float terHeight = terrainManager->GetTerrainHeight();
+	if (std::fabs(terWidth - 2 * pos.x) > std::fabs(terHeight - 2 * pos.z)) {
+		return (2 * pos.x > terWidth) ? UNIT_FACING_WEST : UNIT_FACING_EAST;
+	}
+	return (2 * pos.z > terHeight) ? UNIT_FACING_NORTH : UNIT_FACING_SOUTH;
+}
+
+int CCircuitAI::FactorySiteFacing(CCircuitDef* def, const AIFloat3& pos)
+{
+	if ((def == nullptr) || !utils::is_valid(pos) || !IsPosOnMap(pos)) {
+		return UNIT_NO_FACING;
+	}
+	const int facing = DefaultFacingAt(pos);
+	CTerrainManager* tm = GetTerrainManager();
+	if (!GetMap()->IsPossibleToBuildAt(def->GetDef(), pos, facing)
+		|| tm->FootprintOnSpot(def, pos, facing)
+		|| !tm->FactoryExitOpen(def, pos, facing))
+	{
+		return UNIT_NO_FACING;
+	}
+	return facing;
 }
 
 // Snap a build position onto the base grid, leaving the walkways empty.

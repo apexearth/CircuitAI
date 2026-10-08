@@ -129,6 +129,8 @@ private:
 	int UnitFinished(CCircuitUnit* unit);
 	int UnitIdle(CCircuitUnit* unit);
 	int UnitMoveFailed(CCircuitUnit* unit);
+	int stuckStops = 0;
+	int stuckLogAt = 0;
 	int UnitDamaged(CCircuitUnit* unit, ICoreUnit::Id attackerId, int weaponId, springai::AIFloat3 dir);
 	int UnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker);
 	int UnitGiven(ICoreUnit::Id unitId, int oldTeamId, int newTeamId);
@@ -349,6 +351,14 @@ public:
 	// or UNIT_NO_FACING when the grid does not apply. Factories use it so their
 	// exit apron opens onto the road to the front instead of the map centre.
 	int GetBaseGridFacing(const springai::AIFloat3& pos) const;
+	// The facing a build task gives a building at pos: the grid's, else toward
+	// the map centre along the longer axis (IBuilderTask::FindFacing).
+	int DefaultFacingAt(const springai::AIFloat3& pos) const;
+	// The facing a factory at pos would get, when CBFactoryTask would take the
+	// site exactly as handed (engine footprint, no metal/geo spot under it, the
+	// exit in one area); UNIT_NO_FACING otherwise. The builder's clearance and
+	// the lane of statics ahead are the caller's to check.
+	int FactorySiteFacing(CCircuitDef* def, const springai::AIFloat3& pos);
 	// In-game map markers, for watching what the AI believes. These are ordinary
 	// map points/lines: allies and spectators see them, so anything using these
 	// must stay off by default outside a debug watch.
@@ -677,6 +687,13 @@ private:
 // <<< WeaponDefs ---- END
 
 public:
+	// The static unit def that fires this weapon, or -1: what shelled us when the
+	// shooter was out of sight (UnitDamaged still names the weapon).
+	int GetWeaponStaticOwner(int weaponDefId) const {
+		if ((weaponDefId < 0) || ((size_t)weaponDefId >= weaponToUnitDefs.size())
+			|| weaponToUnitDefs[weaponDefId].staticIds.empty()) return -1;
+		return *weaponToUnitDefs[weaponDefId].staticIds.begin();
+	}
 	bool IsInitialized() const { return isInitialized; }
 	bool IsSavegame() const { return isSavegame; }
 	bool IsLoadSave() const { return isLoadSave; }
@@ -859,10 +876,14 @@ private:
 	std::unique_ptr<springai::SkirmishAI> skirmishAI;
 	FILE* logFile;
 	std::string logTag;
+	std::string aiVersion;
 	int64_t logEpochNs;   // process age when logSteady0 was taken
 	std::chrono::steady_clock::time_point logSteady0;
 	std::mutex logMutex;
 	std::unique_ptr<springai::Team>       team;
+public:
+	const std::string& GetAiVersion() const { return aiVersion; }
+private:
 
 	static std::unique_ptr<CGameAttribute> gameAttribute;
 	static unsigned int gaCounter;

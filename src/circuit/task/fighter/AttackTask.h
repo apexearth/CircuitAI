@@ -26,7 +26,10 @@ public:
 
 	virtual void OnUnitIdle(CCircuitUnit* unit) override;
 
+	bool IsAtStage() const { return atStage; }  // apex: standing at the team push's gather point
+
 private:
+	bool atStage = false;
 	void FindTarget();
 	void ApplyTargetPath(const CQueryPathSingle* query);
 	bool MarchEnemyBox();
@@ -45,6 +48,19 @@ private:
 	int repairerId = -1;
 	// apex: set off for their buildings; small armies on the way are shot, not chased
 	bool forEco = false;
+	int nextStrongLog = 0;
+	int nextNearLog = 0;
+	int nextDropLog = 0;
+	int nextFrontLog = 0;
+	int nextStageLog = 0;
+	// every group in sight was refused as too strong: we are outgunned, not blind
+	bool outgunned = false;
+	// an outgunned fall-back in progress: kept until arrival or a hit
+	bool fallBackActive = false;
+	// the group that last outgunned the squad beside it, while still stronger
+	bool strongMem = false;
+	springai::AIFloat3 strongPos;
+	springai::AIFloat3 fallBackTo;
 };
 
 } // namespace circuit

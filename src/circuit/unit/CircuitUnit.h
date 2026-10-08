@@ -203,6 +203,8 @@ public:
 
 	void SetDamagedFrame(int frame) { damagedFrame = frame; }
 	int GetDamagedFrame() const { return damagedFrame; }
+	void SetDamagedWeapon(int weaponDefId) { damagedWeapon = weaponDefId; }
+	int GetDamagedWeapon() const { return damagedWeapon; }
 	void SetDamagedDir(const springai::AIFloat3& dir) { damagedDir = dir; }
 	const springai::AIFloat3& GetDamagedDir() const { return damagedDir; }
 	void SetDodgeFrame(int frame) { dodgeFrame = frame; }
@@ -223,6 +225,11 @@ public:
 	bool IsDGunReady(int frame, float energy);
 	float GetDGunCostE() const;
 	int GetDGunReloadFrame() const;
+	// apex: the script's commander decision says whether a D-gun may walk him
+	// in on a target beyond range; a withdrawing commander must not walk back.
+	void SetDGunClose(bool v) { dgunMayClose = v; }
+	bool IsDGunCloseOk() const { return dgunMayClose; }
+	int GetDGunOrders() const { return dgunOrders; }
 	// A D-gun order stands until the shot is fired or its window passes: any
 	// other order in that window would replace it in the engine's queue (measured:
 	// every manual-fire order was followed by a move and a stop in the same
@@ -377,6 +384,7 @@ private:
 	SOrdShadow ordLast[static_cast<int>(OrdKind::_SIZE)];
 	unsigned ordSeq = 0;  // orders of any kind sent to this unit
 	int damagedFrame;
+	int damagedWeapon = -1;
 	int electFrame;
 	springai::AIFloat3 damagedDir;
 	int dodgeFrame;
@@ -406,6 +414,8 @@ private:
 	int dgunHoldUntil = 0;
 	int dgunHoldReload = 0;
 	int dgunHoldNoteAt = -1;
+	int dgunOrders = 0;
+	bool dgunMayClose = true;
 	springai::Weapon* weapon;  // main weapon
 	springai::Weapon* shield;
 
