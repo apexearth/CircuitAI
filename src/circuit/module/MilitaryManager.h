@@ -16,6 +16,7 @@
 
 #include <vector>
 #include <set>
+#include <map>
 
 namespace circuit {
 
@@ -132,6 +133,7 @@ public:
 	void MakeDefence(const springai::AIFloat3& pos);
 	void MakeDefence(int cluster);
 	void MakeDefence(int cluster, const springai::AIFloat3& pos);
+	bool AskJoinFight(const springai::AIFloat3& at, float travelS, float allyPow, float foePow, float ownPow, int leaderId);
 	void DefaultMakeDefence(int cluster, const springai::AIFloat3& pos);
 	// Sensors only, without any of DefaultMakeDefence's tower placement. The
 	// script's AiMakeDefence returns early on clusters it declines to porc, and
@@ -218,6 +220,16 @@ public:
 	float GetFocusR() const { return focusR; }
 	float GetFocusPow() const { return focusPow; }
 	bool IsFocusGo() const { return focusGo; }
+	// apex: the team's home centroid -- every AI's squads stage on the one line from
+	// the focus toward it, so a team masses as one army, not one clump per seat
+	void SetFocusHome(const springai::AIFloat3& pos) { focusHome = pos; }
+	const springai::AIFloat3& GetFocusHome() const { return focusHome; }
+	// apex: the odds and mass heads (script military/nnmassodds.as) post their
+	// multipliers on the team board; read every UpdateDefenceTasks.
+	static constexpr int BOARD_ODDS = 1400, BOARD_MASS = 1500, BOARD_MIL_ACK = 1600, BOARD_FLANK = 1700;
+	float GetOddsMul() const { return oddsMul; }
+	float GetMassMul() const { return massMul; }
+	float GetFlankMul() const { return flankMul; }  // weight on a side approach's gain; 1 = the rule
 	float GetAttackPower() const {
 		float p = 0.f;
 		for (IFighterTask* t : GetTasks(IFighterTask::FightType::ATTACK)) {
@@ -226,13 +238,31 @@ public:
 		return p;
 	}
 	float GetAttackPowerNear(const springai::AIFloat3& pos, float radius) const;
+	float GetSquadPowerNear(const springai::AIFloat3& pos, float radius) const;  // attack + defend squads
+	float GetSidePowerAt(const springai::AIFloat3& pos, float radius);  // ours + allies', memoised a second
 	float GetGatheredPower() const;
 	float GetEnemyInflNear(const springai::AIFloat3& pos, float radius) const;
+	// apex: where a long gun holds its ring waiting for someone to see its target
+	void NoteSpotWanted(const springai::AIFloat3& pos, int frame);
+	int GetSpotWantedCount();
+	springai::AIFloat3 GetSpotWantedAt(int i) const;
+private:
+	std::vector<std::pair<springai::AIFloat3, int>> spotWanted;
+	struct SSideMemo { springai::AIFloat3 pos; float radius; float power; int frame; };
+	std::vector<SSideMemo> sideMemo;
+public:
 	springai::AIFloat3 focusPos;
 	float focusR = 0.f;
 	float focusPow = 0.f;
 	bool focusGo = false;
 	int focusUntil = -1;
+	springai::AIFloat3 focusHome = -RgtVector;
+	float oddsMul = 1.f;
+	float massMul = 1.f;
+	float flankMul = 1.f;
+	static constexpr int HOME_CLAIM_STALE = 300;  // frames: a claim not renewed in 10 s has lapsed
+	struct SHomeClaim { const void* task; float power; float rank; int frame; };
+	std::map<int, std::vector<SHomeClaim>> homeClaims;  // enemy group key (its lowest unit id) -> claims
 	// Shared cadence and counters for ISquadTask's merge census. They live on
 	// the manager because the tasks they measure are created and destroyed
 	// constantly, and the question is about the fleet, not one squad.
@@ -247,6 +277,13 @@ public:
 	unsigned int GetGuardTaskNum() const { return defence->GetGuardTaskNum(); }
 	unsigned int ReleaseHoldPools();
 	unsigned int HoldPools();
+	float HoldPoolsUpTo(float needM);
+	// apex: RECALL ONLY WHAT HOME NEEDS (his 10-12). An attack squad that turns for a threat to our base
+	// claims its power against that enemy group; a squad ranked after the claimants (rank: T3 last, then
+	// distance to the threat) treats the group as covered once home plus their claims meet it.
+	float HomeCoveredBefore(int key, const void* task, float rank, int frame);
+	void HomeClaim(int key, const void* task, float power, float rank, int frame);
+	void HomeRelease(const void* task);
 	unsigned int GetGuardsNum() const { return defence->GetGuardsNum(); }
 	int GetGuardFrame() const { return defence->GetGuardFrame(); }
 
@@ -277,11 +314,18 @@ public:
 	// decision needs a SUSTAINED stall, not the boundary flicker of an
 	// economy running used==produced (measured 23 flips in 2 minutes).
 	int commCloakStallTicks = 0;
+	// The script's "comship" team value is fresh: the base is going down.
+	bool IsCommShip() const;
+	int commShipStallTicks = 0;
+	bool commShipCloak = false;
+	bool commHoldFire = false;
 
 private:
 	virtual IUnitTask* DefaultMakeTask(CCircuitUnit* unit) override;
 
 	void UpdateCommCloak();
+	void UpdateCommShipCloak();
+	void UpdateCommHoldFire();
 	void Watchdog();
 
 	void AddArmyCost(CCircuitUnit* unit);

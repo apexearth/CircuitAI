@@ -2136,20 +2136,7 @@ float CCircuitAI::GetTunable(const std::string& name, float defVal) const
 	// (apexearth 2026-09-22: "add one of these AI in multiplayer and check a box
 	// to say I want it to be an eco AI"). Read once, because GetOptionValues
 	// allocates.
-	if (!aiOptsRead) {
-		aiOptsRead = true;
-		springai::SkirmishAI* ai = GetSkirmishAI();
-		if (ai != nullptr) {
-			springai::OptionValues* opts = ai->GetOptionValues();
-			if (opts != nullptr) {
-				const int n = opts->GetSize();
-				for (int i = 0; i < n; ++i) {
-					aiOpts[opts->GetKey(i)] = opts->GetValue(i);
-				}
-				delete opts;
-			}
-		}
-	}
+	ReadAiOpts();
 	auto ov = aiOpts.find(name);
 	if (ov != aiOpts.end()) {
 		try {
@@ -2162,6 +2149,53 @@ float CCircuitAI::GetTunable(const std::string& name, float defVal) const
 	const float value = (game != nullptr) ? game->GetRulesParamFloat(name.c_str(), defVal) : defVal;
 	tunables[name] = value;
 	return value;
+}
+
+void CCircuitAI::ReadAiOpts() const
+{
+	if (aiOptsRead) {
+		return;
+	}
+	aiOptsRead = true;
+	springai::SkirmishAI* ai = GetSkirmishAI();
+	if (ai == nullptr) {
+		return;
+	}
+	springai::OptionValues* opts = ai->GetOptionValues();
+	if (opts != nullptr) {
+		const int n = opts->GetSize();
+		for (int i = 0; i < n; ++i) {
+			aiOpts[opts->GetKey(i)] = opts->GetValue(i);
+		}
+		delete opts;
+	}
+}
+
+const std::string& CCircuitAI::GetAiOption(const std::string& name) const
+{
+	static const std::string none;
+	ReadAiOpts();
+	auto it = aiOpts.find(name);
+	return (it != aiOpts.end()) ? it->second : none;
+}
+
+int CCircuitAI::LoadOptionFloats(const std::string& name)
+{
+	optFloats.clear();
+	const std::string& path = GetAiOption(name);
+	if (path.empty()) {
+		return -1;
+	}
+	std::ifstream in(path);
+	if (!in) {
+		LOG("apex: option-floats t=%i %s: cannot open %s", teamId, name.c_str(), path.c_str());
+		return -1;
+	}
+	float v;
+	while (in >> v) {
+		optFloats.push_back(v);
+	}
+	return (int)optFloats.size();
 }
 
 // Highest build progress among our own units of `def`, or -1 if we hold none.
@@ -2532,6 +2566,32 @@ void CCircuitAI::RecordFoeRefresh()
 // excluded, the script already counts them. The withdraw odds read only our
 // own army, so in a team game every AI saw itself outgunned beside its allies
 // (apexearth 2026-09-26: "maybe our teams just don't fight well together").
+float CCircuitAI::GetAllyArmyMAt(const AIFloat3& pos, float radius)
+{
+	GetAllyPowerAt(pos, 0.f);   // refreshes the per-frame list
+	const float sqR = radius * radius;
+	float sum = 0.f;
+	for (size_t i = 0; i < allyPowerList.size(); ++i) {
+		if (allyPowerList[i].first.SqDistance2D(pos) <= sqR) {
+			sum += allyCostList[i];
+		}
+	}
+	return sum;
+}
+
+float CCircuitAI::GetAllySquadPowerAt(const AIFloat3& pos, float radius)
+{
+	GetAllyPowerAt(pos, 0.f);   // refreshes the per-frame list
+	const float sqR = radius * radius;
+	float sum = 0.f;
+	for (size_t i = 0; i < allyPowerList.size(); ++i) {
+		if (allyPowerList[i].first.SqDistance2D(pos) <= sqR) {
+			sum += allyPwrList[i];
+		}
+	}
+	return sum;
+}
+
 float CCircuitAI::GetAllyPowerAt(const AIFloat3& pos, float radius)
 {
 	// The allied armed mobiles, listed once a frame: the withdraw pass asks per
@@ -2540,6 +2600,8 @@ float CCircuitAI::GetAllyPowerAt(const AIFloat3& pos, float radius)
 	if (allyPowerFrame != frame) {
 		allyPowerFrame = frame;
 		allyPowerList.clear();
+		allyCostList.clear();
+		allyPwrList.clear();
 		for (auto& kv : GetFriendlyUnits()) {
 			CAllyUnit* u = kv.second;
 			if ((u == nullptr) || (GetTeamUnit(kv.first) != nullptr)) {
@@ -2550,6 +2612,8 @@ float CCircuitAI::GetAllyPowerAt(const AIFloat3& pos, float radius)
 				continue;
 			}
 			allyPowerList.emplace_back(u->GetLastPos(), cdef->GetSurfThreat());
+			allyCostList.push_back(cdef->GetCostM());
+			allyPwrList.push_back(cdef->GetPower());
 		}
 	}
 	const float sqR = radius * radius;
@@ -2690,6 +2754,20 @@ float CCircuitAI::GetRecentTradeRatio()
 	return tradeKilled / tradeLost;
 }
 
+// ONE WALKWAY SYSTEM FOR THE TEAM (apexearth 2026-09-21, again 10-08: an
+// ally builds in the gap we left open). Every bot's grid is kept by ally team
+// for the whole process -- all our bots on a team run in it -- and the lane
+// test refuses a site in ANY teammate's walkway, not only our own.
+struct STeamLane {
+	AIFloat3 anchor, fwd;
+	float pitch, half, range;
+};
+static std::map<int, std::map<int, STeamLane>>& TeamLanes()
+{
+	static std::map<int, std::map<int, STeamLane>> lanes;
+	return lanes;
+}
+
 void CCircuitAI::SetBaseGrid(const AIFloat3& anchor, const AIFloat3& fwd,
 		float cell, float lanePitch, float laneHalf, float range)
 {
@@ -2703,6 +2781,7 @@ void CCircuitAI::SetBaseGrid(const AIFloat3& anchor, const AIFloat3& fwd,
 	gridLanePitch = lanePitch;
 	gridLaneHalf = laneHalf;
 	gridRange = range;
+	TeamLanes()[allyTeamId][teamId] = STeamLane{gridAnchor, fwd, lanePitch, laneHalf, range};
 }
 
 int CCircuitAI::GetBaseGridFacing(const AIFloat3& pos) const
@@ -2788,25 +2867,47 @@ static inline float PushOutOfLane(float u, float cell, float pitch, float half)
 	return u + ((u >= centre) ? push : -push);
 }
 
-bool CCircuitAI::IsInBaseLane(const AIFloat3& pos) const
+static bool InLaneOf(const AIFloat3& anchor, const AIFloat3& fwd, float pitch, float half, float range,
+		const AIFloat3& pos)
 {
-	if ((gridLanePitch <= .0f) || (gridLaneHalf <= .0f)
-		|| !utils::is_valid(gridAnchor) || !utils::is_valid(pos))
-	{
+	if ((pitch <= .0f) || (half <= .0f) || !utils::is_valid(anchor)) {
 		return false;
 	}
-	const float dx = pos.x - gridAnchor.x;
-	const float dz = pos.z - gridAnchor.z;
-	if ((dx * dx + dz * dz) > (gridRange * gridRange)) {
+	const float dx = pos.x - anchor.x;
+	const float dz = pos.z - anchor.z;
+	if ((dx * dx + dz * dz) > (range * range)) {
 		return false;  // not in the base; the streets are a base layout, not a map one
 	}
-	const float depth = -(dx * gridFwd.x + dz * gridFwd.z);
-	const float lat = dx * -gridFwd.z + dz * gridFwd.x;
+	const float depth = -(dx * fwd.x + dz * fwd.z);
+	const float lat = dx * -fwd.z + dz * fwd.x;
 	if (depth > .0f) {
 		return false;  // behind the anchor is the economy: no streets (script LanesApply)
 	}
-	return (LaneGapAt(lat, gridLanePitch) < gridLaneHalf)
-		|| (LaneGapAt(depth, gridLanePitch) < gridLaneHalf);
+	return (LaneGapAt(lat, pitch) < half) || (LaneGapAt(depth, pitch) < half);
+}
+
+bool CCircuitAI::IsInBaseLane(const AIFloat3& pos) const
+{
+	if (!utils::is_valid(pos)) {
+		return false;
+	}
+	if (InLaneOf(gridAnchor, gridFwd, gridLanePitch, gridLaneHalf, gridRange, pos)) {
+		return true;
+	}
+	auto it = TeamLanes().find(allyTeamId);
+	if (it == TeamLanes().end()) {
+		return false;
+	}
+	for (const auto& kv : it->second) {
+		if (kv.first == teamId) {
+			continue;
+		}
+		const STeamLane& l = kv.second;
+		if (InLaneOf(l.anchor, l.fwd, l.pitch, l.half, l.range, pos)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // THE LATTICE IS PER DEF, IN WORLD AXES, PHASED FROM THE MAP'S CORNER.
@@ -3712,12 +3813,14 @@ void CCircuitAI::RebuildReachCache()
 	if ((allyTeam != nullptr) && (allyTeam->reachFrame == lastFrame)) {
 		reachCache = allyTeam->reachCache;
 		reachNodes = allyTeam->reachNodes;
+		dgunThreats = allyTeam->dgunThreats;
 		perfReachRebuildNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tRb0).count();
 		++perfReachRebuilds;
 		return;
 	}
 	reachCache.clear();
 	reachCache.reserve(enemyInfos.size());
+	dgunThreats.clear();
 	for (const auto& kv : enemyInfos) {
 		CEnemyInfo* e = kv.second;
 		if ((e == nullptr) || e->IsHidden()) {
@@ -3726,6 +3829,9 @@ void CCircuitAI::RebuildReachCache()
 		CCircuitDef* edef = e->GetCircuitDef();
 		if ((edef == nullptr) || edef->IsAbleToFly()) {
 			continue;
+		}
+		if (edef->GetDGunReach() > 0.f) {
+			dgunThreats.push_back({e->GetPos().x, e->GetPos().z, edef->GetId()});
 		}
 		// Not GetMaxRange: that is the max over EVERY weapon, so a nuke silo
 		// enters the cache with 72000 of "reach" and vetoes the whole map.
@@ -3755,9 +3861,18 @@ void CCircuitAI::RebuildReachCache()
 		allyTeam->reachFrame = lastFrame;
 		allyTeam->reachCache = reachCache;
 		allyTeam->reachNodes = reachNodes;
+		allyTeam->dgunThreats = dgunThreats;
 	}
 	perfReachRebuildNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tRb0).count();
 	++perfReachRebuilds;
+}
+
+const std::vector<SDGunThreat>& CCircuitAI::GetDGunThreats()
+{
+	if ((reachCacheFrame < 0) || (lastFrame - reachCacheFrame > FRAMES_PER_SEC / 2)) {
+		RebuildReachCache();
+	}
+	return dgunThreats;
 }
 
 // apex: median-split BVH over the cache, rebuilt with it, because the flattened

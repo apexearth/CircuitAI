@@ -162,8 +162,46 @@ void CRaidTask::Update()
 	const auto tFt0 = std::chrono::steady_clock::now();
 	const bool isTargetsFound = FindTarget();
 	manager->PerfAdd(20, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tFt0).count());
+	if (IsCommitted() && (frame >= nextCommitLog)) {
+		nextCommitLog = frame + FRAMES_PER_SEC * 20;
+		const AIFloat3& lp = leader->GetPos(frame);
+		circuit->LOG("apex: raid-commit t=%i %s x%i at=%.0f,%.0f goal=%.0f,%.0f d=%.0f target=%s kept=%i aaSet=%i",
+				circuit->GetTeamId(), leader->GetCircuitDef()->GetDef()->GetName(), static_cast<int>(units.size()),
+				lp.x, lp.z, goalPos.x, goalPos.z, lp.distance2D(goalPos),
+				(GetTarget() != nullptr) && (GetTarget()->GetCircuitDef() != nullptr)
+					? GetTarget()->GetCircuitDef()->GetDef()->GetName() : "-",
+				keptN, aaSetN);
+	}
 
 	state = State::ROAM;
+	// SHOOT WHAT SHOOTS YOU, KEEP FLYING (his 10-12): a committed gunship wing on its way to the economy
+	// set-targets the nearest AA in reach -- the move order stands, so it fires going past, not stopping.
+	if ((GetTarget() == nullptr) && (frame >= nextAaPick) && leader->GetCircuitDef()->IsAbleToFly() && IsCommitted()) {
+		nextAaPick = frame + FRAMES_PER_SEC;
+		const AIFloat3& lp = leader->GetPos(frame);
+		float best = SQUARE(leader->GetCircuitDef()->GetMaxRange());
+		CEnemyInfo* aa = nullptr;
+		for (auto& kv : circuit->GetEnemyInfos()) {
+			CEnemyInfo* e = kv.second;
+			CCircuitDef* ed = e->GetCircuitDef();
+			if (e->IsHidden() || !e->IsInRadarOrLOS() || (ed == nullptr) || !ed->HasSurfToAir()) {
+				continue;
+			}
+			const float d2 = lp.SqDistance2D(e->GetPos());
+			if (d2 < best) {
+				best = d2;
+				aa = e;
+			}
+		}
+		if (aa != nullptr) {
+			++aaSetN;
+			for (CCircuitUnit* unit : units) {
+				TRY_UNIT(circuit, unit,
+					unit->CmdSetTarget(aa);
+				)
+			}
+		}
+	}
 	if (GetTarget() != nullptr) {
 		noTargetSince = -1;
 		state = State::ENGAGE;
@@ -224,7 +262,8 @@ void CRaidTask::Update()
 	std::shared_ptr<IPathQuery> query = pathfinder->CreatePathMultiQuery(
 			leader, threatMap,
 			startPos, pathRange, !urgentPositions.empty() ? urgentPositions : enemyPositions, GetHitTest(), true,
-			attackPower / circuit->GetMilitaryManager()->GetRangeUnitCountCompensatorScale());
+			(IsCommitted() && !cdef->IsAbleToFly()) ? std::numeric_limits<float>::max()
+				: attackPower / circuit->GetMilitaryManager()->GetRangeUnitCountCompensatorScale());
 	pathQueries[leader] = query;
 
 	pathfinder->RunQuery(circuit->GetScheduler().get(), query, [this](const IPathQuery* query) {
@@ -260,9 +299,53 @@ void CRaidTask::OnUnitIdle(CCircuitUnit* unit)
 	}
 }
 
+// A raid sent at a target off our home ground commits (his 2026-10-12, docs/24 Raids): it goes for the
+// economy, takes the damage on the way, and nobody walks home to be repaired.
+bool CRaidTask::IsCommitted() const
+{
+	if (goalR <= 0.f) {
+		return false;
+	}
+	CCircuitAI* circuit = manager->GetCircuit();
+	const int frame = circuit->GetLastFrame();
+	if (commitAt == frame) {
+		return commitVal;
+	}
+	commitAt = frame;
+	commitVal = false;
+	// 1: every raid -- the RAID posture puts the main army in raid tasks too, and it lost. 2: only raiders.
+	const float mode = circuit->GetTunable("apex_raid_commit", 2.f);
+	if (mode <= 0.f) {
+		return false;
+	}
+	// A gunship raid commits too (his 10-12: gunships traded with their defences for nothing).
+	if ((mode >= 2.f) && ((leader == nullptr) || !leader->GetCircuitDef()->IsAbleToFly())) {
+		for (CCircuitUnit* u : units) {
+			if (!u->GetCircuitDef()->IsRoleRaider() && !u->GetCircuitDef()->IsCharger()) {
+				return false;
+			}
+		}
+	}
+	const float baseRange = circuit->GetMilitaryManager()->GetBaseDefRange();
+	commitVal = circuit->GetSetupManager()->GetBasePos().SqDistance2D(goalPos) > SQUARE(baseRange);
+	return commitVal;
+}
+
+// ...but aircraft still go to the pad: a repaired gunship comes back for the price of the trip.
+bool CRaidTask::AllowRetreat(CCircuitUnit* unit)
+{
+	if (IsCommitted() && !unit->GetCircuitDef()->IsAbleToFly()) {
+		++keptN;
+		return false;
+	}
+	return true;
+}
+
 bool CRaidTask::FindTarget()
 {
 	CCircuitAI* circuit = manager->GetCircuit();
+	const bool committed = IsCommitted();
+	const bool flies = leader->GetCircuitDef()->IsAbleToFly();
 	CMap* map = circuit->GetMap();
 	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
 	CThreatMap* threatMap = circuit->GetThreatMap();
@@ -314,7 +397,7 @@ bool CRaidTask::FindTarget()
 			checkSpeed *= 2.f;
 		}
 		const float power = threatMap->GetThreatAt(ePos);
-		if (checkPower <= power) {
+		if (!(committed && !flies) && (checkPower <= power)) {
 			continue;
 		}
 		const AIFloat3& eVel = enemy->GetVel();
@@ -351,6 +434,13 @@ bool CRaidTask::FindTarget()
 			}
 			defThreat = enemy->GetInfluence();
 			isBuilder = edef->IsEnemyRoleAny(CCircuitDef::RoleMask::BUILDER | CCircuitDef::RoleMask::COMM);
+			// Committed: the economy only. Their army and their guns are walked past (shot in passing).
+			if (committed && (edef->IsEnemyRoleAny(CCircuitDef::RoleMask::COMM)
+				|| (!isBuilder && (edef->IsMobile()
+					|| (edef->IsAttacker() && !edef->IsAttrStock())))))
+			{
+				continue;
+			}
 		} else {
 			if (!(IsInWater ? cdef->HasSubToWater() : cdef->HasSurfToWater()) && (ePos.y < -SQUARE_SIZE * 5)) {  // notAW
 				continue;
@@ -358,6 +448,9 @@ bool CRaidTask::FindTarget()
 			targetCat = UNKNOWN_CATEGORY;
 			defThreat = enemy->GetInfluence();
 			isBuilder = false;
+			if (committed && (goalPos.SqDistance2D(ePos) > SQUARE(goalR))) {
+				continue;
+			}
 		}
 		// apex: the area test last -- every enemy reached it first, before the
 		// threat, speed and category tests that reject most of them.
@@ -366,10 +459,13 @@ bool CRaidTask::FindTarget()
 		}
 
 		float sqDist = pos.SqDistance2D(ePos);
-		if ((minPower > power) && (minSqDist > sqDist)) {
+		if (((committed && !flies) || (minPower > power)) && (minSqDist > sqDist)) {
 			if (enemy->IsInRadarOrLOS()) {
 				if (((targetCat & noChaseCat) == 0) && !enemy->IsBeingBuilt()) {
-					if (isBuilder) {
+					if (committed) {
+						bestTarget = enemy;   // the nearest piece of economy in reach
+						minSqDist = sqDist;
+					} else if (isBuilder) {
 						bestTarget = enemy;
 						minSqDist = sqDist;
 						maxThreat = std::numeric_limits<float>::max();
@@ -512,7 +608,11 @@ void CRaidTask::ApplyRaidPath(const CQueryPathSingle* query)
 			unit->GetTravelAct()->StateWait();
 		}
 		TRY_UNIT(circuit, unit,
-			unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			if (IsCommitted()) {
+				unit->CmdMoveTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			} else {
+				unit->CmdFightTo(position, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60);
+			}
 		)
 	}
 }

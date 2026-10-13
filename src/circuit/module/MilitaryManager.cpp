@@ -14,6 +14,7 @@
 #include "resource/MetalManager.h"
 #include "scheduler/Scheduler.h"
 #include "script/MilitaryScript.h"
+#include "script/InitScript.h"
 #include "setup/SetupManager.h"
 #include "setup/DefenceData.h"
 #include "task/UnitTask.h"
@@ -41,6 +42,8 @@
 #include "terrain/path/QueryPathMulti.h"
 #include "unit/enemy/EnemyUnit.h"
 #include <algorithm>
+#include <map>
+#include <string>
 #include "CircuitAI.h"
 #include "util/GameAttribute.h"
 #include "util/Utils.h"
@@ -605,6 +608,8 @@ void CMilitaryManager::Init()
 		lodQuiet = true;
 		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::Update, this), 1/*interval / 2*/, offset + 1, "milUpd");
 		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateDefenceTasks, this), FRAMES_PER_SEC * 5, offset + 2, "milDef");
+		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateCommShipCloak, this), FRAMES_PER_SEC, offset + 3, "comShip");
+		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::UpdateCommHoldFire, this), FRAMES_PER_SEC, offset + 5, "comHold");
 
 		scheduler->RunJobEvery(CScheduler::GameJob(&CMilitaryManager::Watchdog, this),
 								FRAMES_PER_SEC * 60,
@@ -843,6 +848,38 @@ void CMilitaryManager::MakeDefence(int cluster)
 void CMilitaryManager::MakeDefence(int cluster, const AIFloat3& pos)
 {
 	static_cast<CMilitaryScript*>(script)->MakeDefence(cluster, pos);  // DefaultMakeDefence
+}
+
+void CMilitaryManager::NoteSpotWanted(const AIFloat3& pos, int frame)
+{
+	for (auto& s : spotWanted) {
+		if (s.first.SqDistance2D(pos) < SQUARE(500.f)) {
+			s.second = frame;
+			return;
+		}
+	}
+	if (spotWanted.size() < 16) {
+		spotWanted.push_back(std::make_pair(pos, frame));
+	}
+}
+
+int CMilitaryManager::GetSpotWantedCount()
+{
+	const int frame = circuit->GetLastFrame();
+	spotWanted.erase(std::remove_if(spotWanted.begin(), spotWanted.end(),
+			[frame](const std::pair<AIFloat3, int>& s) { return frame - s.second > FRAMES_PER_SEC * 20; }),
+			spotWanted.end());
+	return (int)spotWanted.size();
+}
+
+AIFloat3 CMilitaryManager::GetSpotWantedAt(int i) const
+{
+	return ((i >= 0) && (i < (int)spotWanted.size())) ? spotWanted[i].first : AIFloat3(-1.f, 0.f, -1.f);
+}
+
+bool CMilitaryManager::AskJoinFight(const AIFloat3& at, float travelS, float allyPow, float foePow, float ownPow, int leaderId)
+{
+	return static_cast<CMilitaryScript*>(script)->JoinFight(at, travelS, allyPow, foePow, ownPow, leaderId);
 }
 
 void CMilitaryManager::DefaultMakeDefence(int cluster, const AIFloat3& pos)
@@ -1144,6 +1181,41 @@ float CMilitaryManager::GetAttackPowerNear(const AIFloat3& pos, float radius) co
 			p += t->GetAttackPower();
 		}
 	}
+	return p;
+}
+
+float CMilitaryManager::GetSquadPowerNear(const AIFloat3& pos, float radius) const
+{
+	const int frame = circuit->GetLastFrame();
+	float p = 0.f;
+	for (IFighterTask::FightType ft : {IFighterTask::FightType::ATTACK, IFighterTask::FightType::DEFEND}) {
+		for (IFighterTask* t : GetTasks(ft)) {
+			CCircuitUnit* lead = static_cast<ISquadTask*>(t)->GetLeader();
+			if ((lead != nullptr) && (lead->GetPos(frame).SqDistance2D(pos) < SQUARE(radius))) {
+				p += t->GetAttackPower();
+			}
+		}
+	}
+	return p;
+}
+
+// Every squad weighing the same enemy group asks the same question within a few
+// frames; the ally walk behind it is over every allied armed mobile.
+float CMilitaryManager::GetSidePowerAt(const AIFloat3& pos, float radius)
+{
+	const int frame = circuit->GetLastFrame();
+	for (const SSideMemo& m : sideMemo) {
+		if ((frame < m.frame + FRAMES_PER_SEC) && (m.radius == radius)
+			&& (m.pos.SqDistance2D(pos) < SQUARE(SQUARE_SIZE * 2)))
+		{
+			return m.power;
+		}
+	}
+	sideMemo.erase(std::remove_if(sideMemo.begin(), sideMemo.end(), [frame](const SSideMemo& m) {
+		return frame >= m.frame + FRAMES_PER_SEC;
+	}), sideMemo.end());
+	const float p = GetSquadPowerNear(pos, radius) + circuit->GetAllySquadPowerAt(pos, radius);
+	sideMemo.push_back({pos, radius, p, frame});
 	return p;
 }
 
@@ -1591,6 +1663,76 @@ unsigned int CMilitaryManager::HoldPools()
 	return n;
 }
 
+// HoldPools with a budget (his 2026-10-12: "imagine we beat them 4:1, recall only enough to protect
+// home and keep attacking with the rest"). Pools nearest home are held first until the held metal covers
+// needM; the rest keep their attack promotion. Returns the metal held after the pass.
+float CMilitaryManager::HomeCoveredBefore(int key, const void* task, float rank, int frame)
+{
+	auto it = homeClaims.find(key);
+	if (it == homeClaims.end()) {
+		return 0.f;
+	}
+	float sum = 0.f;
+	for (const SHomeClaim& c : it->second) {
+		if ((c.task != task) && (c.rank < rank) && (frame - c.frame < HOME_CLAIM_STALE)) {
+			sum += c.power;
+		}
+	}
+	return sum;
+}
+
+void CMilitaryManager::HomeClaim(int key, const void* task, float power, float rank, int frame)
+{
+	HomeRelease(task);
+	std::vector<SHomeClaim>& v = homeClaims[key];
+	v.erase(std::remove_if(v.begin(), v.end(), [frame](const SHomeClaim& c) {
+		return frame - c.frame >= HOME_CLAIM_STALE;
+	}), v.end());
+	v.push_back({task, power, rank, frame});
+}
+
+void CMilitaryManager::HomeRelease(const void* task)
+{
+	for (auto it = homeClaims.begin(); it != homeClaims.end(); ) {
+		std::vector<SHomeClaim>& v = it->second;
+		v.erase(std::remove_if(v.begin(), v.end(), [task](const SHomeClaim& c) { return c.task == task; }), v.end());
+		it = v.empty() ? homeClaims.erase(it) : std::next(it);
+	}
+}
+
+float CMilitaryManager::HoldPoolsUpTo(float needM)
+{
+	auto poolM = [](IFighterTask* t) {
+		float m = 0.f;
+		for (CCircuitUnit* u : t->GetAssignees()) {
+			m += u->GetCircuitDef()->GetCostM();
+		}
+		return m;
+	};
+	float held = 0.f;
+	std::vector<std::pair<float, CDefendTask*>> pools;
+	const AIFloat3& base = circuit->GetSetupManager()->GetBasePos();
+	for (IFighterTask* task : GetTasks(IFighterTask::FightType::DEFEND)) {
+		CDefendTask* dt = static_cast<CDefendTask*>(task);
+		if ((dt->GetPromote() == IFighterTask::FightType::MELEE)
+			|| (dt->GetPromote() == IFighterTask::FightType::ATTACK))
+		{
+			pools.emplace_back(base.SqDistance2D(task->GetPosition()), dt);
+		}
+	}
+	std::sort(pools.begin(), pools.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+	// Re-balanced every pass, so a hold left from a drawn HOLD or a bigger need goes back out.
+	for (auto& f : pools) {
+		if (held < needM) {
+			f.second->SetPromote(IFighterTask::FightType::MELEE);
+			held += poolM(f.second);
+		} else if (f.second->GetPromote() == IFighterTask::FightType::MELEE) {
+			f.second->SetPromote(IFighterTask::FightType::ATTACK);
+		}
+	}
+	return held;
+}
+
 void CMilitaryManager::UpdateDefenceTasks()
 {
 	/*
@@ -1600,6 +1742,22 @@ void CMilitaryManager::UpdateDefenceTasks()
 		TRY_UNIT(circuit, unit,
 			unit->GetUnit()->Stockpile(UNIT_COMMAND_OPTION_SHIFT_KEY | UNIT_COMMAND_OPTION_CONTROL_KEY);
 		)
+	}
+
+	{
+		const int ally = circuit->GetAllyTeamId();
+		const int tid = circuit->GetTeamId();
+		const float odds = std::max(0.1f, TeamBoardGet(ally, BOARD_ODDS + tid, 1.f));
+		const float mass = std::max(0.1f, TeamBoardGet(ally, BOARD_MASS + tid, 1.f));
+		const float flank = std::max(0.f, TeamBoardGet(ally, BOARD_FLANK + tid, 1.f));
+		if ((odds != oddsMul) || (mass != massMul) || (flank != flankMul)) {
+			circuit->LOG("apex: mil-board t=%i odds=%.2f mass=%.2f flank=%.2f", tid, odds, mass, flank);
+		}
+		oddsMul = odds;
+		massMul = mass;
+		flankMul = flank;
+		// the script draws a non-rule odds only while this says the DLL reads it
+		TeamBoardSet(ally, BOARD_MIL_ACK + tid, float(circuit->GetLastFrame()));
 	}
 
 	/*
@@ -1650,7 +1808,7 @@ void CMilitaryManager::UpdateDefenceTasks()
 //		if (groupIdx >= 0) {
 //			dt->SetMaxPower(std::max(minAttackers, enemyGroups[groupIdx].threat));
 //		}
-		dt->SetMaxPower(std::max(minAttackers, circuit->GetEnemyManager()->GetPreMaxGroupThreat()));
+		dt->SetMaxPower(std::max(minAttackers, circuit->GetEnemyManager()->GetPreMaxGroupThreat() * massMul));
 	}
 
 	/*
@@ -2101,6 +2259,19 @@ bool CMilitaryManager::IsCommCloakWanted(CCircuitUnit* unit) const
 		return false;
 	}
 	CEconomyManager* economyMgr = circuit->GetEconomyManager();
+	// apex: the base going down with its defence beaten (script comship.as):
+	// cloaked whenever the energy surplus pays the moving cost, so the drain
+	// never eats the bank the D-gun fires from.
+	if (IsCommShip()) {
+		const bool cloakedNow = unit->GetUnit()->IsCloaked();
+		// He stands in a trap (comdecide.as), so the cost is the standing one -- 100 e/s for a
+		// commander, against the 1,000 moving that kept him visible (his 10-12).
+		const float cost = cdef->GetCloakCostStill();
+		const float surplus = economyMgr->GetAvgEnergyIncome() - economyMgr->GetEnergyPull()
+				+ (cloakedNow ? cost : 0.f);
+		const bool stalledNow = cloakedNow ? (commShipStallTicks >= 3) : economyMgr->IsEnergyStalling();
+		return !stalledNow && (surplus >= cost);
+	}
 	// apex: the share is the whole rule, and 0.1 against the MOVING cost put
 	// the bar at 10,000 e/s -- an income most games never reach, so "always
 	// cloaked when rich" never happened and commanders stayed visible.
@@ -2145,20 +2316,108 @@ void CMilitaryManager::UpdateCommCloak()
 	}
 }
 
+bool CMilitaryManager::IsCommShip() const
+{
+	const float at = circuit->ReadTeamValue(circuit->GetTeamId(), "comship", -1.f);
+	return (at >= 0.f) && (circuit->GetLastFrame() - (int)at <= FRAMES_PER_SEC * 2);
+}
+
+// Each second while the script says the base is going down, and once after,
+// handing the cloak back to the standing rule.
+void CMilitaryManager::UpdateCommShipCloak()
+{
+	const bool ship = IsCommShip();
+	if (!ship && !commShipCloak) {
+		return;
+	}
+	commShipCloak = ship;
+	CCircuitUnit* comm = circuit->GetSetupManager()->GetCommander();
+	if ((comm == nullptr) || comm->IsDead() || !comm->GetCircuitDef()->IsAbleToCloak()) {
+		return;
+	}
+	CEconomyManager* economyMgr = circuit->GetEconomyManager();
+	commShipStallTicks = economyMgr->IsEnergyStalling() ? (commShipStallTicks + 1) : 0;
+	const bool wantCloak = IsCommCloakWanted(comm);
+	if (wantCloak != comm->GetUnit()->IsCloaked()) {
+		TRY_UNIT(circuit, comm,
+			comm->CmdCloak(wantCloak);
+		)
+		circuit->LOG("apex: com-ship-cloak t=%i on=%d ship=%d e=%.0f inc=%.0f pull=%.0f cost=%.0f",
+				circuit->GetTeamId(), wantCloak ? 1 : 0, ship ? 1 : 0, economyMgr->GetEnergyCur(),
+				economyMgr->GetAvgEnergyIncome(), economyMgr->GetEnergyPull(),
+				comm->GetCircuitDef()->GetCloakCost());
+	}
+}
+
+// A cloaked commander holds fire (his 10-11: the laser uncloaked him walking in to D-gun);
+// the D-gun is a manual-fire order and ignores the fire state. Re-sent each second while
+// cloaked because the retreat task sets RETURN on entry.
+void CMilitaryManager::UpdateCommHoldFire()
+{
+	CCircuitUnit* comm = circuit->GetSetupManager()->GetCommander();
+	if ((comm == nullptr) || comm->IsDead() || !comm->GetCircuitDef()->IsAbleToCloak()) {
+		return;
+	}
+	const bool cloaked = comm->GetUnit()->IsCloaked();
+	if (!cloaked && !commHoldFire) {
+		return;
+	}
+	const bool retreating = (comm->GetTask()->GetType() == IUnitTask::Type::RETREAT);
+	TRY_UNIT(circuit, comm,
+		comm->CmdSetFireState(cloaked ? CCircuitDef::FireType::HOLD
+				: (retreating ? CCircuitDef::FireType::RETURN : comm->GetCircuitDef()->GetFireState()));
+	)
+	if (cloaked != commHoldFire) {
+		circuit->LOG("apex: com-hold-fire t=%i on=%d", circuit->GetTeamId(), cloaked ? 1 : 0);
+	}
+	commHoldFire = cloaked;
+}
+
 void CMilitaryManager::Watchdog()
 {
 	ZoneScopedN(__PRETTY_FUNCTION__);
 
 	UpdateCommCloak();
 
+	// Where the army stands and on what task: a big army parked at home was watched (his 10-11) and
+	// no line said which task held it.
+	const AIFloat3& base = circuit->GetSetupManager()->GetBasePos();
+	const int frame = circuit->GetLastFrame();
+	std::map<std::string, std::pair<int, float>> home;
+	float homeM = 0.f, awayM = 0.f;
 	for (CCircuitUnit* unit : army) {
-		if (unit->GetTask()->GetType() == IUnitTask::Type::PLAYER) {
+		const float m = unit->GetCircuitDef()->GetCostM();
+		IUnitTask* task = unit->GetTask();
+		if (unit->GetPos(frame).SqDistance2D(base) > SQUARE(2000.f)) {
+			awayM += m;
+		} else {
+			homeM += m;
+			std::string key = "t" + std::to_string(static_cast<int>(task->GetType()));
+			if (task->GetType() == IUnitTask::Type::FIGHTER) {
+				key += "f" + std::to_string(static_cast<int>(static_cast<IFighterTask*>(task)->GetFightType()));
+			}
+			key += ":" + std::string(unit->GetCircuitDef()->GetDef()->GetName());
+			auto& e = home[key];
+			e.first += 1;
+			e.second += m;
+		}
+		if (task->GetType() == IUnitTask::Type::PLAYER) {
 			continue;
 		}
 		if (!circuit->GetCallback()->Unit_HasCommands(unit->GetId())) {
 			UnitIdle(unit);
 		}
 	}
+	std::vector<std::pair<float, std::string>> top;
+	for (auto& kv : home) {
+		top.push_back({kv.second.second, kv.first + "x" + std::to_string(kv.second.first)});
+	}
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::string s;
+	for (size_t i = 0; (i < top.size()) && (i < 8); ++i) {
+		s += " " + top[i].second;
+	}
+	circuit->LOG("apex: home-army t=%i home=%.0f away=%.0f |%s", circuit->GetTeamId(), homeM, awayM, s.c_str());
 }
 
 void CMilitaryManager::AddArmyCost(CCircuitUnit* unit)

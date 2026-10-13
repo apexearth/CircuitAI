@@ -584,6 +584,11 @@ static float CCircuitAI_GetEnemyAirCostNear(CCircuitAI* circuit, const springai:
 	return circuit->GetEnemyManager()->GetEnemyAirCostNear(pos, radius);
 }
 
+static float CCircuitAI_GetEnemyArmedCostNear(CCircuitAI* circuit, const springai::AIFloat3& pos, float radius)
+{
+	return circuit->GetEnemyManager()->GetEnemyArmedCostNear(pos, radius);
+}
+
 static int CCircuitUnit_GetStockpile(CCircuitUnit* unit)
 {
 	// Same inline guard as CCircuitUnit_CmdPriorityBuild above: TRY_UNIT wants
@@ -1506,6 +1511,64 @@ static CScriptArray* CCircuitAI_GetAllyBuilds(CCircuitAI* circuit)
 	return arr;
 }
 
+// A team's resource bonus as the engine applies it (Handicap=65 reads 1.65):
+// lobby information every player sees.
+static float CCircuitAI_GetTeamIncomeMult(CCircuitAI* circuit, int team)
+{
+	return circuit->GetGame()->GetTeamIncomeMultiplier(team);
+}
+
+// The largest bonus on any team not allied to ours (gaia reads 1, so a max).
+static float CCircuitAI_GetFoeIncomeMultMax(CCircuitAI* circuit)
+{
+	springai::Game* game = circuit->GetGame();
+	const int n = game->GetTeams();
+	float best = 0.f;
+	for (int t = 0; t < n; ++t) {
+		if (game->IsAllied(game->GetTeamAllyTeam(t), circuit->GetAllyTeamId())) {
+			continue;
+		}
+		best = std::max(best, game->GetTeamIncomeMultiplier(t));
+	}
+	return best;
+}
+
+// Our allies' standing structures near a point, flat [x, z, defId, unitId,
+// team]: what blocks a door or pens a unit when nothing of ours does.
+static CScriptArray* CCircuitAI_GetAllyStructsNear(CCircuitAI* circuit, const AIFloat3& at, float r)
+{
+	std::vector<float> out;
+	const int frame = circuit->GetLastFrame();
+	const float sq = r * r;
+	for (const auto& kv : circuit->GetFriendlyUnits()) {
+		CAllyUnit* u = kv.second;
+		if ((u == nullptr) || (u->GetCircuitDef() == nullptr) || (u->GetUnit() == nullptr)) {
+			continue;
+		}
+		if (u->GetCircuitDef()->IsMobile() || (circuit->GetTeamUnit(kv.first) != nullptr)) {
+			continue;
+		}
+		const AIFloat3& pos = u->GetPos(frame);
+		if (pos.SqDistance2D(at) > sq) {
+			continue;
+		}
+		out.push_back(pos.x);
+		out.push_back(pos.z);
+		out.push_back(float(u->GetCircuitDef()->GetId()));
+		out.push_back(float(kv.first));
+		out.push_back(float(u->GetUnit()->GetTeam()));
+	}
+	asITypeInfo* at2 = FloatArrayType();
+	if (at2 == nullptr) {
+		return nullptr;
+	}
+	CScriptArray* arr = CScriptArray::Create(at2, out.size());
+	for (asUINT i = 0; i < out.size(); ++i) {
+		arr->SetValue(i, &out[i]);
+	}
+	return arr;
+}
+
 // A board the allied AIs of one process share, keyed by ally team: the team's
 // plan and who is raising what. AIs hosted elsewhere simply never see it.
 static std::map<std::pair<int, int>, float>& TeamBoard()
@@ -1523,6 +1586,17 @@ static float CCircuitAI_GetTeamBoard(CCircuitAI* circuit, int slot, float def)
 {
 	auto it = TeamBoard().find(std::make_pair(circuit->GetAllyTeamId(), slot));
 	return (it == TeamBoard().end()) ? def : it->second;
+}
+
+float TeamBoardGet(int allyTeam, int slot, float def)
+{
+	auto it = TeamBoard().find(std::make_pair(allyTeam, slot));
+	return (it == TeamBoard().end()) ? def : it->second;
+}
+
+void TeamBoardSet(int allyTeam, int slot, float v)
+{
+	TeamBoard()[std::make_pair(allyTeam, slot)] = v;
 }
 
 // The area a point stands in for one move type, or the nearest one within a
@@ -1621,6 +1695,16 @@ static float CCircuitAI_GetTeamMetalFill(CCircuitAI* circuit, int otherTeamId)
 static float CCircuitAI_GetTunable(CCircuitAI* circuit, const std::string& name, float defVal)
 {
 	return circuit->GetTunable(name, defVal);
+}
+
+static int CCircuitAI_LoadOptionFloats(CCircuitAI* circuit, const std::string& name)
+{
+	return circuit->LoadOptionFloats(name);
+}
+
+static float CCircuitAI_OptionFloat(CCircuitAI* circuit, int i)
+{
+	return circuit->OptionFloat(i);
 }
 
 // apex: the game speed the host has set (1 = realtime); the script's lag
@@ -2089,6 +2173,8 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	// adds shares this process, so they can simply read each other.
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetDefBuildProgress(CCircuitDef@) const", asFUNCTION(CCircuitAI_GetDefBuildProgress), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetTunable(const string &in, float) const", asFUNCTION(CCircuitAI_GetTunable), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "int LoadOptionFloats(const string &in)", asFUNCTION(CCircuitAI_LoadOptionFloats), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float OptionFloat(int) const", asFUNCTION(CCircuitAI_OptionFloat), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetSpeedFactor() const", asFUNCTION(CCircuitAI_GetSpeedFactor), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float RecordRatio(const CCircuitDef@, int) const", asMETHOD(CCircuitAI, RecordRatio), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "int RecordCount(const CCircuitDef@, int) const", asMETHOD(CCircuitAI, RecordCount), asCALL_THISCALL); ASSERT(r >= 0);
@@ -2096,6 +2182,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "float RecordRatioVs(const CCircuitDef@, const CCircuitDef@) const", asMETHOD(CCircuitAI, RecordRatioVs), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float RecordRatioMix(const CCircuitDef@)", asMETHOD(CCircuitAI, RecordRatioMix), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetAllyPowerAt(const AIFloat3& in, float)", asMETHOD(CCircuitAI, GetAllyPowerAt), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetAllyArmyMAt(const AIFloat3& in, float)", asMETHOD(CCircuitAI, GetAllyArmyMAt), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float RecordFoeRatio(const CCircuitDef@, const CCircuitDef@) const", asMETHOD(CCircuitAI, RecordFoeRatio), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "bool RecordTweaked() const", asMETHOD(CCircuitAI, RecordTweaked), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "double ClockUs() const", asFUNCTION(CCircuitAI_ClockUs), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
@@ -2142,6 +2229,9 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyStatics()", asFUNCTION(CCircuitAI_GetAllyStatics), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyPlants()", asFUNCTION(CCircuitAI_GetAllyPlants), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyBuilds()", asFUNCTION(CCircuitAI_GetAllyBuilds), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyStructsNear(const AIFloat3& in, float)", asFUNCTION(CCircuitAI_GetAllyStructsNear), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetTeamIncomeMult(int)", asFUNCTION(CCircuitAI_GetTeamIncomeMult), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetFoeIncomeMultMax()", asFUNCTION(CCircuitAI_GetFoeIncomeMultMax), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "void SetTeamBoard(int, float)", asFUNCTION(CCircuitAI_SetTeamBoard), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetTeamBoard(int, float)", asFUNCTION(CCircuitAI_GetTeamBoard), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetUnsafeSites()", asFUNCTION(CCircuitAI_GetUnsafeSites), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
@@ -2286,6 +2376,8 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	// unlike behaviour.json's retreat, which applies to every player.
 	r = engine->RegisterObjectMethod("CCircuitDef", "void SetRetreat(float)", asMETHOD(CCircuitDef, SetRetreat), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRetreat() const", asMETHOD(CCircuitDef, GetRetreat), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "void SetSpearhead(bool)", asMETHOD(CCircuitDef, SetSpearhead), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsSpearhead() const", asMETHOD(CCircuitDef, IsSpearhead), asCALL_THISCALL); ASSERT(r >= 0);
 	// Rule a def out entirely. IsAvailable() is maxThisUnit > count, so zero makes
 	// every availability check fail wherever it is asked -- factory weights, build
 	// chains, role lookups -- rather than needing each of them taught a new rule.
@@ -2328,6 +2420,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdStop()", asFUNCTION(CCircuitUnit_CmdStop), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdPatrolTo(const AIFloat3& in)", asFUNCTION(CCircuitUnit_CmdPatrolTo), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetEnemyAirCostNear(const AIFloat3& in, float)", asFUNCTION(CCircuitAI_GetEnemyAirCostNear), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetEnemyArmedCostNear(const AIFloat3& in, float)", asFUNCTION(CCircuitAI_GetEnemyArmedCostNear), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetEnemyMaxMobileCostM() const", asFUNCTION(CCircuitAI_GetEnemyMaxMobileCostM), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "int GetChokeCount() const", asFUNCTION(CCircuitAI_GetChokeCount), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "AIFloat3 GetChokeCenter(int) const", asFUNCTION(CCircuitAI_GetChokeCenter), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);

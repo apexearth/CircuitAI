@@ -190,6 +190,11 @@ public:
 	// are cached on first read: this sits inside the per-unit attack loop.
 	float GetTunable(const char* name, float defVal) const { return GetTunable(std::string(name), defVal); }
 	float GetTunable(const std::string& name, float defVal) const;
+	const std::string& GetAiOption(const std::string& name) const;
+	// the floats in the file a lobby option names: the policy net's weights (tools/neuro.py),
+	// thousands of them, which no start script holds. -1 = no such option or file
+	int LoadOptionFloats(const std::string& name);
+	float OptionFloat(int i) const { return ((i >= 0) && (i < (int)optFloats.size())) ? optFloats[i] : 0.f; }
 
 	// --- in-process team coordination -----------------------------------
 	// Every AI the host adds lives in ONE process (AIExport.cpp keeps them in
@@ -241,6 +246,8 @@ public:
 	// known live enemy attackers, refreshed every 10 s); pooled when blind.
 	float RecordRatioMix(CCircuitDef* cdef);
 	float GetAllyPowerAt(const springai::AIFloat3& pos, float radius);
+	float GetAllyArmyMAt(const springai::AIFloat3& pos, float radius);  // allied armed ground metal
+	float GetAllySquadPowerAt(const springai::AIFloat3& pos, float radius);  // same, in squad power
 	// The same matrix read from their side: their B against our A.
 	float RecordFoeRatio(CCircuitDef* edef, CCircuitDef* ours) const;
 	void RecordSetTier(CCircuitDef* cdef, int tier) { if (cdef != nullptr) { recTier[cdef->GetId()] = tier; recAggDirty = true; } }
@@ -443,6 +450,9 @@ public:
 	float GetEnemyReachSlack(const springai::AIFloat3& pos, float reactS,
 			springai::AIFloat3* foeOut = nullptr);
 	void RebuildReachCache();
+	// Enemies with a D-gun-type weapon, as of the reach cache (at most half a
+	// second old; a stale cache is rebuilt).
+	const std::vector<circuit::SDGunThreat>& GetDGunThreats();
 	float GetBuilderThreatAt(const springai::AIFloat3& pos) const;
 	float GetUnitThreatAt(CCircuitUnit* unit, const springai::AIFloat3& pos) const;
 	void Garbage(CCircuitUnit* unit, const char* reason);
@@ -460,6 +470,8 @@ private:
 	mutable std::unordered_map<std::string, float> tunables;  // see GetTunable
 	mutable std::map<std::string, std::string> aiOpts;  // this bot's lobby options
 	mutable bool aiOptsRead = false;
+	void ReadAiOpts() const;
+	std::vector<float> optFloats;  // see LoadOptionFloats
 	mutable float lavaLevel = NO_LAVA;   // see GetLavaLevel
 	mutable int lavaFrame = -1;
 	float lavaCrest = NO_LAVA;           // see SetLavaCrest
@@ -606,6 +618,8 @@ private:
 	std::unordered_map<long long, int> noPathMarks;  // (mobile id, sector) -> frame
 	int allyPowerFrame = -1;
 	std::vector<std::pair<springai::AIFloat3, float>> allyPowerList;
+	std::vector<float> allyCostList;   // metal, parallel to allyPowerList
+	std::vector<float> allyPwrList;    // CCircuitDef::GetPower, the squads' own scale
 	std::vector<std::pair<springai::AIFloat3, int>> unsafeSites;
 	// def id -> engine pathType. UnitDef::GetMoveData() allocates a wrapper the
 	// caller must delete, so the lookup is done once per def.
@@ -844,6 +858,7 @@ private:
 	// apex: GetEnemyReachSlack's input, flattened once per frame. See its .cpp comment.
 	using SReachEnemy = circuit::SReachEnemy;
 	std::vector<SReachEnemy> reachCache;
+	std::vector<circuit::SDGunThreat> dgunThreats;
 	// apex: bounding-volume tree over reachCache, rebuilt with it. See BuildReachTree.
 	using SReachNode = circuit::SReachNode;
 	std::vector<SReachNode> reachNodes;

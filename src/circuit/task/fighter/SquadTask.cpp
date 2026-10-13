@@ -6,6 +6,7 @@
  */
 
 #include <map>
+#include <array>
 #include "task/fighter/SquadTask.h"
 #include "map/InfluenceMap.h"
 #include "map/ThreatMap.h"
@@ -444,6 +445,58 @@ NSMicroPather::HitFunc ISquadTask::GetHitTest() const
 	};
 }
 
+// How far `u` keeps from an enemy of def `t`; 0 when it cannot outrange the
+// D-gun or outrun its owner, -1 when it is fodder: the metal of `t` it destroys
+// before it dies pays for itself. `hold` is the ring it stands on, midway
+// between their reach and ours.
+float ISquadTask::DGunKeepOut(CCircuitDef* u, CCircuitDef* t, float& hold)
+{
+	const float reach = t->GetDGunReach();
+	if ((reach <= 0.f) || u->IsAbleToFly() || (t->GetSpeed() >= u->GetSpeed())) {
+		return 0.f;
+	}
+	const float keep = reach + t->GetSpeed() * DGUN_REACT_S + u->GetRadius();
+	const float ours = u->GetAutoRange(CCircuitDef::RangeType::LAND);
+	if (ours <= keep) {
+		return 0.f;
+	}
+	const float shot = t->GetDGunShotAt(u->GetArmorType());
+	const float alive = (shot >= u->GetHealth())
+			? t->GetDGunReload()
+			: u->GetHealth() / std::max(t->GetRawDps(), 1.f);
+	const float worth = u->GetRawDps() * alive * t->GetCostM() / std::max(t->GetHealth(), 1.f);
+	if (worth >= u->GetCostM()) {
+		return -1.f;
+	}
+	hold = 0.5f * (keep + ours);
+	return keep;
+}
+
+bool ISquadTask::IsInsideDGun(int frame)
+{
+	CCircuitAI* circuit = manager->GetCircuit();
+	const std::vector<SDGunThreat>& dts = circuit->GetDGunThreats();
+	for (const SDGunThreat& d : dts) {
+		CCircuitDef* tdef = circuit->GetCircuitDefSafe(d.defId);
+		if (tdef == nullptr) {
+			continue;
+		}
+		for (CCircuitUnit* unit : units) {
+			const AIFloat3& p = unit->GetPos(frame);
+			const float sqD = SQUARE(p.x - d.x) + SQUARE(p.z - d.z);
+			if (sqD > SQUARE(highestRange)) {
+				continue;
+			}
+			float hold;
+			const float keep = DGunKeepOut(unit->GetCircuitDef(), tdef, hold);
+			if ((keep > 0.f) && (sqD < SQUARE(keep))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void ISquadTask::Attack(const int frame)
 {
 	Attack(frame, GetTarget()->GetUnit()->IsCloaked());
@@ -481,6 +534,74 @@ void ISquadTask::Attack(const int frame, const bool isGround)
 	const bool isStatic = (edef != nullptr) && !edef->IsMobile();
 	// incorrect, it should check aoe in vicinity
 	const float aoe = (edef != nullptr) ? edef->GetAoe() : SQUARE_SIZE;
+
+	// A LONG GUN STANDS OUTSIDE EVERY TURRET IT KNOWS OF (apexearth 2026-10-08:
+	// an Ambassador outranges most T2 turrets; kept at range, with scouts to see
+	// for it, it need not die). The ring point slides round the target until no
+	// known enemy static reaches it, else backs off along its bearing. Turrets
+	// whose reach covers half the map (LRPC) cannot be stood outside of.
+	CCircuitAI* circuit = manager->GetCircuit();
+	std::vector<std::pair<AIFloat3, float>> guns;
+	bool gunsBuilt = false;
+	auto buildGuns = [&]() {
+		gunsBuilt = true;
+		const float reachSq = SQUARE(highestRange + 2000.f);
+		for (const auto& ekv : circuit->GetEnemyInfos()) {
+			CEnemyInfo* e = ekv.second;
+			CCircuitDef* gd = e->GetCircuitDef();
+			if ((gd == nullptr) || gd->IsMobile() || !gd->HasSurfToLand()) {
+				continue;
+			}
+			const float gr = gd->GetMaxRange(CCircuitDef::RangeType::LAND);
+			if ((gr <= 0.f) || (gr > 2500.f) || (e->GetPos().SqDistance2D(tPos) > reachSq)) {
+				continue;
+			}
+			guns.push_back(std::make_pair(e->GetPos(), gr + 100.f));
+		}
+	};
+	auto safeAt = [&](const AIFloat3& p) {
+		for (const auto& g : guns) {
+			if (p.SqDistance2D(g.first) < SQUARE(g.second)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	if (!GetTarget()->IsInRadarOrLOS()) {
+		for (const auto& kv : rangeUnits) {
+			CCircuitDef* d0 = (*kv.second.begin())->GetCircuitDef();
+			if (d0->IsAttrSiege() || (d0->GetMaxRange() > d0->GetLosRadius())) {
+				circuit->GetMilitaryManager()->NoteSpotWanted(tPos, frame);
+				break;
+			}
+		}
+	}
+	static std::map<int, std::array<int, 4>> ringN;  // per team: ok, slid, back, none
+	static std::map<int, int> ringLogAt;
+	std::array<int, 4>& rn = ringN[circuit->GetTeamId()];
+
+	// D-GUN CARRIERS ARE KEPT OUT OF (apexearth 2026-10-10: Titans walked up to
+	// Behemoths and died; held at range they kill it). A unit that outranges and
+	// outruns one near the target stands outside its reach (DGunKeepOut).
+	struct SFear { float x, z; CCircuitDef* tdef; };
+	std::vector<SFear> fears;
+	for (const SDGunThreat& d : circuit->GetDGunThreats()) {
+		CCircuitDef* tdef = circuit->GetCircuitDefSafe(d.defId);
+		if (tdef == nullptr) {
+			continue;
+		}
+		const float relR = highestRange + tdef->GetDGunReach() + tdef->GetSpeed() * DGUN_REACT_S + DEFAULT_SLACK;
+		if (SQUARE(d.x - tPos.x) + SQUARE(d.z - tPos.z) < SQUARE(relR)) {
+			fears.push_back({d.x, d.z, tdef});
+		}
+	}
+	dgunNear = !fears.empty();
+	std::vector<std::pair<float, float>> keepHold(fears.size());
+	static std::map<int, std::array<int, 3>> fearN;  // per team: hold, backoff, fodder
+	static std::map<int, int> fearLogAt;
+	std::array<int, 3>& fn = fearN[circuit->GetTeamId()];
+	int& fearLog = fearLogAt[circuit->GetTeamId()];
+	std::string fearEx;
 
 	int row = 0;
 	for (const auto& kv : rangeUnits) {
@@ -520,20 +641,121 @@ void ISquadTask::Attack(const int frame, const bool isGround)
 				unit->GetTravelAct()->StateWait();
 			}
 
+			bool feared = false;
+			bool inside = false;
+			bool fodder = false;
+			int exI = -1;
+			const AIFloat3 uPos = unit->GetPos(frame);
+			for (size_t i = 0; i < fears.size(); ++i) {
+				float h = 0.f;
+				const float keep = DGunKeepOut(unit->GetCircuitDef(), fears[i].tdef, h);
+				keepHold[i] = std::make_pair(keep, h);
+				fodder |= (keep < 0.f);
+				if (keep > 0.f) {
+					feared = true;
+					if (SQUARE(uPos.x - fears[i].x) + SQUARE(uPos.z - fears[i].z) < SQUARE(keep)) {
+						inside = true;
+						exI = (int)i;
+					}
+				}
+			}
+
 			if (isRepeatAttack
+				|| inside
 				|| (unit->GetTarget() != GetTarget())
 				|| (unit->GetTargetTile() != targetTile))
 			{
 				const float angle = alpha + beta;
 				const float r = (iterNum == 0) ? range0 : range;
 				AIFloat3 newPos(tPos.x + r * cosf(angle), tPos.y, tPos.z + r * sinf(angle));
+				CCircuitDef* udef = unit->GetCircuitDef();
+				if ((udef->IsAttrSiege() || (udef->GetMaxRange() > udef->GetLosRadius())) && !udef->IsAttrMelee()) {
+					if (!gunsBuilt) {
+						buildGuns();
+					}
+					if (safeAt(newPos)) {
+						++rn[0];
+					} else {
+						bool found = false;
+						for (int k = 1; (k <= 9) && !found; ++k) {
+							for (int sgn = -1; (sgn <= 1) && !found; sgn += 2) {
+								const float a2 = angle + sgn * k * 0.17f;
+								const AIFloat3 p(tPos.x + r * cosf(a2), tPos.y, tPos.z + r * sinf(a2));
+								if (safeAt(p)) {
+									newPos = p;
+									found = true;
+								}
+							}
+						}
+						if (found) {
+							++rn[1];
+						} else {
+							float rr = r;
+							for (int k = 0; (k < 12) && !found; ++k) {
+								rr += 100.f;
+								const AIFloat3 p(tPos.x + rr * cosf(angle), tPos.y, tPos.z + rr * sinf(angle));
+								newPos = p;
+								found = safeAt(p);
+							}
+							++rn[found ? 2 : 3];
+						}
+					}
+				}
+				bool pushed = false;
+				for (size_t i = 0; feared && (i < fears.size()); ++i) {
+					const float keep = keepHold[i].first;
+					const float h = keepHold[i].second;
+					if (keep <= 0.f) {
+						continue;
+					}
+					float ax = newPos.x - fears[i].x;
+					float az = newPos.z - fears[i].z;
+					float d = std::sqrt(ax * ax + az * az);
+					if (d >= h) {
+						continue;
+					}
+					if (d < 1.f) {
+						ax = uPos.x - fears[i].x;
+						az = uPos.z - fears[i].z;
+						d = std::sqrt(ax * ax + az * az);
+						if (d < 1.f) {
+							ax = cosf(alpha);
+							az = sinf(alpha);
+							d = 1.f;
+						}
+					}
+					newPos.x = fears[i].x + ax * h / d;
+					newPos.z = fears[i].z + az * h / d;
+					pushed = true;
+					exI = (exI < 0) ? (int)i : exI;
+				}
+				if ((exI >= 0) && fearEx.empty() && (frame >= fearLog)) {
+					fearEx = utils::string_format("unit=%s threat=%s ourR=%.0f theirR=%.0f keep=%.0f hold=%.0f act=%s",
+							udef->GetDef()->GetName(), fears[exI].tdef->GetDef()->GetName(),
+							udef->GetAutoRange(CCircuitDef::RangeType::LAND), fears[exI].tdef->GetDGunReach(),
+							keepHold[exI].first, keepHold[exI].second, inside ? "backoff" : "hold");
+				}
+				fn[0] += (pushed && !inside) ? 1 : 0;
+				fn[1] += inside ? 1 : 0;
+				fn[2] += fodder ? 1 : 0;
 				CTerrainManager::CorrectPosition(newPos);
-				unit->Attack(newPos, GetTarget(), targetTile, isGround, isStatic, frame + FRAMES_PER_SEC * 60);
+				unit->Attack(newPos, GetTarget(), targetTile, isGround, isStatic, frame + FRAMES_PER_SEC * 60, feared);
 			}
 
 			beta += delta;
 			++iterNum;
 		}
+	}
+	int& logAt = ringLogAt[circuit->GetTeamId()];
+	if ((frame >= logAt) && (rn[1] + rn[2] + rn[3] > 0)) {
+		logAt = frame + FRAMES_PER_SEC * 60;
+		circuit->LOG("apex: siege-ring t=%i ok=%i slid=%i back=%i none=%i guns=%i",
+				circuit->GetTeamId(), rn[0], rn[1], rn[2], rn[3], (int)guns.size());
+	}
+	if (!fearEx.empty()) {
+		fearLog = frame + FRAMES_PER_SEC * 20;
+		circuit->LOG("apex: dgun-fear t=%i %s n_hold=%i n_back=%i n_fodder=%i",
+				circuit->GetTeamId(), fearEx.c_str(), fn[0], fn[1], fn[2]);
 	}
 }
 

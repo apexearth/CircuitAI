@@ -225,6 +225,7 @@ public:
 	bool IsDGunReady(int frame, float energy);
 	float GetDGunCostE() const;
 	int GetDGunReloadFrame() const;
+	int GetWeaponReloadFrame() const;  // the main weapon's; 0 with none
 	// apex: the script's commander decision says whether a D-gun may walk him
 	// in on a target beyond range; a withdrawing commander must not walk back.
 	void SetDGunClose(bool v) { dgunMayClose = v; }
@@ -294,8 +295,8 @@ public:
 	void TrySetMoveState(CCircuitDef::MoveT state);  // safe CmdSetMoveState
 
 	void Attack(CEnemyInfo* enemy, bool isGround, int timeout);
-	void Attack(const springai::AIFloat3& position, CEnemyInfo* enemy, bool isGround, bool isStatic, int timeout);
-	void Attack(const springai::AIFloat3& position, CEnemyInfo* enemy, int tile, bool isGround, bool isStatic, int timeout);
+	void Attack(const springai::AIFloat3& position, CEnemyInfo* enemy, bool isGround, bool isStatic, int timeout, bool hold = false);
+	void Attack(const springai::AIFloat3& position, CEnemyInfo* enemy, int tile, bool isGround, bool isStatic, int timeout, bool hold = false);
 	void Guard(CCircuitUnit* target, int timeout);
 	void Gather(const springai::AIFloat3& groupPos, int timeout);
 
@@ -311,10 +312,12 @@ public:
 	//
 	// Held here and applied in the two command funnels below, so a call site
 	// cannot forget it -- there is no call site to forget.
-	void SetFormSlot(float lat, const springai::AIFloat3& dir) { formLateral = lat; formDir = dir; }
+	void SetFormSlot(float lat, const springai::AIFloat3& dir, float depth = 0.f) { formLateral = lat; formDepth = depth; formDir = dir; }
 	void SetFormDir(const springai::AIFloat3& dir) { formDir = dir; }
-	void ClearFormSlot() { formLateral = 0.f; formDir = -RgtVector; }
+	void ClearFormSlot() { formLateral = 0.f; formDepth = 0.f; formDir = -RgtVector; }
 	float GetFormLateral() const { return formLateral; }
+	float GetFormDepth() const { return formDepth; }
+	bool HasFormSlot() const { return (formLateral != 0.f) || (formDepth != 0.f); }
 	springai::AIFloat3 InFormation(const springai::AIFloat3& p, OrdSrc src) const;
 
 	void Morph();
@@ -391,6 +394,7 @@ private:
 	int execFrame;  // TODO: Replace by CExecuteAction?
 	Wake execWake = Wake::REACT;  // what the pending wake is FOR
 	float formLateral = 0.f;      // signed slot offset across the squad's front
+	float formDepth = 0.f;        // slot offset behind it
 	springai::AIFloat3 formDir = -RgtVector;  // the squad's direction of travel
 	int disarmFrame;
 	int ammoFrame;
