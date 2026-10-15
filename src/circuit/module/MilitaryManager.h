@@ -23,6 +23,8 @@ namespace circuit {
 class IMainJob;
 class CBDefenceTask;
 class CFGuardTask;
+class CFortCensus;
+class CAttackTask;
 
 namespace TaskF {
 	struct SFightTask {
@@ -115,6 +117,8 @@ public:
 
 	IFighterTask* Enqueue(const TaskF::SFightTask& ti);
 	virtual CRetreatTask* EnqueueRetreat() override;
+	// apex: their fortifications and our siege goal; created on first use (unit/enemy/FortCensus.cpp)
+	CFortCensus* GetFortCensus();
 private:
 	virtual void DequeueTask(IUnitTask* task, bool done = false) override;
 
@@ -234,6 +238,22 @@ public:
 	float GetOddsMul() const { return oddsMul; }
 	float GetMassMul() const { return massMul; }
 	float GetFlankMul() const { return flankMul; }  // weight on a side approach's gain; 1 = the rule
+	// apex: the army heads (script military/nnarmy.as), 1 = the rule. The army slots are published
+	// here for the heads' features: ground attack squads, the main army's power, their spread.
+	static constexpr int BOARD_SPLIT = 1800, BOARD_COMMIT = 1900, BOARD_STAGE = 2500, BOARD_RETREAT = 2600;
+	static constexpr int BOARD_ARMY_N = 2700, BOARD_ARMY_MAIN = 2800, BOARD_ARMY_SPREAD = 2900, BOARD_ARMY_SW = 3000;
+	static constexpr int BOARD_ONE_ARMY = 3100;  // script TUNE_ONE_ARMY: squads follow and stage with the main army
+	bool IsOneArmy() const { return oneArmy; }
+	float GetSplitMul() const { return splitMul; }
+	float GetCommitMul() const { return commitMul; }
+	float GetStageMul() const { return stageMul; }
+	float GetRetreatMul() const { return retreatMul; }
+	// the strongest ground attack squad: every other one walks to it and fights its target
+	CAttackTask* GetMainArmy();
+	// how far the main army pulls a squad: split x the map's diagonal
+	float GetArmyPullR() const;
+	enum ArmyEv { AE_WALK, AE_SHARE, AE_STAGE, AE_GO, AE_MERGE, AE_SWITCH, AE_N };
+	void NoteArmy(ArmyEv e) { ++armyEv[e]; }
 	float GetAttackPower() const {
 		float p = 0.f;
 		for (IFighterTask* t : GetTasks(IFighterTask::FightType::ATTACK)) {
@@ -264,6 +284,17 @@ public:
 	float oddsMul = 1.f;
 	float massMul = 1.f;
 	float flankMul = 1.f;
+	float splitMul = 1.f;
+	bool oneArmy = false;
+	float commitMul = 1.f;
+	float stageMul = 1.f;
+	float retreatMul = 1.f;
+	CAttackTask* mainArmy = nullptr;
+	int mainArmyFrame = -1;
+	unsigned armyEv[AE_N] = {0};
+	unsigned armySwSeen = 0;
+	int armyLogAt = 0;
+	void UpdateArmyBoard();
 	static constexpr int HOME_CLAIM_STALE = 300;  // frames: a claim not renewed in 10 s has lapsed
 	struct SHomeClaim { const void* task; float power; float rank; int frame; };
 	std::map<int, std::vector<SHomeClaim>> homeClaims;  // enemy group key (its lowest unit id) -> claims
@@ -447,6 +478,8 @@ private:
 
 	std::shared_ptr<IMainJob> defend;
 	std::vector<std::pair<springai::AIFloat3, BuildVector>> buildDefence;  // pos: defences
+
+	std::shared_ptr<CFortCensus> fortCensus;
 };
 
 } // namespace circuit
