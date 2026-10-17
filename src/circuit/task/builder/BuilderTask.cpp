@@ -1408,10 +1408,13 @@ void IBuilderTask::UpdatePath(CCircuitUnit* unit)
 	// them all. The pathfinder skips squares above maxThreat, so a road hotter than
 	// our own guns' reach at the site has no path -- ApplyPath tells that
 	// apart from terrain. Defence walks into the threat it answers.
+	// apex_expand_far: a claim's road heat is priced in the script (want_mex.as, expandfar.as);
+	// the bar here refused 104-145 mex tasks a game on Supreme Isthmus 4v4.
 	const bool roadFree = (buildType == BuildType::DEFENCE)
 			|| (buildType == BuildType::BUNKER)
 			|| (buildType == BuildType::BIG_GUN)
-			|| cdef->IsAbleToResurrect();
+			|| cdef->IsAbleToResurrect()
+			|| ((buildType == BuildType::MEX) && (circuit->GetTunable("apex_expand_far", 0.f) > 0.f));
 	const float roadBar = roadFree ? std::numeric_limits<float>::max()
 			: std::max(cdef->GetPower(), std::max(THREAT_MIN, circuit->GetAllyDefendInflAt(endPos)));
 	CPathFinder* pathfinder = circuit->GetPathfinder();
@@ -1519,7 +1522,8 @@ void IBuilderTask::ApplyPathUnbounded(const CQueryPathSingle* query)
 			unit->GetCircuitDef()->GetDef()->GetName(), endPos.x, endPos.z,
 			sqrtf(unit->GetPos(circuit->GetLastFrame()).SqDistance2D(endPos)),
 			roadMax, roadBarLog, pawn);
-	circuit->NoteBuildBlocked(endPos, buildDef);
+	// No NoteBuildBlocked: a road refused for threat is read live next election, never banned for
+	// three minutes (his ruling; the same fix as the reach test above, lost here once).
 	SetDeathNote("hot-road");
 	manager->AbortTask(this);
 }

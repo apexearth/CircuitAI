@@ -377,6 +377,13 @@ static bool StockDropUnit(CCircuitUnit* unit, const char* kind)
 		return false;
 	}
 	CCircuitAI* circuit = unit->GetManager()->GetCircuit();
+	if (unit->IsSquadOwned()) {
+		if (circuit->IsSquadOrders()) {
+			return false;
+		}
+		circuit->NoteStockLeak((std::string("squad.") + kind).c_str());
+		return true;
+	}
 	if (!circuit->IsStockCtl(unit)) {
 		return false;
 	}
@@ -390,7 +397,7 @@ static bool StockDropTask(IUnitTask* task, const char* kind)
 		return false;
 	}
 	CCircuitAI* circuit = task->GetManager()->GetCircuit();
-	if (!circuit->IsStockArmy()) {
+	if (!static_cast<IFighterTask*>(task)->IsStockTask()) {
 		return false;
 	}
 	circuit->NoteStockLeak(kind);
@@ -473,6 +480,27 @@ static void CCircuitUnit_CmdMoveTo(CCircuitUnit* unit, const AIFloat3& pos)
 	try {
 		unit->CmdMoveTo(pos, 0, INT_MAX, CCircuitUnit::OrdSrc::SCRIPT);
 	} catch (const std::exception&) {
+	}
+}
+
+static void CCircuitUnit_CmdFightTo(CCircuitUnit* unit, const AIFloat3& pos)
+{
+	if (StockDropUnit(unit, "fight")) {
+		return;
+	}
+	if ((unit == nullptr) || unit->IsDead()) {
+		return;
+	}
+	try {
+		unit->CmdFightTo(pos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, INT_MAX, CCircuitUnit::OrdSrc::SCRIPT);
+	} catch (const std::exception&) {
+	}
+}
+
+static void CCircuitUnit_SetSquadOwned(CCircuitUnit* unit, bool own)
+{
+	if ((unit != nullptr) && !unit->IsDead()) {
+		unit->SetSquadOwned(own);
 	}
 }
 
@@ -1802,6 +1830,11 @@ static float CCircuitAI_GetTunable(CCircuitAI* circuit, const std::string& name,
 	return circuit->GetTunable(name, defVal);
 }
 
+static float CCircuitAI_GetOwnTunable(CCircuitAI* circuit, const std::string& name, float defVal)
+{
+	return circuit->GetOwnTunable(name, defVal);
+}
+
 static int CCircuitAI_LoadOptionFloats(CCircuitAI* circuit, const std::string& name)
 {
 	return circuit->LoadOptionFloats(name);
@@ -2364,6 +2397,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	// adds shares this process, so they can simply read each other.
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetDefBuildProgress(CCircuitDef@) const", asFUNCTION(CCircuitAI_GetDefBuildProgress), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetTunable(const string &in, float) const", asFUNCTION(CCircuitAI_GetTunable), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetOwnTunable(const string &in, float) const", asFUNCTION(CCircuitAI_GetOwnTunable), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "int LoadOptionFloats(const string &in)", asFUNCTION(CCircuitAI_LoadOptionFloats), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float OptionFloat(int) const", asFUNCTION(CCircuitAI_OptionFloat), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetSpeedFactor() const", asFUNCTION(CCircuitAI_GetSpeedFactor), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
@@ -2378,6 +2412,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "bool RecordTweaked() const", asMETHOD(CCircuitAI, RecordTweaked), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "double ClockUs() const", asFUNCTION(CCircuitAI_ClockUs), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "void PublishTeamValue(const string& in, float)", asFUNCTION(CCircuitAI_PublishTeamValue), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "void SetSquadOrders(bool)", asMETHOD(CCircuitAI, SetSquadOrders), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float ReadTeamValue(int, const string& in, float) const", asFUNCTION(CCircuitAI_ReadTeamValue), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "AIFloat3 GetBestWreckPos(const AIFloat3& in, float, float) const", asFUNCTION(CCircuitAI_GetBestWreckPos), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "AIFloat3 GetBestRezPos(const AIFloat3& in, float, float) const", asFUNCTION(CCircuitAI_GetBestRezPos), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
@@ -2532,6 +2567,12 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsDumbFireDef() const", asMETHOD(CCircuitDef, IsDumbFire), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawDps() const", asMETHOD(CCircuitDef, GetRawDps), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawDmg() const", asMETHOD(CCircuitDef, GetRawDmg), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawSurfDps() const", asMETHOD(CCircuitDef, GetRawSurfDps), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawAirDps() const", asMETHOD(CCircuitDef, GetRawAirDps), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawWaterDps() const", asMETHOD(CCircuitDef, GetRawWaterDps), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawSurfDmg() const", asMETHOD(CCircuitDef, GetRawSurfDmg), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawAirDmg() const", asMETHOD(CCircuitDef, GetRawAirDmg), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetRawWaterDmg() const", asMETHOD(CCircuitDef, GetRawWaterDmg), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastRadius() const", asMETHOD(CCircuitDef, GetBlastRadius), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastDamage() const", asMETHOD(CCircuitDef, GetBlastDamage), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastEdge() const", asMETHOD(CCircuitDef, GetBlastEdge), asCALL_THISCALL); ASSERT(r >= 0);
@@ -2602,6 +2643,9 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	// command moves the unit without consuming its task slot.
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdMoveTo(const AIFloat3& in)", asFUNCTION(CCircuitUnit_CmdMoveTo), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdGuard(CCircuitUnit@)", asFUNCTION(CCircuitUnit_CmdGuard), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdFightTo(const AIFloat3& in)", asFUNCTION(CCircuitUnit_CmdFightTo), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitUnit", "void SetSquadOwned(bool)", asFUNCTION(CCircuitUnit_SetSquadOwned), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitUnit", "bool IsSquadOwned() const", asMETHOD(CCircuitUnit, IsSquadOwned), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdReclaimUnit(CCircuitUnit@)", asFUNCTION(CCircuitUnit_CmdReclaimUnit), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdLoadUnit(CCircuitUnit@)", asFUNCTION(CCircuitUnit_CmdLoadUnit), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "void CmdUnloadAt(const AIFloat3& in, CCircuitUnit@)", asFUNCTION(CCircuitUnit_CmdUnloadAt), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
