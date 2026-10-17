@@ -49,7 +49,40 @@ public:
 
 	const std::set<CCircuitUnit*>& GetShields() const { return shields; }
 
+	// apex: THE JOIN WINDOW (docs/doctrine.md): OPEN while the squad forms, COMMITTED from the moment it
+	// launches until it is home again (JoinReopen). Under apex_gather a committed task takes only the roster
+	// admitted at its commit, for admitFrames; everything else is refused at the join paths that ask JoinOpen.
+	// ATTACK, RAID and BOMB tasks are launched by being made: they commit on their first update.
+	virtual bool JoinOpen(const CCircuitUnit* unit) const override final;
+	virtual void JoinTick() override final;
+	bool IsJoinClosed() const;
+	bool IsJoinCommitted() const { return joinCommitted; }
+	int GetJoinCommitFrame() const { return joinCommitted ? joinCommitFrame : -1; }
+	void JoinAdmit(int unitId) { if (!joinCommitted) { joinAdmit.insert(unitId); } }
+	void JoinCommit(int admitFrames);
+	void JoinReopen();
+	void NoteJoinMerged(int n);
+
+	// apex (comfight.as, apex_com_fight): the script's fight verdict for the group. Until `until` every member
+	// walks (fight false) or fight-walks (fight true) to pos, and the task's own targeting and travel wait.
+	void SetScriptMove(const springai::AIFloat3& pos, int until, bool fight);
+	bool ScriptMoveActive() const;
+	// ...and the defended point it decided not to take: targets inside the ring are not picked until `until`
+	void SetKeepOut(const springai::AIFloat3& pos, float r, int until) { keepPos = pos; keepR = r; keepUntil = until; }
+	bool InKeepOut(const springai::AIFloat3& p) const;
+
 protected:
+	bool ScriptMoveUpdate();
+	// apex_focus_fire (ISquadTask): set targets during a fight-walk
+	virtual void FocusScript(int frame) {}
+	springai::AIFloat3 scriptPos;
+	int scriptUntil = -1;
+	int scriptIssued = -1;
+	bool scriptFight = false;
+	springai::AIFloat3 keepPos;
+	float keepR = 0.f;
+	int keepUntil = -1;
+
 	void SetTarget(CEnemyInfo* enemy);
 	void Attack(CCircuitUnit* unit, const int frame);
 
@@ -66,6 +99,14 @@ protected:
 	static F3Vec enemyPositions;  // NOTE: micro-opt
 
 	int attackFrame;
+
+private:
+	bool JoinAdmitted(const CCircuitUnit* unit) const;
+	bool joinCommitted = false;
+	bool joinTicked = false;
+	int joinAdmitUntil = -1;
+	int joinCommitFrame = -1;
+	std::set<int> joinAdmit;
 
 private:  // NOTE: Never assign directly, use SetTarget() to avoid access to a dead target
 	CEnemyInfo* target;

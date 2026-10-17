@@ -13,6 +13,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace circuit {
 
@@ -29,7 +30,11 @@ public:
 	virtual void AssignTo(CCircuitUnit* unit) override;
 	virtual void RemoveAssignee(CCircuitUnit* unit) override;
 
-	virtual void Merge(ISquadTask* task);
+	// apex: the one way a squad folds into another; refused when either join window is closed
+	bool Merge(ISquadTask* task);
+protected:
+	virtual void MergeFrom(ISquadTask* task);
+public:
 	virtual bool PurgeStrays() override;
 	// apex: a ground member of a squad of two or more does not walk home alone
 	virtual bool AllowRetreat(CCircuitUnit* unit) override;
@@ -54,6 +59,7 @@ protected:
 	NSMicroPather::HitFunc GetHitTest() const;
 	void Attack(const int frame);
 	void Attack(const int frame, const bool isGround);
+	void StockAttack(const int frame, const bool isGround);  // StockFight.inl
 	// one task update (1 s) plus the turn to walk away
 	static constexpr float DGUN_REACT_S = 2.f;
 	static float DGunKeepOut(CCircuitDef* u, CCircuitDef* t, float& hold);
@@ -79,6 +85,26 @@ protected:
 public:
 	static void NoteTargetKill(CCircuitAI* circuit, CCircuitDef* edef);
 	static void NoteTargetPick(CCircuitAI* circuit, float pickM, float nearM);
+
+	// apex_focus_fire: in contact, each member's fire goes to the enemy whose death removes the most of
+	// their damage per second of ours, in lethal doses; what deals us no damage comes last
+	virtual void OnUnitDestroyed(CCircuitUnit* unit, CEnemyInfo* attacker) override;
+	bool IsFocusFight() const;
+	static void NoteFocusKill(CCircuitAI* circuit, CCircuitUnit* killer, CEnemyInfo* enemy);
+protected:
+	virtual void FocusScript(int frame) override;
+	bool FocusTick(int frame, bool issue);
+	bool FocusHold(int frame);
+	bool FocusLive(int frame) const;
+	std::map<int, int> focusAt;  // member -> enemy
+	std::vector<int> focusOrder;
+	int focusNext = -1;
+	int focusSeen = -1;
+	int focusEp = -1;
+	int focusKillN = 0;
+	bool focusArmedKilled = false;
+	bool focusOn = false;
+	bool focusOrdered = false;
 protected:
 
 	float lowestRange;

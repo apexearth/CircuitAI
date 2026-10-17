@@ -10,15 +10,19 @@
 #include "map/InfluenceMap.h"
 #include "map/ThreatMap.h"
 #include "module/BuilderManager.h"
+#include "module/MilitaryManager.h"
 #include "setup/SetupManager.h"
 #include "terrain/TerrainManager.h"
 #include "unit/action/RearmAction.h"
 #include "unit/action/DGunAction.h"
 #include "unit/action/TravelAction.h"
 #include "unit/enemy/EnemyUnit.h"
+#include "unit/CircuitUnit.h"
 #include "CircuitAI.h"
 #include "util/Utils.h"
 #include "spring/SpringMap.h"   // RoamPos: GetElevationAt
+
+#include "AISCommands.h"
 
 namespace circuit {
 
@@ -45,8 +49,68 @@ IFighterTask::~IFighterTask()
 	}
 }
 
+bool IFighterTask::JoinAdmitted(const CCircuitUnit* unit) const
+{
+	return (manager->GetCircuit()->GetLastFrame() < joinAdmitUntil) && (joinAdmit.count(unit->GetId()) != 0);
+}
+
+bool IFighterTask::IsJoinClosed() const
+{
+	return joinCommitted && static_cast<CMilitaryManager*>(manager)->IsJoinGate();
+}
+
+bool IFighterTask::JoinOpen(const CCircuitUnit* unit) const
+{
+	return !IsJoinClosed() || (units.count(const_cast<CCircuitUnit*>(unit)) != 0) || JoinAdmitted(unit);
+}
+
+void IFighterTask::JoinCommit(int admitFrames)
+{
+	if (joinCommitted) {
+		return;
+	}
+	joinCommitted = true;
+	joinTicked = true;
+	joinCommitFrame = manager->GetCircuit()->GetLastFrame();
+	joinAdmitUntil = joinCommitFrame + std::max(0, admitFrames);
+	static_cast<CMilitaryManager*>(manager)->NoteJoin(fightType, CMilitaryManager::JW_COMMIT);
+}
+
+void IFighterTask::JoinReopen()
+{
+	if (!joinCommitted) {
+		return;
+	}
+	joinCommitted = false;
+	joinAdmit.clear();
+	joinAdmitUntil = -1;
+	static_cast<CMilitaryManager*>(manager)->NoteJoin(fightType, CMilitaryManager::JW_REOPEN);
+}
+
+void IFighterTask::JoinTick()
+{
+	if (joinTicked) {
+		return;
+	}
+	joinTicked = true;
+	if ((FightType::ATTACK == fightType) || (FightType::RAID == fightType) || (FightType::BOMB == fightType)) {
+		JoinCommit(0);
+	}
+}
+
+void IFighterTask::NoteJoinMerged(int n)
+{
+	if (joinCommitted && (n > 0)) {
+		static_cast<CMilitaryManager*>(manager)->NoteJoin(fightType, CMilitaryManager::JW_LATE, n);
+	}
+}
+
 void IFighterTask::AssignTo(CCircuitUnit* unit)
 {
+	if (joinCommitted) {
+		static_cast<CMilitaryManager*>(manager)->NoteJoin(fightType,
+				JoinAdmitted(unit) ? CMilitaryManager::JW_ADMIT : CMilitaryManager::JW_LATE);
+	}
 	IUnitTask::AssignTo(unit);
 
 	CCircuitDef* cdef = unit->GetCircuitDef();
@@ -101,6 +165,59 @@ void IFighterTask::OnUnitIdle(CCircuitUnit* unit)
 	}
 }
 
+void IFighterTask::SetScriptMove(const AIFloat3& pos, int until, bool fight)
+{
+	if ((fight != scriptFight) || (pos.SqDistance2D(scriptPos) > SQUARE(64.f))) {
+		scriptIssued = -1;
+	}
+	scriptPos = pos;
+	scriptUntil = until;
+	scriptFight = fight;
+}
+
+bool IFighterTask::ScriptMoveActive() const
+{
+	return manager->GetCircuit()->GetLastFrame() < scriptUntil;
+}
+
+bool IFighterTask::InKeepOut(const AIFloat3& p) const
+{
+	return (keepR > 0.f) && (manager->GetCircuit()->GetLastFrame() < keepUntil)
+		&& (keepPos.SqDistance2D(p) < SQUARE(keepR));
+}
+
+bool IFighterTask::ScriptMoveUpdate()
+{
+	CCircuitAI* circuit = manager->GetCircuit();
+	const int frame = circuit->GetLastFrame();
+	if (frame >= scriptUntil) {
+		return false;
+	}
+	if (scriptFight) {
+		FocusScript(frame);
+	}
+	if ((scriptIssued >= 0) && (frame < scriptIssued + FRAMES_PER_SEC * 2)) {
+		return true;
+	}
+	scriptIssued = frame;
+	SetTarget(nullptr);
+	for (CCircuitUnit* unit : units) {
+		if (unit->GetTravelAct() != nullptr) {
+			unit->GetTravelAct()->StateWait();
+		}
+		TRY_UNIT(circuit, unit,
+			if (scriptFight) {
+				unit->CmdFightTo(scriptPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60,
+						CCircuitUnit::OrdSrc::SCRIPT);
+			} else {
+				unit->CmdMoveTo(scriptPos, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 60,
+						CCircuitUnit::OrdSrc::SCRIPT);
+			}
+		)
+	}
+	return true;
+}
+
 void IFighterTask::OnUnitDamaged(CCircuitUnit* unit, CEnemyInfo* attacker)
 {
 	CCircuitAI* circuit = manager->GetCircuit();
@@ -115,7 +232,8 @@ void IFighterTask::OnUnitDamaged(CCircuitUnit* unit, CEnemyInfo* attacker)
 
 	// Retreat 0 means never: a disarmed unit fell through to the no-target
 	// retreat below at full health, and a rolling bomb walked home to blow up.
-	if ((cdef->GetRetreat() <= 0.f) || cdef->IsKamikazeDef()) {
+	const bool stock = circuit->IsStockArmy();
+	if (!stock && ((cdef->GetRetreat() <= 0.f) || cdef->IsKamikazeDef())) {
 		return;
 	}
 
@@ -138,7 +256,7 @@ void IFighterTask::OnUnitDamaged(CCircuitUnit* unit, CEnemyInfo* attacker)
 		}
 		return;
 	} else if (healthPerc < 0.2f) {  // stuck units workaround: they don't shoot and don't see distant threat
-		if (!AllowRetreat(unit)) {
+		if (!stock && !AllowRetreat(unit)) {
 			return;
 		}
 		CRetreatTask* task = manager->EnqueueRetreat();
@@ -146,7 +264,7 @@ void IFighterTask::OnUnitDamaged(CCircuitUnit* unit, CEnemyInfo* attacker)
 		return;
 	}
 
-	if (!AllowRetreat(unit)) {
+	if (!stock && !AllowRetreat(unit)) {
 		return;
 	}
 	CThreatMap* threatMap = circuit->GetThreatMap();

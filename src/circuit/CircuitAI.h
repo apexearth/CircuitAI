@@ -63,6 +63,7 @@ class CMapManager;
 class CThreatMap;
 class CInfluenceMap;
 class CPathFinder;
+class IPathQuery;
 class CTerrainManager;
 class CBuilderManager;
 class CFactoryManager;
@@ -190,6 +191,13 @@ public:
 	// are cached on first read: this sits inside the per-unit attack loop.
 	float GetTunable(const char* name, float defVal) const { return GetTunable(std::string(name), defVal); }
 	float GetTunable(const std::string& name, float defVal) const;
+	// apex_stock_army: every combat unit runs stock BARb's fight code (docs/how-it-works.md, Army control layers)
+	bool IsStockArmy() const;
+	bool IsStockCtl(const CCircuitUnit* unit) const;
+	bool IsStockCtlDef(const CCircuitDef* cdef) const;
+	// a script call that would have ordered a combat unit under the switch, dropped and counted by kind
+	void NoteStockLeak(const char* kind);
+	std::string TakeStockLeaks();
 	const std::string& GetAiOption(const std::string& name) const;
 	// the floats in the file a lobby option names: the policy net's weights (tools/neuro.py),
 	// thousands of them, which no start script holds. -1 = no such option or file
@@ -442,6 +450,12 @@ public:
 	// path manager reads the synced blocking map, structures included, which is
 	// the only oracle here that can see one.
 	float GetPathLength(CCircuitUnit* unit, const springai::AIFloat3& to);
+	// Our own pathfinder's walk flood from `from` for cdef's move type, on a worker
+	// thread (no engine call, so nothing host-only touches sim state). Returns a
+	// handle, -1 when refused; WalkMapCost reads elmos to the nearest of 8 points
+	// `radius` around `to`: -2 still running or unknown handle, -1 unreachable.
+	int WalkMapStart(CCircuitDef* cdef, const springai::AIFloat3& from);
+	float WalkMapCost(int handle, const springai::AIFloat3& to, float radius);
 	float GetEnemyCostAt(const springai::AIFloat3& pos, float radius) const;
 	// How close the nearest enemy is to being able to shoot this spot: the
 	// smallest (distance - its weapon reach - `reactS` seconds of its own
@@ -468,6 +482,8 @@ public:
 	using EnemyInfos = std::map<ICoreUnit::Id, CEnemyInfo*>;
 private:
 	mutable std::unordered_map<std::string, float> tunables;  // see GetTunable
+	mutable int stockArmy = -1;
+	std::map<std::string, int> stockLeaks;
 	mutable std::map<std::string, std::string> aiOpts;  // this bot's lobby options
 	mutable bool aiOptsRead = false;
 	void ReadAiOpts() const;
@@ -624,6 +640,8 @@ private:
 	// def id -> engine pathType. UnitDef::GetMoveData() allocates a wrapper the
 	// caller must delete, so the lookup is done once per def.
 	std::map<int, int> pathTypes;
+	std::map<int, std::shared_ptr<IPathQuery>> walkMaps;
+	int walkMapNext = 0;
 	float engageBoost = 1.f;
 	springai::AIFloat3 frontPos = -RgtVector;
 	springai::AIFloat3 healPos = -RgtVector;

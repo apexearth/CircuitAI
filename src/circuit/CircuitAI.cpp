@@ -22,6 +22,8 @@
 #include "map/GridAnalyzer.h"
 #include "map/InfluenceMap.h"   // unconditionally: the DEBUG_VIS include below is gated
 #include "terrain/path/PathFinder.h"
+#include "terrain/path/QueryCostMap.h"
+#include "terrain/TerrainData.h"
 #include "task/PlayerTask.h"
 #include "task/fighter/FighterTask.h"
 #include "task/fighter/SquadTask.h"
@@ -538,6 +540,7 @@ int CCircuitAI::HandleGameEvent(int topic, const void* data)
 						GetTeamUnit(evt->attacker) != nullptr);
 				if (GetTeamUnit(evt->attacker) != nullptr) {
 					ISquadTask::NoteTargetKill(this, enemy->GetCircuitDef());
+					ISquadTask::NoteFocusKill(this, GetTeamUnit(evt->attacker), enemy);
 				}
 				allyTeam->DyingEnemy(enemy->GetData(), lastFrame);
 				ret = 0;
@@ -2131,8 +2134,64 @@ float CCircuitAI::GetTeamMetalIncome(int otherTeamId) const
 	return game->GetRulesParamFloat(key.c_str(), -1.f);
 }
 
+// apex_stock_army: the value at which each fight-code tunable runs stock BARb's code
+static const std::unordered_map<std::string, float>& StockArmyValues()
+{
+	static const std::unordered_map<std::string, float> vals = {
+		{"apex_gather", 0.f}, {"apex_com_fight", 0.f}, {"apex_focus_fire", 0.f}, {"apex_birth_defend", 0.f},
+		{"apex_target_value", 0.f}, {"apex_fight_travel", 0.f}, {"apex_pool_leash", 0.f}, {"apex_roam_front", 0.f},
+		{"apex_air_form", 0.f}, {"apex_squad_form", 0.f}, {"apex_side_with", 0.f}, {"apex_bomb_enroute", 0.f},
+		{"apex_raid_commit", 0.f}, {"apex_raid_first", 0.f}, {"apex_attack_share", 0.f}, {"apex_prefer_target", 0.f},
+		{"apex_retreat_stand", 0.f},
+	};
+	return vals;
+}
+
+bool CCircuitAI::IsStockArmy() const
+{
+	if (stockArmy < 0) {
+		stockArmy = (GetTunable("apex_stock_army", 0.f) > 0.f) ? 1 : 0;
+	}
+	return stockArmy > 0;
+}
+
+bool CCircuitAI::IsStockCtlDef(const CCircuitDef* cdef) const
+{
+	return (cdef != nullptr) && cdef->IsMobile() && !cdef->IsBuilder() && !cdef->IsRoleComm()
+		&& !cdef->IsRoleTrans() && (cdef->IsAttacker() || cdef->IsRoleScout() || !cdef->IsAbleToFly());
+}
+
+bool CCircuitAI::IsStockCtl(const CCircuitUnit* unit) const
+{
+	return IsStockArmy() && (unit != nullptr) && IsStockCtlDef(unit->GetCircuitDef());
+}
+
+void CCircuitAI::NoteStockLeak(const char* kind)
+{
+	++stockLeaks[kind];
+}
+
+std::string CCircuitAI::TakeStockLeaks()
+{
+	std::string s;
+	int n = 0;
+	for (const auto& kv : stockLeaks) {
+		s += " " + kv.first + "=" + utils::int_to_string(kv.second);
+		n += kv.second;
+	}
+	stockLeaks.clear();
+	return "leak=" + utils::int_to_string(n) + s;
+}
+
 float CCircuitAI::GetTunable(const std::string& name, float defVal) const
 {
+	if ((stockArmy != 0) && (name != "apex_stock_army") && IsStockArmy()) {
+		const auto& sv = StockArmyValues();
+		auto st = sv.find(name);
+		if (st != sv.end()) {
+			return st->second;
+		}
+	}
 	auto it = tunables.find(name);
 	if (it != tunables.end()) {
 		return it->second;
@@ -3297,6 +3356,48 @@ float CCircuitAI::GetPathLength(CCircuitUnit* unit, const springai::AIFloat3& to
 	// goalRadius 0 asks for the exact square and fails on anything standing on
 	// it; SQUARE_SIZE * 8 is the granularity the estimator works at anyway.
 	return GetPathing()->GetApproximateLength(unit->GetPos(GetLastFrame()), to, it->second, 64.f);
+}
+
+int CCircuitAI::WalkMapStart(CCircuitDef* cdef, const springai::AIFloat3& from)
+{
+	if ((cdef == nullptr) || !cdef->IsMobile() || cdef->IsAbleToFly() || (pathfinder == nullptr)) {
+		return -1;
+	}
+	// a running query is owned by its job too, but only finished ones are dropped
+	int running = 0;
+	for (auto it = walkMaps.begin(); it != walkMaps.end();) {
+		if (it->second->GetState() != IPathQuery::State::READY) {
+			++running;
+			++it;
+		} else if (walkMaps.size() > 4) {
+			it = walkMaps.erase(it);
+		} else {
+			++it;
+		}
+	}
+	if (running >= 2) {
+		return -1;
+	}
+	springai::AIFloat3 pos = from;
+	CTerrainData::CorrectPosition(pos);
+	std::shared_ptr<IPathQuery> query = pathfinder->CreateWalkMapQuery(cdef, pos);
+	const int handle = walkMapNext++;
+	walkMaps[handle] = query;
+	pathfinder->RunQuery(scheduler.get(), query);
+	return handle;
+}
+
+float CCircuitAI::WalkMapCost(int handle, const springai::AIFloat3& to, float radius)
+{
+	auto it = walkMaps.find(handle);
+	if ((it == walkMaps.end()) || (it->second->GetState() != IPathQuery::State::READY)) {
+		return -2.f;
+	}
+	springai::AIFloat3 pos = to;
+	CTerrainData::CorrectPosition(pos);
+	const CQueryCostMap* q = static_cast<const CQueryCostMap*>(it->second.get());
+	const float cells = q->GetCostAt(pos, int(std::max(radius, 0.f)));
+	return (cells < 0.f) ? -1.f : cells * pathfinder->GetSquareSize();
 }
 
 // Ask the terrain manager for a site `def` can be placed on near `pos`.

@@ -6,6 +6,7 @@
  */
 
 #include "task/fighter/DefendTask.h"
+#include "task/fighter/Catch.h"
 #include "map/InfluenceMap.h"
 #include <algorithm>
 #include <map>
@@ -51,7 +52,7 @@ CDefendTask::~CDefendTask()
 
 bool CDefendTask::CanAssignTo(CCircuitUnit* unit) const
 {
-	if ((leader != nullptr)
+	if ((leader != nullptr) && !manager->GetCircuit()->IsStockArmy()
 		&& !SameClimb(manager->GetCircuit(), leader->GetCircuitDef(), unit->GetCircuitDef()))
 	{
 		return false;
@@ -209,22 +210,52 @@ void CDefendTask::PathToEnemies(int frame)
 
 void CDefendTask::Update()
 {
+	if (manager->GetCircuit()->IsStockArmy()) {
+		StockUpdate();
+		return;
+	}
 	++updCount;
 	if (birth) {
 		BirthUpdate();
 		return;
 	}
+	if (ScriptMoveUpdate()) {
+		return;
+	}
 	const bool hunting = manager->GetCircuit()->GetLastFrame() < detachUntil;
+	// a sortie back home is a pool again
+	if (!hunting && IsJoinCommitted() && (leader != nullptr)) {
+		CCircuitAI* c = manager->GetCircuit();
+		CMilitaryManager* mm = c->GetMilitaryManager();
+		const float sqR = SQUARE(mm->GetBaseDefRange());
+		const AIFloat3& lp = leader->GetPos(c->GetLastFrame());
+		const AIFloat3 stand = mm->GetDefenceStand();
+		if ((lp.SqDistance2D(c->GetSetupManager()->GetBasePos()) < sqR)
+			|| (utils::is_valid(stand) && (lp.SqDistance2D(stand) < sqR)))
+		{
+			JoinReopen();
+		}
+	}
 
 	/*
 	 * Promote task if possible
 	 */
-	if (!hunting && (updCount % 32 == 1)) {
+	// apex_gather: a pool never walks out to a squad already launched, and an all-raider pool leaves only when
+	// nnraid.as launches it whole on its fight estimate (gather.as)
+	const bool gather = manager->GetCircuit()->GetTunable("apex_gather", 0.f) > 0.f;
+	bool scriptLaunch = false;
+	if (gather && (promote == FightType::RAID) && (manager->GetCircuit()->GetTunable("apex_nnraid", 1.f) > 0.f)) {
+		scriptLaunch = true;
+		for (CCircuitUnit* unit : units) {
+			scriptLaunch = scriptLaunch && unit->GetCircuitDef()->IsRoleRaider();
+		}
+	}
+	if (!hunting && !scriptLaunch && (updCount % 32 == 1)) {
 		CMilitaryManager* militaryMgr = static_cast<CMilitaryManager*>(manager);
 		// JOIN THE SQUAD, NOT THE TARGET (docs/doctrine.md; his 10-13: "We make 1 fuckin unit and are
 		// charging out to meet these guys on our doorstep", Tzars sent alone): under its bar a
 		// pool walks to the strongest live squad of its kind; only a full bar opens a new one.
-		if ((attackPower < maxPower) && !units.empty() && !militaryMgr->GetTasks(check).empty()) {
+		if (!gather && (attackPower < maxPower) && !units.empty() && !militaryMgr->GetTasks(check).empty()) {
 			IFighterTask* best = militaryMgr->BestSquadToJoin(check, *units.begin(), this);
 			if (best != nullptr) {
 				static std::map<const CCircuitAI*, std::pair<int, int>> joined;   // count, next log frame
@@ -249,6 +280,7 @@ void CDefendTask::Update()
 			for (CCircuitUnit* unit : tmpUnits) {
 				manager->AssignTask(unit, task);
 			}
+			task->JoinCommit(0);
 //			manager->DoneTask(this);  // NOTE: RemoveAssignee() will abort task
 			return;
 		}
@@ -258,8 +290,7 @@ void CDefendTask::Update()
 	 * Merge tasks if possible
 	 */
 	ISquadTask* task = hunting ? nullptr : GetMergeTask();
-	if (task != nullptr) {
-		task->Merge(this);
+	if ((task != nullptr) && task->Merge(this)) {
 		units.clear();
 		manager->AbortTask(this);
 		return;
@@ -283,6 +314,12 @@ void CDefendTask::Update()
 		if (leader == nullptr) {  // task aborted
 			return;
 		}
+	}
+
+	if (FocusHold(frame)) {
+		state = State::ENGAGE;
+		Attack(frame);
+		return;
 	}
 
 	/*
@@ -316,7 +353,7 @@ void CDefendTask::Update()
 	PathToEnemies(frame);
 }
 
-void CDefendTask::Merge(ISquadTask* task)
+void CDefendTask::MergeFrom(ISquadTask* task)
 {
 	CCircuitAI* circuit = manager->GetCircuit();
 	int frame = circuit->GetLastFrame();
@@ -395,6 +432,8 @@ bool CDefendTask::FindTarget()
 	const float ourSpeed = std::max(lowestSpeed, 1.f);
 	const float threatSq = (float)threatMap->GetSquareSize();
 	float detachThreat = .0f;
+	const bool catchOn = (circuit->GetTunable("apex_open_race", 0.f) > 0.f) && !circuit->IsStockArmy();
+	SChaseStat& chase = ChaseStat(circuit);
 	for (auto& kv : enemies) {
 		CEnemyInfo* enemy = kv.second;
 		if (enemy->IsHidden() || (enemy->GetTasks().size() > 2)) {
@@ -402,6 +441,9 @@ bool CDefendTask::FindTarget()
 		}
 
 		const AIFloat3& ePos = enemy->GetPos();
+		if (InKeepOut(ePos)) {
+			continue;
+		}
 		if (birth) {
 			// the odds were read when the unit was given the task; here only who engages the anchor
 			const CCircuitDef* ed = enemy->GetCircuitDef();
@@ -465,6 +507,14 @@ bool CDefendTask::FindTarget()
 			}
 		}
 
+		const float catchP = CatchP(pos, ourSpeed, weaponRange, enemy);
+		if (catchP <= 0.f) {
+			++chase.unreach;
+			if (catchOn) {
+				++chase.refused;
+				continue;
+			}
+		}
 		float sqDist = pos.SqDistance2D(ePos);
 		if (petty) {
 			++pettySkipped;
@@ -481,6 +531,9 @@ bool CDefendTask::FindTarget()
 		if (tv && (edef != nullptr) && (FireAt(fire, edef) > 0.f)) {
 			const float killS = EnemyHp(enemy) / FireAt(fire, edef);
 			score = SQUARE((std::sqrt(sqDist) + killS * ourSpeed) / std::max(TargetWorth(fire, enemy, killS), 1.f));
+		}
+		if (catchOn) {
+			score /= SQUARE(catchP);
 		}
 		if (minSqDist > score) {
 			minSqDist = score;
@@ -510,6 +563,22 @@ bool CDefendTask::FindTarget()
 		leashLogAt = frame + FRAMES_PER_SEC * 30;
 		circuit->LOG("apex: defend-leash t=%i lead=%s n=%u skipped=%i", circuit->GetTeamId(),
 				cdef->GetDef()->GetName(), (unsigned)units.size(), leashSkipped);
+	}
+	{
+		const CCircuitDef* bd = (bestTarget != nullptr) ? bestTarget->GetCircuitDef() : nullptr;
+		chase.picks += (bestTarget != nullptr) ? 1 : 0;
+		if ((bd != nullptr) && (bd->GetSpeed() > ourSpeed)) {
+			++chase.fast;
+			if (chaseFrame >= 0) {
+				chase.sec += float(frame - chaseFrame) / FRAMES_PER_SEC;
+				chase.dist += pos.distance2D(chasePos);
+			}
+			chaseFrame = frame;
+			chasePos = pos;
+		} else {
+			chaseFrame = -1;
+		}
+		ChaseStatLog(circuit, frame);
 	}
 	if (bestTarget != nullptr) {
 		SetTarget(bestTarget);
@@ -568,6 +637,7 @@ int CDefendTask::Detach(CEnemyInfo* enemy, float threat)
 	for (CCircuitUnit* unit : pick) {
 		manager->AssignTask(unit, det);
 	}
+	det->JoinCommit(0);
 	return int(pick.size());
 }
 

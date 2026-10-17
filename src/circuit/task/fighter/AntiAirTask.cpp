@@ -75,6 +75,9 @@ CAntiAirTask::~CAntiAirTask()
 
 bool CAntiAirTask::CanAssignTo(CCircuitUnit* unit) const
 {
+	if (manager->GetCircuit()->IsStockArmy()) {
+		return StockCanAssignTo(unit);
+	}
 	if (!unit->GetCircuitDef()->IsRoleAA()) {
 		return false;
 	}
@@ -165,8 +168,7 @@ void CAntiAirTask::Update()
 	 * Merge tasks if possible
 	 */
 	ISquadTask* task = GetMergeTask();
-	if (task != nullptr) {
-		task->Merge(this);
+	if ((task != nullptr) && task->Merge(this)) {
 		units.clear();
 		manager->AbortTask(this);
 		return;
@@ -319,6 +321,10 @@ NSMicroPather::HitFunc CAntiAirTask::GetHitTest() const
 
 void CAntiAirTask::FindTarget()
 {
+	if (manager->GetCircuit()->IsStockArmy()) {
+		StockFindTarget();
+		return;
+	}
 	CCircuitAI* circuit = manager->GetCircuit();
 	CTerrainManager* terrainMgr = circuit->GetTerrainManager();
 	CThreatMap* threatMap = circuit->GetThreatMap();
