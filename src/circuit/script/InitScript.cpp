@@ -1399,6 +1399,73 @@ static void CCircuitAI_SetBaseGrid(CCircuitAI* circuit, const AIFloat3& anchor,
 	circuit->SetBaseGrid(anchor, fwd, cell, lanePitch, laneHalf, range);
 }
 
+// apex: THE ROAD C++ REFUSED IS STILL HOT (his 10-22 game: one con re-elected the same far T1 lab 74 times in
+// five minutes, each refused for a hot road a second later -- the script's own trip risk read that road as safe).
+// True while `site` is within 512 of the last refused road's end and its hottest square is still over the bar
+// it was refused at: a live read, no clock (his ruling: a hot road is never banned for minutes).
+static bool CCircuitUnit_HotRoadTo(CCircuitUnit* unit, const AIFloat3& site)
+{
+	if ((unit == nullptr) || (unit->hotRoadEnd.x < 0.f) || (unit->hotRoadEnd.SqDistance2D(site) > SQUARE(512.f))) {
+		return false;
+	}
+	ITaskModule* mgr = unit->GetManager();
+	if (mgr == nullptr) {
+		return false;
+	}
+	CThreatMap* tm = mgr->GetCircuit()->GetThreatMap();
+	tm->SetThreatType(unit);
+	if (tm->GetThreatAt(unit, unit->hotRoadAt) > unit->hotRoadBar) {
+		return true;
+	}
+	unit->hotRoadEnd.x = -1.f;
+	return false;
+}
+
+// ...and another hand's refusal there: 11 armck walked one by one into the same refused road on Isthmus (10-23).
+// It holds while the refused road's hot square is over THIS hand's bar and within 600 of its own straight road.
+static bool CCircuitUnit_HotRoadToTeam(CCircuitUnit* unit, const AIFloat3& site)
+{
+	if (CCircuitUnit_HotRoadTo(unit, site)) {
+		return true;
+	}
+	ITaskModule* mgr = (unit != nullptr) ? unit->GetManager() : nullptr;
+	if ((mgr == nullptr) || (unit->GetCircuitDef() == nullptr)) {
+		return false;
+	}
+	CCircuitAI* circuit = mgr->GetCircuit();
+	const AIFloat3 from = unit->GetPos(circuit->GetLastFrame());
+	const float bar = std::max(unit->GetCircuitDef()->GetPower(), std::max(THREAT_MIN, circuit->GetAllyDefendInflAt(site)));
+	CThreatMap* tm = circuit->GetThreatMap();
+	bool typed = false;
+	for (const CCircuitAI::SHotRoad& h : circuit->hotRoads) {
+		if ((h.end.x < 0.f) || (h.end.SqDistance2D(site) > SQUARE(512.f))) {
+			continue;
+		}
+		const AIFloat3 d = site - from;
+		const float len2 = d.x * d.x + d.z * d.z;
+		float t = (len2 > 1.f) ? (((h.at.x - from.x) * d.x + (h.at.z - from.z) * d.z) / len2) : 0.f;
+		t = std::min(1.f, std::max(0.f, t));
+		const AIFloat3 onRoad(from.x + d.x * t, 0.f, from.z + d.z * t);
+		if (onRoad.SqDistance2D(h.at) > SQUARE(600.f)) {
+			continue;
+		}
+		if (!typed) {
+			tm->SetThreatType(unit);
+			typed = true;
+		}
+		if (tm->GetThreatAt(unit, h.at) > bar) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Our streets or an in-process ally's (CCircuitAI::IsInBaseLane): the lanes the script cannot see.
+static bool CCircuitAI_InAnyBaseLane(CCircuitAI* circuit, const AIFloat3& pos)
+{
+	return circuit->IsInBaseLane(pos);
+}
+
 // The def's lattice cell nearest `pos`, exactly as the builder task will snap
 // it. Script walks that used their own pitch from an unsnapped origin sat
 // half a cell off the cells C++ chose.
@@ -2572,6 +2639,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "void SetHealPos(const AIFloat3& in)", asMETHOD(CCircuitAI, SetHealPos), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "void SetBaseGrid(const AIFloat3& in, const AIFloat3& in, float, float, float, float)", asFUNCTION(CCircuitAI_SetBaseGrid), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "AIFloat3 SnapToLattice(CCircuitDef@, const AIFloat3& in) const", asFUNCTION(CCircuitAI_SnapToLattice), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "bool InAnyBaseLane(const AIFloat3& in) const", asFUNCTION(CCircuitAI_InAnyBaseLane), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "bool IsPosOnMap(const AIFloat3& in) const",asMETHOD(CCircuitAI, IsPosOnMap), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetAllyInflAt(const AIFloat3& in) const", asMETHOD(CCircuitAI, GetAllyInflAt), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetAllyDefendInflAt(const AIFloat3& in) const", asMETHOD(CCircuitAI, GetAllyDefendInflAt), asCALL_THISCALL); ASSERT(r >= 0);
@@ -2734,6 +2802,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitUnit", "string GetActTrace() const", asMETHOD(CCircuitUnit, GetActTrace), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "int GetDamagedWeapon() const", asMETHOD(CCircuitUnit, GetDamagedWeapon), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitUnit", "int GetDamagedFrame() const", asMETHOD(CCircuitUnit, GetDamagedFrame), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitUnit", "bool HotRoadTo(const AIFloat3& in)", asFUNCTION(CCircuitUnit_HotRoadToTeam), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsRezAble() const", asMETHOD(CCircuitDef, IsRezAble), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetStoreM() const", asMETHOD(CCircuitDef, GetStoreM), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetStoreE() const", asMETHOD(CCircuitDef, GetStoreE), asCALL_THISCALL); ASSERT(r >= 0);
