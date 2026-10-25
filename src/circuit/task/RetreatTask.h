@@ -11,6 +11,8 @@
 #include "task/UnitTask.h"
 #include "util/Defines.h"
 
+#include <map>
+
 namespace circuit {
 
 class CQueryCostMap;
@@ -55,6 +57,10 @@ private:
 	int comHoldLogAt = -999999;
 	int comEvadeAt = -999999;
 	std::shared_ptr<IPathQuery> costQuery;  // owner
+	// apex_stock_heal: the heal spot each unit chose, kept until it is repaired (the station moves with the front)
+	std::map<CCircuitUnit*, springai::AIFloat3> healSpot;
+	// where Start() last sent each unit and how near counts as there: the idle handler goes to the same place
+	std::map<CCircuitUnit*, std::pair<springai::AIFloat3, float>> retreatDest;
 };
 
 } // namespace circuit

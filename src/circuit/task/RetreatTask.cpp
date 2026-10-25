@@ -115,6 +115,8 @@ void CRetreatTask::AssignTo(CCircuitUnit* unit)
 
 void CRetreatTask::RemoveAssignee(CCircuitUnit* unit)
 {
+	healSpot.erase(unit);
+	retreatDest.erase(unit);
 	IUnitTask::RemoveAssignee(unit);
 	if (units.empty()) {
 		manager->DoneTask(this);
@@ -180,15 +182,33 @@ void CRetreatTask::Start(CCircuitUnit* unit)
 		// apex_stock_heal (his 10-24: "our units retreat too far to get back home for repairs... we can just pull back a
 		// little and be repaired by rezbots or con turrets"): a stock unit takes the script's medic station -- published
 		// only while a rez bot of ours stands at it -- when it is nearer than the haven, ours, and walkable.
-		if (stock && (circuit->GetTunable("apex_stock_heal", 1.f) > 0.f) && utils::is_valid(circuit->GetHealPos())) {
-			AIFloat3 spot = circuit->GetHealPos();
-			CTerrainManager::CorrectPosition(spot);
+		// The spot a unit chose is KEPT: the station moves with the front every 5 s, and re-aimed every other update a
+		// wounded unit walked a step, stopped, walked a step (his 10-24 watch). Re-chosen only when the kept spot stops
+		// being ours or nearer than the haven.
+		if (stock && (circuit->GetTunable("apex_stock_heal", 1.f) > 0.f)
+			&& (utils::is_valid(circuit->GetHealPos()) || (healSpot.find(unit) != healSpot.end())))
+		{
 			const AIFloat3& here = unit->GetPos(frame);
-			const bool use = (here.SqDistance2D(spot) < here.SqDistance2D(endPos))
-				&& (circuit->GetInflMap()->GetInfluenceAt(spot) > circuit->GetInflMap()->GetEnemyInflAt(spot))
-				&& circuit->GetTerrainManager()->CanMoveToPos(unit->GetArea(), spot);
-			if (use) {
-				endPos = spot;
+			auto ok = [&](const AIFloat3& s) {
+				return (here.SqDistance2D(s) < here.SqDistance2D(endPos))
+					&& (circuit->GetInflMap()->GetInfluenceAt(s) > circuit->GetInflMap()->GetEnemyInflAt(s))
+					&& circuit->GetTerrainManager()->CanMoveToPos(unit->GetArea(), s);
+			};
+			bool use = false;
+			auto kept = healSpot.find(unit);
+			if ((kept != healSpot.end()) && ok(kept->second)) {
+				endPos = kept->second;
+				use = true;
+			} else if (utils::is_valid(circuit->GetHealPos())) {
+				AIFloat3 spot = circuit->GetHealPos();
+				CTerrainManager::CorrectPosition(spot);
+				use = ok(spot);
+				if (use) {
+					endPos = spot;
+					healSpot[unit] = spot;
+				} else {
+					healSpot.erase(unit);
+				}
 			}
 			struct Tally { int heal = 0, home = 0, logAt = 0; };
 			static std::map<const CCircuitAI*, Tally> tally;
@@ -343,6 +363,7 @@ void CRetreatTask::Start(CCircuitUnit* unit)
 	// combat death bucket, 39.4k metal / 371 units in one 20m game ("solo
 	// dudes walking into enemy groups"). High mod, no ceiling: the path bends
 	// hard around danger but can never fail to exist.
+	retreatDest[unit] = std::make_pair(endPos, range);
 	std::shared_ptr<IPathQuery> query = pathfinder->CreatePathSingleQuery(
 			unit, circuit->GetThreatMap(),
 			startPos, endPos, range, nullptr,
@@ -609,8 +630,13 @@ void CRetreatTask::OnUnitIdle(CCircuitUnit* unit)
 		haven = utils::is_valid(rally) ? rally : GetRearHaven(unit, haven);
 	}
 
-	const float maxDist = factoryMgr->GetAssistRange();
+	float maxDist = factoryMgr->GetAssistRange();
 	const AIFloat3& unitPos = unit->GetPos(frame);
+	auto dest = retreatDest.find(unit);
+	if ((repairer == nullptr) && (dest != retreatDest.end()) && utils::is_valid(dest->second.first)) {
+		haven = dest->second.first;
+		maxDist = std::max(dest->second.second, float(circuit->GetPathfinder()->GetSquareSize()));
+	}
 
 	// Cloak is switched on once, when the unit finishes (CircuitAI.cpp), and
 	// nothing there ever switches it off -- so re-decide it here too rather than
@@ -640,8 +666,11 @@ void CRetreatTask::OnUnitIdle(CCircuitUnit* unit)
 
 	if (unitPos.SqDistance2D(haven) > SQUARE(maxDist)) {
 		// TODO: push MoveAction into unit? to avoid enemy fire
+		// the whole walk, not one second: a 1 s order expired mid-walk, the unit idled and stopped, and came back here
+		const float walkS = unitPos.distance2D(haven) / std::max(cdef->GetSpeed(), 1.f);
+		const int timeout = frame + FRAMES_PER_SEC * std::max(1, int(walkS * 1.5f) + 1);
 		TRY_UNIT(circuit, unit,
-			unit->CmdMoveTo(haven, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, frame + FRAMES_PER_SEC * 1, CCircuitUnit::OrdSrc::RETREAT);
+			unit->CmdMoveTo(haven, UNIT_COMMAND_OPTION_RIGHT_MOUSE_KEY, timeout, CCircuitUnit::OrdSrc::RETREAT);
 		)
 		// TODO: Add fail counter?
 	} else {
