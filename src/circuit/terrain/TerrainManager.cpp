@@ -6,6 +6,10 @@
  */
 
 #include "terrain/TerrainManager.h"
+#include <unordered_set>
+#include <chrono>
+#include <set>
+#include <tuple>
 #include "terrain/BlockRectangle.h"
 #include "terrain/BlockCircle.h"
 #include "terrain/path/PathFinder.h"
@@ -20,6 +24,7 @@
 #include "setup/SetupManager.h"
 #include "CircuitAI.h"
 #include "util/Utils.h"
+#include "spring/SpringCallback.h"
 #include "util/Profiler.h"
 #include "json/json.h"
 
@@ -32,6 +37,20 @@
 #include "Log.h"
 
 namespace circuit {
+
+// apex: the team's factory exit paths, one entry per bot (CTerrainManager::PublishBus)
+struct SBusShare {
+	int version = 0;
+	int frame = 0;   // apex: when it was last published
+	std::vector<int2> cells;
+	std::unordered_set<long long> set;  // apex: cells as z*100000+x
+};
+static std::map<int, std::map<int, SBusShare>>& TeamBus()
+{
+	static std::map<int, std::map<int, SBusShare>> bus;
+	return bus;
+}
+
 
 using namespace springai;
 using namespace terrain;
@@ -69,6 +88,7 @@ CTerrainManager::CTerrainManager(CCircuitAI* circuit, CTerrainData* terrainData)
 
 CTerrainManager::~CTerrainManager()
 {
+	TeamBus()[circuit->GetAllyTeamId()].erase(circuit->GetTeamId());
 	for (auto& kv : blockInfos) {
 		delete kv.second;
 	}
@@ -374,6 +394,7 @@ void CTerrainManager::AddBlocker(CCircuitDef* cdef, const AIFloat3& pos, int fac
 
 	SStructure building = {-1, cdef, newPos, facing};
 	MarkBlocker(building, true);
+	NoteExitHit(cdef, newPos, facing, isOffset);   // isOffset: a standing unit's mark (BuilderManager, FactoryManager)
 
 #ifdef DEBUG_VIS
 	UpdateVis();
@@ -541,7 +562,7 @@ void CTerrainManager::AddBusPath(CCircuitUnit* unit, const AIFloat3& toPos, CCir
 	fpq.startPos = startPos;
 	fpq.endPos = endPos;
 	fpq.targets = std::move(targets);
-	busPath[unit] = {nullptr, 0};
+	busPath[unit] = {nullptr, 0, startPos, endPos, mobileDef};
 }
 
 void CTerrainManager::DelBusPath(CCircuitUnit* unit)
@@ -579,6 +600,7 @@ void CTerrainManager::DelBusPath(CCircuitUnit* unit)
 	}
 	busPath.erase(it);
 	busQueries.erase(unit);
+	PublishBus();
 }
 
 AIFloat3 CTerrainManager::GetBusPos(CCircuitDef* facDef, const AIFloat3& pos, int& outFacing)
@@ -808,8 +830,380 @@ void CTerrainManager::ApplyAuthority()
 	}
 }
 
+// apex: ONE SET OF FACTORY EXIT PATHS FOR THE TEAM (his 10-30 crowd game: a teammate's AA shut a T2 lab's way out;
+// 27 anti-air, ~100 converters and ~300 nano turrets went up within 320 of a teammate's plant). Each bot keeps its own
+// factories' paths as TERRA blockers; every bot of the same ally team in this process now marks the others' too, so the
+// placement rules that refuse a bot's own exit path refuse a teammate's.
+void CTerrainManager::BusCells(const CPathInfo* pathInfo, int howWide, std::vector<int2>& out)
+{
+	if (pathInfo == nullptr) {
+		return;
+	}
+	CPathFinder* pathfinder = circuit->GetPathfinder();
+	const int granularity = pathfinder->GetSquareSize() / (SQUARE_SIZE * 2);
+	const int squares = howWide * granularity;
+	for (int index : pathInfo->path) {
+		int ix, iz;
+		pathfinder->PathIndex2PathXY(index, &ix, &iz);
+		ix = ix * granularity + granularity / 2;
+		iz = iz * granularity + granularity / 2;
+		int2 m1 = (howWide & 1) ? int2(ix - squares / 2, iz - squares / 2)
+				: int2(ix - (squares - granularity) / 2, iz - (squares - granularity) / 2);
+		int2 m2 = (howWide & 1) ? int2(ix + squares / 2, iz + squares / 2)
+				: int2(ix + (squares + granularity) / 2, iz + (squares + granularity) / 2);
+		blockingMap.Bound(m1, m2);
+		for (int z = m1.y; z < m2.y; ++z) {
+			for (int x = m1.x; x < m2.x; ++x) {
+				out.push_back(int2(x, z));
+			}
+		}
+	}
+}
+
+void CTerrainManager::PublishBus()
+{
+	SBusShare& s = TeamBus()[circuit->GetAllyTeamId()][circuit->GetTeamId()];
+	s.cells.clear();
+	s.set.clear();
+	for (const auto& kv : busPath) {
+		std::vector<int2> one;
+		BusCells(kv.second.pPath.get(), kv.second.howWide, one);
+		NotePathOnStructs(kv.first, one);
+		s.cells.insert(s.cells.end(), one.begin(), one.end());
+	}
+	for (const int2& p : s.cells) {
+		s.set.insert((long long)p.y * 100000LL + p.x);
+	}
+	++s.version;
+	s.frame = circuit->GetLastFrame();
+}
+
+void CTerrainManager::SyncAllyBus()
+{
+	auto it = TeamBus().find(circuit->GetAllyTeamId());
+	const int me = circuit->GetTeamId();
+	// a teammate that left: its cells come off
+	for (auto ai = busApplied.begin(); ai != busApplied.end(); ) {
+		if ((it == TeamBus().end()) || (it->second.find(ai->first) == it->second.end())) {
+			for (const int2& p : ai->second.second) {
+				blockingMap.DelBlocker(p.x, p.y, SBlockingMap::StructType::TERRA);
+			}
+			ai = busApplied.erase(ai);
+		} else {
+			++ai;
+		}
+	}
+	if (it == TeamBus().end()) {
+		return;
+	}
+	for (const auto& kv : it->second) {
+		if (kv.first == me) {
+			continue;
+		}
+		auto& applied = busApplied[kv.first];
+		if (applied.first == kv.second.version) {
+			continue;
+		}
+		for (const int2& p : applied.second) {
+			blockingMap.DelBlocker(p.x, p.y, SBlockingMap::StructType::TERRA);
+		}
+		for (const int2& p : kv.second.cells) {
+			blockingMap.AddBlocker(p.x, p.y, SBlockingMap::StructType::TERRA);
+		}
+		applied.first = kv.second.version;
+		applied.second = kv.second.cells;
+	}
+}
+
+// apex: A BUILDING ON A FACTORY'S EXIT PATH, OURS OR A TEAMMATE'S (his 10-30: "do proper diagnostic logging so you can
+// find these issues without guessing"). Its body cells against every bot's published bus cells; logged once per site.
+void CTerrainManager::NoteExitHit(CCircuitDef* cdef, const AIFloat3& pos, int facing, bool standing)
+{
+	if ((cdef == nullptr) || cdef->IsMobile() || !utils::is_valid(pos)) {
+		return;
+	}
+	auto it = TeamBus().find(circuit->GetAllyTeamId());
+	if (it == TeamBus().end()) {
+		return;
+	}
+	static std::set<std::tuple<int, int, int, int>> seen;
+	const auto key = std::make_tuple(circuit->GetTeamId() * 2 + (standing ? 1 : 0), cdef->GetId(), int(pos.x) / 16,
+			int(pos.z) / 16);
+	if (seen.count(key) > 0) {
+		return;
+	}
+	std::vector<std::pair<int2, char>> cells;
+	int notIgnore = 0, typeMask = 0;
+	MaskCells(cdef, pos, facing, cells, notIgnore, typeMask);
+	for (const auto& kv : it->second) {
+		int n = 0;
+		for (const auto& c : cells) {
+			if ((c.second == 2) && (kv.second.set.count((long long)c.first.y * 100000LL + c.first.x) > 0)) {
+				++n;
+			}
+		}
+		if (n > 0) {
+			seen.insert(key);
+			const bool ignoresTerra = (notIgnore & STRUCT_BIT(TERRA)) == 0;
+			// when=site: the site search chose it with that path in the map (or the def ignores paths); when=standing:
+			// the building was marked as it stood, and pathAge says whether the path is newer than the building
+			circuit->LOG("apex: exitblock t=%i %s at=%.0f,%.0f path-of=t%i cells=%i when=%s pathAge=%i ignoresTerra=%i synced=%i",
+					circuit->GetTeamId(), cdef->GetDef()->GetName(), pos.x, pos.z, kv.first, n, standing ? "standing" : "site",
+					circuit->GetLastFrame() - kv.second.frame, ignoresTerra ? 1 : 0,
+					(kv.first == circuit->GetTeamId()) ? 1
+						: ((busApplied.count(kv.first) > 0) && (busApplied[kv.first].first == kv.second.version) ? 1 : 0));
+		}
+	}
+}
+
+// apex: a freshly published exit path that runs over structures already standing (ours or allies' in our map): the
+// wide path query costs structure sectors high but does not refuse them, so the exit may be shut from the start.
+void CTerrainManager::NotePathOnStructs(CCircuitUnit* fac, const std::vector<int2>& cells)
+{
+	if ((fac == nullptr) || cells.empty()) {
+		return;
+	}
+	static std::set<std::pair<int, int>> said;   // (team, factory id) once per path version is enough
+	int n = 0;
+	for (const int2& p : cells) {
+		if (blockingMap.IsInBounds(p.x, p.y) && blockingMap.IsStruct(p.x, p.y)) {
+			++n;
+		}
+	}
+	const auto key = std::make_pair(circuit->GetTeamId(), int(fac->GetId()) * 1000 + int(cells.size() % 1000));
+	if ((n == 0) || (said.count(key) > 0)) {
+		return;
+	}
+	said.insert(key);
+	circuit->LOG("apex: exitpath-on-structs t=%i %s#%i cells=%i structCells=%i", circuit->GetTeamId(),
+			fac->GetCircuitDef()->GetDef()->GetName(), int(fac->GetId()), int(cells.size()), n);
+}
+
+float CTerrainManager::ExitGap(CCircuitUnit* fac, const AIFloat3& goal, AIFloat3& outDoor, AIFloat3& outStop)
+{
+	auto it = busPath.find(fac);
+	if ((it == busPath.end()) || (it->second.busDef == nullptr) || !utils::is_valid(it->second.busStart)
+		|| !utils::is_valid(goal)) {
+		return -1.f;
+	}
+	outDoor = it->second.busStart;
+	// the flood, not the engine path (see FloodStop); its cost, worst per seat per minute
+	const auto t0 = std::chrono::steady_clock::now();
+	int cells = 0;
+	outStop = FloodStop(const_cast<CCircuitDef*>(it->second.busDef), outDoor, goal, &cells);
+	struct Cost { int at = 0; double us = 0; int n = 0, cells = 0; };
+	static std::map<int, Cost> cost;
+	Cost& cc = cost[circuit->GetTeamId()];
+	cc.us = std::max(cc.us, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+	cc.cells = std::max(cc.cells, cells);
+	++cc.n;
+	if (circuit->GetLastFrame() - cc.at >= FRAMES_PER_SEC * 60) {
+		circuit->LOG("apex: facexit-cost t=%i calls=%i worstFloodUs=%.0f worstCells=%i", circuit->GetTeamId(), cc.n, cc.us,
+				cc.cells);
+		cc = Cost();
+		cc.at = circuit->GetLastFrame();
+	}
+	return outStop.distance2D(goal);
+}
+
+// apex: THE EXIT PATH IS CLEARED, NOT ONLY RESERVED (crowd8: 5 plants penned per game for ~10 minutes, mostly gantries
+// inside nano rings; a factory's path is laid as it rises, and the wide query costs structure sectors high but crosses
+// them, so a packed base's path runs over turrets that then stand on it -- 108 such marks from one seat). What stands on
+// the cells is named here; the script eats ours and asks for an ally's, and the TERRA mark refuses it being rebuilt.
+void CTerrainManager::ExitPathBlockers(std::vector<float>& out)
+{
+	out.clear();
+	auto it = TeamBus().find(circuit->GetAllyTeamId());
+	if (it == TeamBus().end()) {
+		return;
+	}
+	auto mine = it->second.find(circuit->GetTeamId());
+	if ((mine == it->second.end()) || mine->second.set.empty()) {
+		return;
+	}
+	const std::unordered_set<long long>& set = mine->second.set;
+	int x1 = std::numeric_limits<int>::max(), z1 = x1, x2 = -x1, z2 = -x1;
+	for (const int2& p : mine->second.cells) {
+		x1 = std::min(x1, p.x); x2 = std::max(x2, p.x);
+		z1 = std::min(z1, p.y); z2 = std::max(z2, p.y);
+	}
+	const float cell = SQUARE_SIZE * 2;
+	const float bx1 = x1 * cell - 128.f, bx2 = (x2 + 1) * cell + 128.f;
+	const float bz1 = z1 * cell - 128.f, bz2 = (z2 + 1) * cell + 128.f;
+	const int frame = circuit->GetLastFrame();
+	circuit->UpdateFriendlyUnits();
+	std::vector<std::pair<int2, char>> cells;
+	for (const auto& kv : circuit->GetFriendlyUnits()) {
+		CAllyUnit* u = kv.second;
+		if ((u == nullptr) || (u->GetCircuitDef() == nullptr) || (u->GetUnit() == nullptr) || u->GetCircuitDef()->IsMobile()) {
+			continue;
+		}
+		const AIFloat3& p = u->GetPos(frame);
+		if ((p.x < bx1) || (p.x > bx2) || (p.z < bz1) || (p.z > bz2)) {
+			continue;
+		}
+		const int facing = u->GetUnit()->GetBuildingFacing();
+		int notIgnore = 0, typeMask = 0;
+		MaskCells(u->GetCircuitDef(), p + u->GetCircuitDef()->GetMidPosOffset(facing), facing, cells, notIgnore, typeMask);
+		bool hit = false;
+		for (const auto& c : cells) {
+			if ((c.second == 2) && (set.count((long long)c.first.y * 100000LL + c.first.x) > 0)) {
+				hit = true;
+				break;
+			}
+		}
+		if (!hit) {
+			continue;
+		}
+		out.push_back(p.x);
+		out.push_back(p.z);
+		out.push_back(float(u->GetCircuitDef()->GetId()));
+		out.push_back(float(kv.first));
+		out.push_back(float(u->GetUnit()->GetTeam()));
+	}
+}
+
+bool CTerrainManager::OnTeamExitPath(CCircuitDef* cdef, const AIFloat3& pos, int facing)
+{
+	auto it = TeamBus().find(circuit->GetAllyTeamId());
+	if ((cdef == nullptr) || (it == TeamBus().end())) {
+		return false;
+	}
+	std::vector<std::pair<int2, char>> cells;
+	int notIgnore = 0, typeMask = 0;
+	MaskCells(cdef, pos, facing, cells, notIgnore, typeMask);
+	for (const auto& kv : it->second) {
+		for (const auto& c : cells) {
+			if ((c.second == 2) && (kv.second.set.count((long long)c.first.y * 100000LL + c.first.x) > 0)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// apex: NO ENGINE PATH IN PLAY (his 10-30 online game, lane c9: sync errors from frame 6345, after the factory site
+// check ran Pathing::InitPath at frames 1146, 5089 and 6838 -- the call the 2026-08-09 desync was traced to: a QTPFS
+// search on the host alone, in the same registry as the synced paths). A breadth-first flood over the blocking map,
+// which holds our and our allies' structures: a cell is open when no structure body lies under a unit-sized window
+// around it and the mobile def's map area reaches it. The stop is the reached cell nearest the goal.
+AIFloat3 CTerrainManager::FloodStop(CCircuitDef* mobileDef, const AIFloat3& start, const AIFloat3& goal, int* outCells)
+{
+	if (outCells != nullptr) {
+		*outCells = 0;
+	}
+	if ((mobileDef == nullptr) || !utils::is_valid(start) || !utils::is_valid(goal)) {
+		return start;
+	}
+	terrain::SArea* area;
+	bool isOK;
+	std::tie(area, isOK) = GetCurrentMapArea(mobileDef, start);
+	if (!isOK) {
+		return start;
+	}
+	const float cs = SQUARE_SIZE * 2;   // one blocking-map cell
+	const int cols = blockingMap.columns, rows = blockingMap.rows;
+	const int sx = int(start.x / cs), sz = int(start.z / cs);
+	const int gx = int(goal.x / cs), gz = int(goal.z / cs);
+	if ((sx < 0) || (sz < 0) || (sx >= cols) || (sz >= rows)) {
+		return start;
+	}
+	// a window as wide as the unit's footprint, in cells
+	const int foot = std::max(mobileDef->GetDef()->GetXSize(), mobileDef->GetDef()->GetZSize());
+	const int half = std::max(0, (foot / 2) / 2);
+	const int span = std::max(std::abs(gx - sx), std::abs(gz - sz)) + 2;
+	const int x1 = std::max(0, sx - span), x2 = std::min(cols - 1, sx + span);
+	const int z1 = std::max(0, sz - span), z2 = std::min(rows - 1, sz + span);
+	const int w = x2 - x1 + 1, hgt = z2 - z1 + 1;
+	std::vector<char> seen(size_t(w) * size_t(hgt), 0);
+	auto open = [&](int x, int z) {
+		for (int dz = -half; dz <= half; ++dz) {
+			for (int dx = -half; dx <= half; ++dx) {
+				const int xx = x + dx, zz = z + dz;
+				if ((xx < 0) || (zz < 0) || (xx >= cols) || (zz >= rows)) {
+					return false;
+				}
+				if (blockingMap.IsStruct(xx, zz)) {
+					return false;
+				}
+			}
+		}
+		return CanMoveToPos(area, AIFloat3(x * cs + cs * 0.5f, 0.f, z * cs + cs * 0.5f));
+	};
+	std::vector<int> queue;
+	queue.reserve(4096);
+	queue.push_back((sz - z1) * w + (sx - x1));
+	seen[(sz - z1) * w + (sx - x1)] = 1;
+	int best = queue[0];
+	long long bestD = (long long)(sx - gx) * (sx - gx) + (long long)(sz - gz) * (sz - gz);
+	size_t head = 0;
+	static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+	while (head < queue.size()) {
+		const int cur = queue[head++];
+		const int cx = cur % w + x1, cz = cur / w + z1;
+		const long long d = (long long)(cx - gx) * (cx - gx) + (long long)(cz - gz) * (cz - gz);
+		if (d < bestD) {
+			bestD = d;
+			best = cur;
+			if (d <= 2) {
+				break;
+			}
+		}
+		for (const auto& dd : dirs) {
+			const int nx = cx + dd[0], nz = cz + dd[1];
+			if ((nx < x1) || (nx > x2) || (nz < z1) || (nz > z2)) {
+				continue;
+			}
+			const int k = (nz - z1) * w + (nx - x1);
+			if (seen[k]) {
+				continue;
+			}
+			seen[k] = 1;
+			if (open(nx, nz)) {
+				queue.push_back(k);
+			}
+		}
+	}
+	if (outCells != nullptr) {
+		*outCells = int(queue.size());
+	}
+	return AIFloat3((best % w + x1) * cs + cs * 0.5f, start.y, (best / w + z1) * cs + cs * 0.5f);
+}
+
+// apex: A FACTORY IS NOT PLACED FACING A DEAD END (crowd8: 5 plants per game penned ~10 minutes, gantries placed into
+// nano blocks by design). The engine path, which sees every building already standing, from the door the new plant
+// would have toward the front: refused when it stops nearer the door than the front.
+bool CTerrainManager::DoorEscapes(CCircuitDef* facDef, CCircuitDef* mobileDef, const AIFloat3& pos, int facing,
+		const AIFloat3& goal)
+{
+	if ((facDef == nullptr) || (mobileDef == nullptr) || !utils::is_valid(goal)) {
+		return true;
+	}
+	const bool turned = (facing == UNIT_FACING_EAST) || (facing == UNIT_FACING_WEST);
+	const float depth = (turned ? facDef->GetDef()->GetXSize() : facDef->GetDef()->GetZSize()) * SQUARE_SIZE * 0.5f
+			+ SQUARE_SIZE * 6;
+	AIFloat3 door = pos;
+	switch (facing) {
+		default:
+		case UNIT_FACING_SOUTH: door.z += depth; break;
+		case UNIT_FACING_EAST:  door.x += depth; break;
+		case UNIT_FACING_NORTH: door.z -= depth; break;
+		case UNIT_FACING_WEST:  door.x -= depth; break;
+	}
+	CorrectPosition(door);
+	// toward the goal, no further than leaving home takes (as FacExitWatch)
+	AIFloat3 g = goal;
+	const float dg = door.distance2D(g);
+	if (dg > 2000.f) {
+		g = door + (g - door) * (2000.f / dg);
+	}
+	const AIFloat3 stop = FloodStop(mobileDef, door, g);
+	return stop.distance2D(door) >= stop.distance2D(g);
+}
+
 void CTerrainManager::MarkAllyBuildings()
 {
+	SyncAllyBus();
 	if (markFrame /*+ FRAMES_PER_SEC*/ >= circuit->GetLastFrame()) {
 		return;
 	}
@@ -1472,6 +1866,146 @@ std::vector<CCircuitUnit*> CTerrainManager::BlockersOf(CCircuitDef* cdef, const 
 	return out;
 }
 
+// apex: the ground alone could take cdef at pos: every square dry enough (or wet enough) for it and within
+// maxHeightDif of the lowest (rich12: 15 cleared plots with a shore under them, 4 too steep, against a 5x5 sample)
+bool CTerrainManager::GroundTakes(CCircuitDef* cdef, const AIFloat3& pos)
+{
+	if ((cdef == nullptr) || !utils::is_valid(pos)) {
+		return false;
+	}
+	UnitDef* ud = cdef->GetDef();
+	const float hx = ud->GetXSize() * SQUARE_SIZE * 0.5f, hz = ud->GetZSize() * SQUARE_SIZE * 0.5f;
+	const bool wet = cdef->IsFloater() || (ud->GetMinWaterDepth() > 0.f);
+	const float maxDepth = ud->GetMaxWaterDepth();
+	float lo = std::numeric_limits<float>::max(), hi = -lo;
+	for (float x = pos.x - hx; x <= pos.x + hx; x += SQUARE_SIZE) {
+		for (float z = pos.z - hz; z <= pos.z + hz; z += SQUARE_SIZE) {
+			if ((x < 0.f) || (z < 0.f) || (x >= GetTerrainWidth()) || (z >= GetTerrainHeight())) {
+				return false;
+			}
+			const float e = circuit->GetMap()->GetElevationAt(x, z);
+			if (wet ? (e >= -ud->GetMinWaterDepth()) : (e < -maxDepth)) {
+				return false;
+			}
+			lo = std::min(lo, e);
+			hi = std::max(hi, e);
+		}
+	}
+	return wet || (hi - lo <= ud->GetMaxHeightDif());
+}
+
+// apex: cdef's body at pos lands on ground the map itself reserves -- a factory's exit path (TERRA), a metal or geo
+// spot -- which no reclaim frees (rich17-19: 13 cleared plots refused by b=0x2000 and b=0x2). The blocker bits only:
+// IsBlocked also reads any standing structure (rich20: every candidate refused, 6 plots against 54).
+bool CTerrainManager::Reserved(CCircuitDef* cdef, const AIFloat3& pos, int facing)
+{
+	if ((cdef == nullptr) || !utils::is_valid(pos)) {
+		return true;
+	}
+	std::vector<std::pair<int2, char>> cells;
+	int notIgnore = 0, typeMask = 0;
+	MaskCells(cdef, pos, facing, cells, notIgnore, typeMask);
+	const SBlockingMap::SM fixed = notIgnore & (STRUCT_BIT(TERRA) | STRUCT_BIT(MEX) | STRUCT_BIT(GEO));
+	for (const auto& c : cells) {
+		if ((c.second == 2) && blockingMap.IsInBounds(c.first.x, c.first.y)
+			&& (blockingMap.grid[c.first.y * blockingMap.columns + c.first.x].blockerMask & fixed))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// apex: the placement tests FindBuildSite runs, one by one, at exactly this cell (rich8: 26 of 29 cleared plots with
+// no structure of ours blocking still refused). "map:" carries the struct and blocker masks of the refusing cells.
+std::string CTerrainManager::PlaceWhy(CCircuitDef* cdef, const AIFloat3& pos, int facing)
+{
+	if ((cdef == nullptr) || !utils::is_valid(pos)) {
+		return "invalid";
+	}
+	if (!circuit->GetMap()->IsPossibleToBuildAt(cdef->GetDef(), pos, facing)) {
+		// the engine's own test: features on the footprint, and the height spread under it against maxHeightDif
+		UnitDef* ud = cdef->GetDef();
+		const float hx = ud->GetXSize() * SQUARE_SIZE * 0.5f, hz = ud->GetZSize() * SQUARE_SIZE * 0.5f;
+		auto features = circuit->GetCallback()->GetFeaturesIn(pos, std::max(hx, hz));
+		const int nf = (int)features.size();
+		utils::free(features);
+		float lo = std::numeric_limits<float>::max(), hi = -lo;
+		for (float x = pos.x - hx; x <= pos.x + hx; x += SQUARE_SIZE) {
+			for (float z = pos.z - hz; z <= pos.z + hz; z += SQUARE_SIZE) {
+				const float e = circuit->GetMap()->GetElevationAt(x, z);
+				lo = std::min(lo, e);
+				hi = std::max(hi, e);
+			}
+		}
+		// what stands ON the footprint, by name: b = being built, m = mobile, a = an ally's (rich21: a move-off for our
+		// mobiles moved nothing in 43 waits, so the "units" there were not ours, or not mobile)
+		circuit->UpdateFriendlyUnits();
+		auto friends = circuit->GetCallback()->GetFriendlyUnitsIn(pos, std::max(hx, hz) * 1.5f);
+		const int nu = (int)friends.size();
+		std::string on;
+		for (springai::Unit* u : friends) {
+			if ((u == nullptr) || (on.size() > 90)) {
+				continue;
+			}
+			auto [au, isTeam] = circuit->GetTeamOrAllyUnit(u);
+			const AIFloat3 up = u->GetPos();
+			CCircuitDef* udef = (au != nullptr) ? au->GetCircuitDef() : nullptr;
+			const float ux = (udef != nullptr) ? udef->GetDef()->GetXSize() * SQUARE_SIZE * 0.5f : 8.f;
+			const float uz = (udef != nullptr) ? udef->GetDef()->GetZSize() * SQUARE_SIZE * 0.5f : 8.f;
+			if ((std::fabs(up.x - pos.x) >= hx + ux) || (std::fabs(up.z - pos.z) >= hz + uz)) {
+				continue;
+			}
+			on += " ";
+			on += (udef != nullptr) ? udef->GetDef()->GetName() : "?";
+			on += "[";
+			if (u->IsBeingBuilt()) on += "b";
+			if ((udef != nullptr) && udef->IsMobile()) on += "m";
+			if (!isTeam) on += "a";
+			on += "]";
+		}
+		utils::free(friends);
+		char buf[256];
+		snprintf(buf, sizeof(buf), "engine:feat=%d,rise=%.0f,mhd=%.0f,low=%.0f,units=%d,on=%s", nf, hi - lo, ud->GetMaxHeightDif(), lo, nu, on.c_str());
+		return std::string(buf);
+	}
+	if (circuit->GetThreatMap()->GetBuilderThreatAt(pos) > THREAT_MIN) {
+		return "threat";
+	}
+	if (!CanBeBuiltAt(cdef, pos)) {
+		return "area";
+	}
+	if (ZoneRefuses(cdef, pos, facing)) {
+		return "zone";
+	}
+	std::vector<std::pair<int2, char>> cells;
+	int notIgnore = 0, typeMask = 0;
+	MaskCells(cdef, pos, facing, cells, notIgnore, typeMask);
+	int structs = 0, blockers = 0, n = 0, out = 0;
+	for (const auto& c : cells) {
+		const int x = c.first.x, z = c.first.y;
+		if (!blockingMap.IsInBounds(x, z)) {
+			++out;
+			continue;
+		}
+		const SBlockingMap::SBlockCell& cell = blockingMap.grid[z * blockingMap.columns + x];
+		if ((c.second == 1) && blockingMap.IsStructed(x, z, static_cast<SBlockingMap::StructMask>(typeMask))) {
+			structs |= static_cast<int>(cell.structMask);
+			++n;
+		} else if ((c.second == 2) && blockingMap.IsBlocked(x, z, static_cast<SBlockingMap::SM>(notIgnore))) {
+			structs |= static_cast<int>(cell.structMask);
+			blockers |= (cell.blockerMask & notIgnore);
+			++n;
+		}
+	}
+	if ((n == 0) && (out == 0)) {
+		return "ok";
+	}
+	char buf[96];
+	snprintf(buf, sizeof(buf), "map:s=0x%x,b=0x%x,cells=%d,out=%d", structs, blockers, n, out);
+	return std::string(buf);
+}
+
 void CTerrainManager::MarkBlocker(const SStructure& building, bool block)
 {
 	CCircuitDef* cdef = building.cdef;
@@ -1616,6 +2150,7 @@ void CTerrainManager::MarkBusPath()
 			it->second.pPath = q->GetPathInfo();
 			it->second.howWide = q->GetHowWide();
 			busQueries.erase(query->GetUnit());
+			PublishBus();
 		});
 
 		/*

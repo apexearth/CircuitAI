@@ -72,6 +72,10 @@ public:
 	void AddBlocker(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing, bool isOffset = false);
 	void DelBlocker(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing, bool isOffset = false);
 	// apex: which of `near` refuse cdef at pos/facing, by the cell tests FindBuildSiteByMask makes
+	// apex: which test refuses cdef at exactly pos/facing: "engine", "threat", "area", "zone", "map:<struct mask>", or "ok"
+	std::string PlaceWhy(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing);
+	bool GroundTakes(CCircuitDef* cdef, const springai::AIFloat3& pos);
+	bool Reserved(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing);
 	std::vector<CCircuitUnit*> BlockersOf(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing,
 			const std::vector<CCircuitUnit*>& nearby, int frame);
 	bool IsObstruct(const springai::AIFloat3& pos) const;
@@ -175,9 +179,36 @@ private:
 	struct WidePathInfo {
 		std::shared_ptr<CPathInfo> pPath;
 		int howWide;
+		springai::AIFloat3 busStart = -RgtVector;  // apex: the door point and the bus end it was asked for
+		springai::AIFloat3 busEnd = -RgtVector;
+		const CCircuitDef* busDef = nullptr;
 	};
 	std::map<CCircuitUnit*, WidePathInfo> busPath;
 	std::map<CCircuitUnit*, FactoryPathQuery> busQueries;
+	// apex: our teammates' (other bots in this process) factory exit paths, as TERRA in our map: team id ->
+	// (their version, the cells we marked)
+	std::map<int, std::pair<int, std::vector<int2>>> busApplied;
+	void BusCells(const CPathInfo* pathInfo, int howWide, std::vector<int2>& out);
+	void PublishBus();
+	void SyncAllyBus();
+	void NoteExitHit(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing, bool standing);
+	void NotePathOnStructs(CCircuitUnit* fac, const std::vector<int2>& cells);
+public:
+	// apex: by the engine's own pathing, how far short of `goal` a unit leaving fac's door stops; -1 unknown
+	float ExitGap(CCircuitUnit* fac, const springai::AIFloat3& goal, springai::AIFloat3& outDoor, springai::AIFloat3& outStop);
+	// apex: every friendly structure (ours or an ally's) whose body stands on this bot's own factory exit cells, as
+	// (x, z, def, id, team) quintuples
+	void ExitPathBlockers(std::vector<float>& out);
+	// apex: cdef's body at pos on any exit path of this ally team's bots, ours included
+	bool OnTeamExitPath(CCircuitDef* cdef, const springai::AIFloat3& pos, int facing);
+	// apex: from the door a factory facDef would have at pos, a unit it makes gets nearer `goal` than the door
+	bool DoorEscapes(CCircuitDef* facDef, CCircuitDef* mobileDef, const springai::AIFloat3& pos, int facing,
+			const springai::AIFloat3& goal);
+	// apex: from start, how near goal a unit of mobileDef can get over ground no structure body stands on, by a flood
+	// of the blocking map (host-local memory only: the engine path this replaced ran on the host alone and desynced)
+	springai::AIFloat3 FloodStop(CCircuitDef* mobileDef, const springai::AIFloat3& start, const springai::AIFloat3& goal,
+			int* outCells = nullptr);
+private:
 	void MarkBusPath();
 	void FillParentBusNodes(CPathInfo* pathInfo);
 

@@ -6,6 +6,7 @@
  */
 
 #include "script/InitScript.h"
+#include "task/static/ReclaimTask.h"
 #include "script/SetupScript.h"
 #include "script/ScriptManager.h"
 #include "script/RefCounter.h"
@@ -1634,6 +1635,99 @@ static int CCircuitAI_TurretsReclaim(CCircuitAI* circuit, CCircuitUnit* target, 
 	return sent;
 }
 
+// apex: every free turret of ours in reach of a teammate's building eats it (CSReclaimAllyTask), split `share` ways
+// as TurretsReclaim is; returns how many were sent
+static int CCircuitAI_TurretsReclaimAlly(CCircuitAI* circuit, int allyId, int frames, int share)
+{
+	circuit->UpdateFriendlyUnits();
+	CAllyUnit* target = circuit->GetFriendlyUnit(allyId);
+	if ((target == nullptr) || (target->GetUnit() == nullptr) || (circuit->GetTeamUnit(allyId) != nullptr)) {
+		static std::map<int, int> nNo;
+		if (nNo[circuit->GetTeamId()]++ < 5) {
+			circuit->LOG("apex: allyeat-none t=%i id=%i why=%s", circuit->GetTeamId(), allyId,
+					(target == nullptr) ? "no-friendly" : ((target->GetUnit() == nullptr) ? "no-unit" : "ours"));
+		}
+		return 0;
+	}
+	const int frame = circuit->GetLastFrame();
+	circuit->GetBuilderManager()->MarkReclaim(allyId, frame + frames);
+	CFactoryManager* factoryMgr = circuit->GetFactoryManager();
+	const AIFloat3& tp = target->GetPos(frame);
+	const float tr = target->GetCircuitDef()->GetDef()->GetRadius();
+	std::vector<CCircuitUnit*> hands;
+	for (auto& kv : circuit->GetTeamUnits()) {
+		CCircuitUnit* u = kv.second;
+		if ((u == nullptr) || u->IsDead()) {
+			continue;
+		}
+		CCircuitDef* d = u->GetCircuitDef();
+		if (d->IsMobile() || !d->IsAbleToReclaim() || d->IsBuilder() || (d->GetBuildDistance() <= 0.f)) {
+			continue;
+		}
+		IUnitTask* cur = u->GetTask();
+		if ((cur == nullptr) || (cur->GetManager() != factoryMgr)) {
+			continue;
+		}
+		if (dynamic_cast<CSReclaimAllyTask*>(cur) != nullptr) {
+			continue;   // already eating a teammate's building
+		}
+		if ((cur->GetType() == IUnitTask::Type::FACTORY)
+			&& (static_cast<IBuilderTask*>(cur)->GetBuildType() == IBuilderTask::BuildType::RECLAIM))
+		{
+			CCircuitUnit* eating = static_cast<IBuilderTask*>(cur)->GetTarget();
+			if ((eating != nullptr) && (circuit->GetTeamUnit(eating->GetId()) == eating)) {
+				continue;
+			}
+		}
+		if (u->GetPos(frame).distance2D(tp) > d->GetBuildDistance() + tr) {
+			continue;
+		}
+		hands.push_back(u);
+	}
+	if (hands.empty()) {
+		// why no hand: the nearest of our turrets, its reach, and what it was doing (crowd12: 1 eat against 42 asks)
+		static std::map<int, int> nEmpty;
+		if (nEmpty[circuit->GetTeamId()]++ < 8) {
+			float best = 1e9f, reach = 0.f;
+			int tasked = -1;
+			for (auto& kv : circuit->GetTeamUnits()) {
+				CCircuitUnit* u = kv.second;
+				if ((u == nullptr) || u->IsDead() || u->GetCircuitDef()->IsMobile() || u->GetCircuitDef()->IsBuilder()
+					|| !u->GetCircuitDef()->IsAbleToReclaim() || (u->GetCircuitDef()->GetBuildDistance() <= 0.f)) {
+					continue;
+				}
+				const float dd = u->GetPos(frame).distance2D(tp);
+				if (dd < best) {
+					best = dd;
+					reach = u->GetCircuitDef()->GetBuildDistance() + tr;
+					IUnitTask* cur = u->GetTask();
+					tasked = (cur == nullptr) ? 0 : ((cur->GetManager() != factoryMgr) ? 1 : 2);
+				}
+			}
+			circuit->LOG("apex: allyeat-none t=%i id=%i %s why=no-hand nearestTurret=%.0f reach=%.0f task=%i",
+					circuit->GetTeamId(), allyId, target->GetCircuitDef()->GetDef()->GetName(), best, reach, tasked);
+		}
+		return 0;
+	}
+	std::sort(hands.begin(), hands.end(), [frame, &tp](CCircuitUnit* a, CCircuitUnit* b) {
+		return a->GetPos(frame).SqDistance2D(tp) < b->GetPos(frame).SqDistance2D(tp);
+	});
+	const size_t take = (hands.size() + size_t(std::max(1, share)) - 1) / size_t(std::max(1, share));
+	if (hands.size() > take) {
+		hands.resize(take);
+	}
+	IUnitTask* task = nullptr;
+	int sent = 0;
+	for (CCircuitUnit* u : hands) {
+		if (task == nullptr) {
+			task = factoryMgr->Enqueue(TaskS::ReclaimAlly(IBuilderTask::Priority::HIGH, allyId, tp, frames));
+		}
+		factoryMgr->AssignTask(u, task);
+		++sent;
+	}
+	return sent;
+}
+
 // apex: our structures that refuse `def` at the cell CanPlaceCell would test there (TerrainManager::BlockersOf): what a
 // plot must clear for the building to fit, by the blocking map's own rules (his 10-29 mass reclaim).
 static CScriptArray* CCircuitAI_PlotBlockers(CCircuitAI* circuit, CCircuitDef* def, const AIFloat3& pos, float radius)
@@ -1655,6 +1749,113 @@ static CScriptArray* CCircuitAI_PlotBlockers(CCircuitAI* circuit, CCircuitDef* d
 		arr->SetValue(i++, &unit);
 	}
 	return arr;
+}
+
+// apex: which placement test refuses `def` at the cell CanPlaceCell would test (TerrainManager::PlaceWhy)
+// apex: the ground alone could take `def` at the cell CanPlaceCell would test (TerrainManager::GroundTakes)
+static bool CCircuitAI_GroundTakes(CCircuitAI* circuit, CCircuitDef* def, const AIFloat3& pos)
+{
+	if ((def == nullptr) || !utils::is_valid(pos)) {
+		return false;
+	}
+	const int facing = circuit->GetBaseGridFacing(pos);
+	AIFloat3 cell;
+	return circuit->SnapToBaseGrid(pos, cell, def, facing) && circuit->GetTerrainManager()->GroundTakes(def, cell);
+}
+
+// apex: ground no reclaim frees under `def` at the cell CanPlaceCell would test (TerrainManager::Reserved)
+static bool CCircuitAI_PlotReserved(CCircuitAI* circuit, CCircuitDef* def, const AIFloat3& pos)
+{
+	if ((def == nullptr) || !utils::is_valid(pos)) {
+		return true;
+	}
+	const int facing = circuit->GetBaseGridFacing(pos);
+	AIFloat3 cell;
+	return !circuit->SnapToBaseGrid(pos, cell, def, facing) || circuit->GetTerrainManager()->Reserved(def, cell, facing);
+}
+
+// apex: our own ground units standing on `def`'s footprint at the cell CanPlaceCell would test step off it (rich13-19:
+// cleared plots refused by the engine with 1-9 units on the ground, the reclaimers among them). Returns how many moved.
+static int CCircuitAI_PlotShoo(CCircuitAI* circuit, CCircuitDef* def, const AIFloat3& pos)
+{
+	if ((def == nullptr) || !utils::is_valid(pos)) {
+		return 0;
+	}
+	const int facing = circuit->GetBaseGridFacing(pos);
+	AIFloat3 cell;
+	if (!circuit->SnapToBaseGrid(pos, cell, def, facing)) {
+		return 0;
+	}
+	UnitDef* ud = def->GetDef();
+	const float hx = ud->GetXSize() * SQUARE_SIZE * 0.5f, hz = ud->GetZSize() * SQUARE_SIZE * 0.5f;
+	const float r = std::max(hx, hz);
+	const int frame = circuit->GetLastFrame();
+	auto units = circuit->GetCallback()->GetFriendlyUnitsIn(cell, r + 32.f);
+	int n = 0;
+	for (springai::Unit* u : units) {
+		CCircuitUnit* cu = (u != nullptr) ? circuit->GetTeamUnit(u->GetUnitId()) : nullptr;
+		if ((cu == nullptr) || cu->IsDead() || !cu->GetCircuitDef()->IsMobile() || cu->GetCircuitDef()->IsAbleToFly()) {
+			continue;
+		}
+		const AIFloat3 p = cu->GetPos(frame);
+		if ((std::fabs(p.x - cell.x) > hx + 24.f) || (std::fabs(p.z - cell.z) > hz + 24.f)) {
+			continue;
+		}
+		AIFloat3 d = p - cell;
+		d.y = 0.f;
+		const float len = d.Length2D();
+		d = (len > 1.f) ? (d / len) : AIFloat3(1.f, 0.f, 0.f);
+		AIFloat3 to = cell + d * (std::sqrt(hx * hx + hz * hz) + 64.f);
+		CTerrainManager::CorrectPosition(to);
+		try {
+			cu->CmdMoveTo(to, 0, frame + FRAMES_PER_SEC * 10, CCircuitUnit::OrdSrc::SCRIPT);
+			++n;
+		} catch (const std::exception&) {
+		}
+	}
+	utils::free(units);
+	return n;
+}
+
+// apex: a factory's way out by the engine's pathing: the gap between where a unit leaving its door can get and
+// `goal` (TerrainManager::ExitGap); -1 when the factory has no bus path yet
+static float CCircuitAI_FacExitGap(CCircuitAI* circuit, CCircuitUnit* fac, const AIFloat3& goal, AIFloat3& door, AIFloat3& stop)
+{
+	if ((fac == nullptr) || fac->IsDead()) {
+		return -1.f;
+	}
+	return circuit->GetTerrainManager()->ExitGap(fac, goal, door, stop);
+}
+
+static asITypeInfo* FloatArrayType();
+
+// apex: friendly structures standing on this bot's own factory exit cells (TerrainManager::ExitPathBlockers)
+static CScriptArray* CCircuitAI_ExitPathBlockers(CCircuitAI* circuit)
+{
+	std::vector<float> out;
+	circuit->GetTerrainManager()->ExitPathBlockers(out);
+	asITypeInfo* at = FloatArrayType();
+	if (at == nullptr) {
+		return nullptr;
+	}
+	CScriptArray* arr = CScriptArray::Create(at, out.size());
+	for (asUINT i = 0; i < out.size(); ++i) {
+		arr->SetValue(i, &out[i]);
+	}
+	return arr;
+}
+
+static const std::string CCircuitAI_PlaceWhy(CCircuitAI* circuit, CCircuitDef* def, const AIFloat3& pos)
+{
+	if ((def == nullptr) || !utils::is_valid(pos)) {
+		return "invalid";
+	}
+	const int facing = circuit->GetBaseGridFacing(pos);
+	AIFloat3 cell;
+	if (!circuit->SnapToBaseGrid(pos, cell, def, facing)) {
+		return "snap";
+	}
+	return circuit->GetTerrainManager()->PlaceWhy(def, cell, facing);
 }
 
 static CScriptArray* CCircuitAI_GetOwnStructsNear(CCircuitAI* circuit, const AIFloat3& pos, float radius)
@@ -2323,6 +2524,12 @@ static float CCircuitDef_GetMinWaterDepth(CCircuitDef* cdef)
 	return cdef->GetDef()->GetMinWaterDepth();
 }
 
+// apex: how far the ground under a footprint may rise from its build height (the engine's flatness test)
+static float CCircuitDef_GetMaxHeightDif(CCircuitDef* cdef)
+{
+	return cdef->GetDef()->GetMaxHeightDif();
+}
+
 // apex: the builder-only members (buildDef, target, GetBuildType, GetBuildPos)
 // were registered on the base IUnitTask type as raw IBuilderTask field
 // offsets and THISCALLs -- so a script read on a FIGHTER, WAIT or IDLE task
@@ -2760,8 +2967,15 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<CCircuitUnit@>@ GetOwnUnitsOfDef(CCircuitDef@, const AIFloat3& in, float)", asFUNCTION(CCircuitAI_GetOwnUnitsOfDef), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<CCircuitUnit@>@ GetOwnStructsNear(const AIFloat3& in, float)", asFUNCTION(CCircuitAI_GetOwnStructsNear), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<CCircuitUnit@>@ PlotBlockers(CCircuitDef@, const AIFloat3& in, float)", asFUNCTION(CCircuitAI_PlotBlockers), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "const string PlaceWhy(CCircuitDef@, const AIFloat3& in)", asFUNCTION(CCircuitAI_PlaceWhy), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "bool GroundTakes(CCircuitDef@, const AIFloat3& in)", asFUNCTION(CCircuitAI_GroundTakes), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "bool PlotReserved(CCircuitDef@, const AIFloat3& in)", asFUNCTION(CCircuitAI_PlotReserved), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "int PlotShoo(CCircuitDef@, const AIFloat3& in)", asFUNCTION(CCircuitAI_PlotShoo), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ ExitPathBlockers()", asFUNCTION(CCircuitAI_ExitPathBlockers), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float FacExitGap(CCircuitUnit@, const AIFloat3& in, AIFloat3& out, AIFloat3& out)", asFUNCTION(CCircuitAI_FacExitGap), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "void MarkReclaim(CCircuitUnit@, int)", asFUNCTION(CCircuitAI_MarkReclaim), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "int TurretsReclaim(CCircuitUnit@, int, int)", asFUNCTION(CCircuitAI_TurretsReclaim), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "int TurretsReclaimAlly(int, int, int)", asFUNCTION(CCircuitAI_TurretsReclaimAlly), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyDefences()", asFUNCTION(CCircuitAI_GetAllyDefences), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyStatics()", asFUNCTION(CCircuitAI_GetAllyStatics), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "array<float>@ GetAllyPlants()", asFUNCTION(CCircuitAI_GetAllyPlants), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
@@ -2877,6 +3091,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetHealth() const", asMETHOD(CCircuitDef, GetHealth), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetAutoHealPerSec() const", asFUNCTION(CCircuitDef_GetAutoHealPerSec), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetMinWaterDepth() const", asFUNCTION(CCircuitDef_GetMinWaterDepth), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetMaxHeightDif() const", asFUNCTION(CCircuitDef_GetMaxHeightDif), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetAoe() const", asMETHOD(CCircuitDef, GetAoe), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsAlwaysHitDef() const", asMETHOD(CCircuitDef, IsAlwaysHit), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsDumbFireDef() const", asMETHOD(CCircuitDef, IsDumbFire), asCALL_THISCALL); ASSERT(r >= 0);
