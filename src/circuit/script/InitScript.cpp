@@ -2266,6 +2266,12 @@ static float CCircuitAI_GetSpeedFactor(CCircuitAI* circuit)
 	return circuit->GetGame()->GetSpeedFactor();
 }
 
+// apex: how late our orders land, seconds, smoothed (CMoveAction's probe); 0 until measured
+static float CCircuitAI_GetOrderLagSec(CCircuitAI* circuit)
+{
+	return circuit->GetOrderLagSec();
+}
+
 // apex: monotonic microsecond clock so the script can profile its own sections.
 // Host-local wall time — the AI runs only on the host, so reading it cannot
 // desync; still, use it for logging only, never for a gameplay decision.
@@ -2909,6 +2915,7 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitAI", "int LoadOptionFloats(const string &in)", asFUNCTION(CCircuitAI_LoadOptionFloats), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float OptionFloat(int) const", asFUNCTION(CCircuitAI_OptionFloat), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float GetSpeedFactor() const", asFUNCTION(CCircuitAI_GetSpeedFactor), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitAI", "float GetOrderLagSec() const", asFUNCTION(CCircuitAI_GetOrderLagSec), asCALL_CDECL_OBJFIRST); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float RecordRatio(const CCircuitDef@, int) const", asMETHOD(CCircuitAI, RecordRatio), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float YieldDealt(const CCircuitDef@, bool) const", asMETHOD(CCircuitAI, YieldDealt), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitAI", "float YieldSpent(const CCircuitDef@, bool) const", asMETHOD(CCircuitAI, YieldSpent), asCALL_THISCALL); ASSERT(r >= 0);
@@ -3106,6 +3113,9 @@ CInitScript::CInitScript(CScriptManager* scr, CCircuitAI* ai)
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastRadius() const", asMETHOD(CCircuitDef, GetBlastRadius), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastDamage() const", asMETHOD(CCircuitDef, GetBlastDamage), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "float GetBlastEdge() const", asMETHOD(CCircuitDef, GetBlastEdge), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetSelfDRadius() const", asMETHOD(CCircuitDef, GetSelfDRadius), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetSelfDDamage() const", asMETHOD(CCircuitDef, GetSelfDDamage), asCALL_THISCALL); ASSERT(r >= 0);
+	r = engine->RegisterObjectMethod("CCircuitDef", "float GetSelfDEdge() const", asMETHOD(CCircuitDef, GetSelfDEdge), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "void SetLatticeStride(float, float)", asMETHOD(CCircuitDef, SetLatticeStride), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsRadarDef() const", asMETHOD(CCircuitDef, IsRadar), asCALL_THISCALL); ASSERT(r >= 0);
 	r = engine->RegisterObjectMethod("CCircuitDef", "bool IsJammerDef() const", asMETHOD(CCircuitDef, IsJammer), asCALL_THISCALL); ASSERT(r >= 0);
