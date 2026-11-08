@@ -17,6 +17,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 
 namespace circuit {
 
@@ -180,6 +181,17 @@ public:
 	bool GetGuardAnchor(const springai::AIFloat3& from, const std::vector<float>& assigned,
 			springai::AIFloat3& outPos, int& outSpot) const;
 	void FillFrontPos(CCircuitUnit* unit, F3Vec& outPositions);
+	// apex_shell_answer: whoever is shooting our structures is the defenders' business (his 11-07)
+	void NoteStructFire(CCircuitUnit* unit, CEnemyInfo* attacker, int weaponId, const springai::AIFloat3& dir);
+	bool IsSheller(int enemyId) const;
+	bool ShellPointNear(const springai::AIFloat3& from, springai::AIFloat3& outPos) const;
+	bool ShellAnswerOn();
+	void NoteShellAnswer(bool seen) { ++(seen ? shellHitSeen : shellHitBlind); }
+	// the live shell points for the script's air look (looks.as LOOK_SHELL): position and the dearest structure hit from it
+	int GetShellPointCount() const { return (int)shellPoints.size(); }
+	springai::AIFloat3 GetShellPointAt(int i) const;
+	float GetShellPointStake(int i) const;
+	bool GetShellPointSeen(int i) const { return (i >= 0) && (i < (int)shellPoints.size()) && shellPoints[i].seen; }
 	void FillDefencePos(CCircuitUnit* unit, F3Vec& outPositions);
 	springai::AIFloat3 GetDefenceStand();
 	void FillAttackSafePos(CCircuitUnit* unit, F3Vec& outPositions);
@@ -261,16 +273,12 @@ public:
 	// here for the heads' features: ground attack squads, the main army's power, their spread.
 	static constexpr int BOARD_SPLIT = 1800, BOARD_COMMIT = 1900, BOARD_STAGE = 2500, BOARD_RETREAT = 2600;
 	static constexpr int BOARD_ARMY_N = 2700, BOARD_ARMY_MAIN = 2800, BOARD_ARMY_SPREAD = 2900, BOARD_ARMY_SW = 3000;
-	static constexpr int BOARD_ONE_ARMY = 3100;  // script TUNE_ONE_ARMY: squads follow and stage with the main army
-	bool IsOneArmy() const { return oneArmy; }
 	float GetSplitMul() const { return splitMul; }
 	float GetCommitMul() const { return commitMul; }
 	float GetStageMul() const { return stageMul; }
 	float GetRetreatMul() const { return retreatMul; }
 	// the strongest ground attack squad: every other one walks to it and fights its target
 	CAttackTask* GetMainArmy();
-	// how far the main army pulls a squad: split x the map's diagonal
-	float GetArmyPullR() const;
 	enum ArmyEv { AE_WALK, AE_SHARE, AE_STAGE, AE_GO, AE_MERGE, AE_SWITCH, AE_N };
 	void NoteArmy(ArmyEv e) { ++armyEv[e]; }
 	float GetAttackPower() const {
@@ -310,7 +318,6 @@ public:
 	float massMul = 1.f;
 	float flankMul = 1.f;
 	float splitMul = 1.f;
-	bool oneArmy = false;
 	float commitMul = 1.f;
 	float stageMul = 1.f;
 	float retreatMul = 1.f;
@@ -395,9 +402,27 @@ public:
 	std::string StockArmyStat();
 
 private:
+	std::unordered_map<int, int> shellerUntil;   // enemy -> frame its mark lapses
+	struct SShellPoint { springai::AIFloat3 pos; int until; float stake; bool seen; };
+	std::vector<SShellPoint> shellPoints;                   // where unseen fire on our structures came from
+	bool shellAnswer = false;
+	int shellReadFrame = -1;
+	int shellFireSeen = 0, shellFireBlind = 0, shellHitSeen = 0, shellHitBlind = 0, shellLogFrame = 0;
+
 	virtual IUnitTask* DefaultMakeTask(CCircuitUnit* unit) override;
 	IUnitTask* BirthDefendTask(CCircuitUnit* unit);
 	void LogBirthStat();
+	// apex_dodge (his 11-06: "dodges shots while fighting"): a fighting ground unit inside the reach of a seen
+	// enemy whose shot it can outrun sidesteps across the line of fire, then resumes its orders.
+	void DodgeUpdate();
+	struct SDodge {
+		int nextFrame = 0;
+		float side = 1.f;
+	};
+	std::unordered_map<int, SDodge> dodgeState;
+	struct SDodgeStat {
+		int passes = 0, units = 0, inReach = 0, dodgeable = 0, ordered = 0, nextLog = 0, slowTurn = 0, jinks = 0, outOfRange = 0;
+	} dodgeStat;
 	struct SBirthStat {
 		int born = 0, retask = 0, joined = 0, created = 0, released = 0, hopeless = 0;
 		int pulled = 0, pulledRet = 0, wdSkip = 0, consSkip = 0, consRedir = 0, ansSkip = 0;

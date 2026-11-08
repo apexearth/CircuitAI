@@ -27,6 +27,7 @@
 #include "task/PlayerTask.h"
 #include "task/fighter/FighterTask.h"
 #include "task/fighter/SquadTask.h"
+#include "task/static/ReclaimTask.h"
 #include "unit/CircuitUnit.h"
 #include "unit/ally/AllyUnit.h"
 #include "unit/enemy/EnemyUnit.h"
@@ -541,6 +542,7 @@ int CCircuitAI::HandleGameEvent(int topic, const void* data)
 				if (GetTeamUnit(evt->attacker) != nullptr) {
 					ISquadTask::NoteTargetKill(this, enemy->GetCircuitDef());
 					ISquadTask::NoteFocusKill(this, GetTeamUnit(evt->attacker), enemy);
+					CSReclaimEnemyTask::NoteKill(this, GetTeamUnit(evt->attacker), enemy);
 				}
 				allyTeam->DyingEnemy(enemy->GetData(), lastFrame);
 				ret = 0;
@@ -1242,9 +1244,8 @@ int CCircuitAI::Update(int frame)
 		// dupable = moves a re-send provably could not change; DROPPED only when
 		// apex_order_dedupe is on, counted either way, so the number is what
 		// turning it on would buy rather than what it bought.
-		LOG("apex: orders t=%i move=%u fight=%u patrol=%u attack=%u target=%u dupable=%u routeKept=%u doorRefused=%u",
-				teamId, ordSent[0], ordSent[1], ordSent[2], ordSent[3], ordSent[4], ordSup[0], routeKept, doorRefused);
-		routeKept = 0;
+		LOG("apex: orders t=%i move=%u fight=%u patrol=%u attack=%u target=%u dupable=%u doorRefused=%u",
+				teamId, ordSent[0], ordSent[1], ordSent[2], ordSent[3], ordSent[4], ordSup[0], doorRefused);
 		doorRefused = 0;
 		{
 			// apex: EVERY command the wrappers sent this minute, by who got it (his 10-22: "throttle it so APM doesn't
@@ -1743,6 +1744,11 @@ int CCircuitAI::UnitDamaged(CCircuitUnit* unit, ICoreUnit::Id attackerId, int we
 
 	for (auto& module : modules) {
 		module->UnitDamaged(unit, attacker);
+	}
+	if ((militaryManager != nullptr) && IsValidWeaponDefId(weaponId)
+		&& ((attacker != nullptr) || (GetFriendlyUnit(attackerId) == nullptr)))
+	{
+		militaryManager->NoteStructFire(unit, attacker, weaponId, dir);
 	}
 
 	return 0;  // signaling: OK
@@ -3740,9 +3746,7 @@ bool CCircuitAI::IsPosOnMap(const AIFloat3& pos) const
 //
 // File_getContent routes to CFileHandler with none of the alliance gating that
 // makes Game_getTeamResourceIncome useless (see GetTeamMetalIncome), so an AI
-// can read the same configs the gadgets read. This is how the lava tide's own
-// schedule becomes knowable at frame 0 instead of being learned a crest at a
-// time: manager/lava.as parses it.
+// can read the same configs the gadgets read (script: ai.ReadVfsFile).
 //
 // Empty string on any failure, including a file that is not there -- callers
 // must treat that as "no answer", never as "empty config".
