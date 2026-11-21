@@ -356,7 +356,9 @@ asQWORD CallSystemFunctionNative(asCContext *context, asCScriptFunction *descr, 
 #if defined(AS_IPHONE) || defined(AS_MAC)
 			if(!fitsInRegisters)
 			{
-				asUINT parmBytes = parmType.GetSizeInMemoryBytes();
+				// a reference is a pointer on the stack, not the referenced type's size
+				asUINT parmBytes = (parmType.IsReference() || parmType.IsObjectHandle() || parmType.IsObject())
+					? AS_PTR_SIZE * 4 : parmType.GetSizeInMemoryBytes();
 				PadAppleStack(argsArray, numArgs, stackDispositionBytes, parmBytes);
 				memcpy( ((asBYTE*)&argsArray[numArgs]) + stackDispositionBytes, (void*)(args+argsPos), parmBytes);
 				stackDispositionBytes += parmBytes;
